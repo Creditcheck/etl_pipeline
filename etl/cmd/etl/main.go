@@ -11,6 +11,7 @@ import (
 
 	"etl/internal/config"
 	"etl/internal/metrics"
+	"etl/internal/metrics/datadog"
 	"etl/internal/metrics/prompush"
 
 	// register all backends with the storage factory.
@@ -104,6 +105,51 @@ func main() {
 			defer func() {
 				if err := metrics.Flush(); err != nil {
 					log.Printf("metrics: flush error: %v", err)
+				}
+			}()
+		}
+
+	case "datadog":
+		// Datadog backend:
+		//   - buffers metrics and submits periodically (default once per minute)
+		//   - submits one final time at shutdown (Close())
+		//
+		// This is generally more useful than “submit once per job” because:
+		//   - you get an actual time series during long runs
+		//   - monitors can evaluate continuously
+		//   - dashboards look normal (not just a single spike at the end)
+
+		ddCtx := context.Background()
+
+		// Prefer the pipeline job name for the "job:<name>" tag.
+		// Fall back to a stable default so the tag always exists.
+		jobName := p.Job
+		if jobName == "" {
+			jobName = "etl_job"
+		}
+
+		// Optional extra tags provided via config/environment.
+		// This complements the backend-enforced env:<...> tag.
+		extraTags := datadog.ParseTagsCSV(os.Getenv("METRICS_TAGS"))
+
+		// Create the backend. It starts its own periodic flush goroutine.
+		b, err := datadog.NewBackend(ddCtx, datadog.Options{
+			JobName:    jobName,
+			Tags:       extraTags,
+			FlushEvery: 60 * time.Second, // change here if you want a different default
+		})
+		if err != nil {
+			log.Printf("metrics: failed to init datadog backend: %v; using nop", err)
+		} else {
+			log.Printf("metrics: backend=%v job_name=%v tags=%v", backendName, jobName, extraTags)
+			metrics.SetBackend(b)
+
+			// IMPORTANT:
+			// Close() stops the periodic flush loop and then performs a final Flush().
+			// This is the clean shutdown path for the Datadog backend.
+			defer func() {
+				if err := b.Close(); err != nil {
+					log.Printf("metrics: datadog close/flush error: %v", err)
 				}
 			}()
 		}

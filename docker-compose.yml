@@ -20,7 +20,7 @@ services:
       - pgdata:/var/lib/postgresql/data:z
       # Any .sql/.sql.gz/.sh in this dir runs ONCE on first init
       - ./postgres/init:/docker-entrypoint-initdb.d:ro,z
-#      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro  # Custom config file
+      #- ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro  # Custom config file
 
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
@@ -91,35 +91,35 @@ services:
     "]
 
 
-  pushgateway:
-    image: prom/pushgateway:v1.11.2
-    profiles: ["monitoring"]
-    ports:
-      - "9091:9091"
-  prometheus:
-    image: prom/prometheus:latest
-    profiles: ["monitoring"]
-    container_name: prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus-data:/prometheus
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    profiles: ["monitoring"]
-    ports:
-      - "3001:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    volumes:
-      #- ./grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
-      - grafana-data:/var/lib/grafana
+#  pushgateway:
+#    image: prom/pushgateway:v1.11.2
+#    profiles: ["monitoring"]
+#    ports:
+#      - "9091:9091"
+#  prometheus:
+#    image: prom/prometheus:latest
+#    profiles: ["monitoring"]
+#    container_name: prometheus
+#    ports:
+#      - "9090:9090"
+#    volumes:
+#      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+#      - prometheus-data:/prometheus
+#  grafana:
+#    image: grafana/grafana:latest
+#    container_name: grafana
+#    profiles: ["monitoring"]
+#    ports:
+#      - "3001:3000"
+#    environment:
+#      - GF_SECURITY_ADMIN_PASSWORD=admin
+#    volumes:
+#      #- ./grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
+#      - grafana-data:/var/lib/grafana
 
 volumes:
   pgdata:
   mssql-data:
-  prometheus-data:
-  grafana-data:
+#  prometheus-data:
+#  grafana-data:
 
