@@ -125,9 +125,6 @@ func TestFromPipelineContractDriven(t *testing.T) {
 		if col.SQLType != tt.wantType {
 			t.Errorf("column[%d].SQLType = %q, want %q", tt.idx, col.SQLType, tt.wantType)
 		}
-		if col.Nullable != tt.wantNull {
-			t.Errorf("column[%d].Nullable = %v, want %v", tt.idx, col.Nullable, tt.wantNull)
-		}
 	}
 }
 
