@@ -557,8 +557,8 @@ func probeJSON(sample []byte, opt Options) (config.Pipeline, error) {
 		ReaderWorkers:    1,
 		TransformWorkers: 1,
 		LoaderWorkers:    1,
-		BatchSize:        1,
-		ChannelBuffer:    1000,
+		BatchSize:        512,
+		ChannelBuffer:    256,
 	}
 
 	// Parser config: allow arrays and carry a header_map so the streaming
@@ -601,7 +601,6 @@ func probeJSON(sample []byte, opt Options) (config.Pipeline, error) {
 
 	return p, nil
 }
-
 
 // probeCSV builds a config.Pipeline for a CSV source using the existing CSV
 // sampling + type/layout inference heuristics.

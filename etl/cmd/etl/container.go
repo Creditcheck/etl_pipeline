@@ -29,7 +29,8 @@ import (
 
 	csvparser "etl/internal/parser/csv"
 	jsonparser "etl/internal/parser/json"
-	xmlparser "etl/internal/parser/xml"
+
+	//	xmlparser "etl/internal/parser/xml"
 
 	"etl/internal/schema"
 	"etl/internal/storage"
@@ -97,7 +98,7 @@ var (
 
 	// streamXMLRowsFn provides a test seam for the XML streaming adapter.
 	// In production it points to xmlparser.StreamXMLRows.
-	streamXMLRowsFn = xmlparser.StreamXMLRows
+	//	streamXMLRowsFn = xmlparser.StreamXMLRows
 
 	// streamJSONRowsFn provides a test seam for the JSON streaming adapter.
 	// In production it points to jsonparser.StreamJSONRows.
@@ -231,6 +232,7 @@ func runStreamed(ctx context.Context, spec config.Pipeline) (err error) {
 				errCh <- RowErr{Err: fmt.Errorf("source open: %w", err)}
 				return
 			}
+			defer src.Close()
 
 			switch spec.Parser.Kind {
 			case "csv":
@@ -245,30 +247,30 @@ func runStreamed(ctx context.Context, spec config.Pipeline) (err error) {
 					errCh <- RowErr{Err: err}
 				}
 
-			case "xml":
-				// XML streaming path: uses internal/parser/xml.StreamXMLRows, which
-				// consumes parser.options as an xml.Config JSON and emits *transformer.Row
-				// records aligned with storage.DB.Columns.
-
-				// If the pipeline uses the nested "xml_config" shape (as produced by ProbeURL
-				// and by your JSON config), unwrap it so StreamXMLRows sees the Config directly.
-				xmlOpts := spec.Parser.Options
-				if raw := xmlOpts.Any("xml_config"); raw != nil {
-					if m, ok := raw.(map[string]any); ok {
-						xmlOpts = config.Options(m)
-					}
-				}
-
-				if err := streamXMLRowsFn(
-					ctx,
-					src,
-					spec.Storage.DB.Columns,
-					xmlOpts,
-					rawRowCh,
-					onParseErr,
-				); err != nil {
-					errCh <- RowErr{Err: err}
-				}
+				//			case "xml":
+				//				// XML streaming path: uses internal/parser/xml.StreamXMLRows, which
+				//				// consumes parser.options as an xml.Config JSON and emits *transformer.Row
+				//				// records aligned with storage.DB.Columns.
+				//
+				//				// If the pipeline uses the nested "xml_config" shape (as produced by ProbeURL
+				//				// and by your JSON config), unwrap it so StreamXMLRows sees the Config directly.
+				//				xmlOpts := spec.Parser.Options
+				//				if raw := xmlOpts.Any("xml_config"); raw != nil {
+				//					if m, ok := raw.(map[string]any); ok {
+				//						xmlOpts = config.Options(m)
+				//					}
+				//				}
+				//
+				//				if err := streamXMLRowsFn(
+				//					ctx,
+				//					src,
+				//					spec.Storage.DB.Columns,
+				//					xmlOpts,
+				//					rawRowCh,
+				//					onParseErr,
+				//				); err != nil {
+				//					errCh <- RowErr{Err: err}
+				//				}
 
 			case "json":
 				// JSON streaming path: uses internal/parser/json.StreamJSONRows, which

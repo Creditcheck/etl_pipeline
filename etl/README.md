@@ -1,5 +1,8 @@
 # Generic ETL
 
+# memory 
+GOMEMLIMIT=50000000
+
 # TODO
 add documentation
     - probe

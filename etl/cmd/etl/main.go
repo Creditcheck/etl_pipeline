@@ -16,6 +16,7 @@ import (
 	// register all backends with the storage factory.
 	// config specifies which to use but we need to build in support for all of them.
 	_ "etl/internal/storage/all"
+	//_ "etl/internal/storage/postgres"
 )
 
 // main is the entry point for the ETL binary. It loads the pipeline config,

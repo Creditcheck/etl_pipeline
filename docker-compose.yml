@@ -7,8 +7,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-P@ssw0rd123!}
-#      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
       POSTGRES_DB: ${POSTGRES_DB:-testdb}
       TZ: ${TZ:-Europe/Prague}
       POSTGRES_LOGGING_COLLECTOR: "on"  # Enables log collection
@@ -91,7 +90,36 @@ services:
       go tool cover -func=coverage.out
     "]
 
+
+  pushgateway:
+    image: prom/pushgateway:v1.11.2
+    profiles: ["monitoring"]
+    ports:
+      - "9091:9091"
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["monitoring"]
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    profiles: ["monitoring"]
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      #- ./grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml
+      - grafana-data:/var/lib/grafana
+
 volumes:
   pgdata:
   mssql-data:
+  prometheus-data:
+  grafana-data:
 

@@ -60,9 +60,10 @@ func FromPipeline(p config.Pipeline) (gddl.TableDef, error) {
 		for _, name := range cols {
 			f := idx[name] // zero value if missing; MapType("") → TEXT
 			defs = append(defs, gddl.ColumnDef{
-				Name:     name,
-				SQLType:  MapType(f.Type),
-				Nullable: !f.Required && !f.Nullable, // adjust to your semantics
+				Name:    name,
+				SQLType: MapType(f.Type),
+				// Nullable: f.Required && f.Nullable, // adjust to your semantics
+				Nullable: !f.Required, // adjust to your semantics
 				// PrimaryKey / Default can be filled here if you encode them in config later.
 			})
 		}
