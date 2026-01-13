@@ -27,3 +27,7 @@ docker compose run go-tests
 
 ### coverage
 go test ./... -count=1 -coverprofile=/tmp/coverage.out; go tool cover -html=/tmp/coverage.out
+
+### ETL
+### validate config
+etl -config configs/pipelines/technickeprohlidky.json -validate  
