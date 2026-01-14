@@ -6,75 +6,31 @@ import (
 	"log"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"etl/internal/config"
 	"etl/internal/storage"
+	"etl/internal/transformer"
 )
 
-// Record is the canonical row representation used inside the multitable pipeline.
-// Values are expected to already be coerced/validated by the transform layer.
-type Record map[string]any
-
-// Logger is the minimal logging interface used by Engine.
+// Logger is the minimal logging interface used by the multitable engine.
 // *log.Logger satisfies this interface.
 type Logger interface {
 	Printf(format string, v ...any)
 }
 
-// LookupCache stores dimension key -> id mappings per table.
-// It is safe for concurrent use.
-type LookupCache struct {
-	mu   sync.RWMutex
-	data map[string]map[string]int64 // table -> normalizedKey -> id
-}
-
-// NewLookupCache returns an initialized lookup cache.
-func NewLookupCache() *LookupCache {
-	return &LookupCache{data: make(map[string]map[string]int64)}
-}
-
-// Get returns the cached ID for (table,key).
-func (c *LookupCache) Get(table, key string) (int64, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	m := c.data[table]
-	if m == nil {
-		return 0, false
-	}
-	v, ok := m[key]
-	return v, ok
-}
-
-// Put stores (table,key)->id in the cache.
-func (c *LookupCache) Put(table, key string, id int64) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	m := c.data[table]
-	if m == nil {
-		m = make(map[string]int64)
-		c.data[table] = m
-	}
-	m[key] = id
-}
-
-// Engine loads dimension and fact tables based on Pipeline configuration.
-// It is intentionally small and testable: storage access and logging are injected.
-type Engine struct {
+// Engine2Pass implements Option 2 (two-pass streaming):
+//   - Pass 1: stream validated rows and ensure dimension keys exist (batching, no global dedupe).
+//   - Pass 2: stream again, resolve IDs per batch, insert facts per batch.
+//
+// This avoids buffering all rows in memory and avoids huge in-memory key sets.
+type Engine2Pass struct {
 	Repo   storage.MultiRepository
 	Logger Logger
 }
 
-// Run executes a multi-table pipeline over already transformed records.
-//
-// Stages (timed):
-//  1. Ensure tables exist (DDL)
-//  2. Ensure + cache dimensions
-//  3. Load facts
-func (e *Engine) Run(ctx context.Context, cfg Pipeline, recs []Record) error {
+// Run executes the two-pass streaming plan.
+func (e *Engine2Pass) Run(ctx context.Context, cfg Pipeline, columns []string) error {
 	if e.Repo == nil {
 		return fmt.Errorf("engine: Repo is required")
 	}
@@ -82,48 +38,35 @@ func (e *Engine) Run(ctx context.Context, cfg Pipeline, recs []Record) error {
 	logf := e.logger()
 	lenient := isLenient(cfg.Transform)
 
-	plan, err := buildPlanFromPipeline(cfg)
+	plan, err := buildIndexedPlan(cfg, columns)
 	if err != nil {
 		return err
 	}
 
-	// 1) DDL
 	ddlStart := time.Now()
 	if err := e.Repo.EnsureTables(ctx, plan.AllTables()); err != nil {
 		return err
 	}
-	logf("stage=ddl ok duration=%s", time.Since(ddlStart).Truncate(time.Millisecond))
+	logf("stage=ddl ok duration=%s", durMS(ddlStart))
 
-	cache := NewLookupCache()
-
-	// 2) Dimensions
-	dimStart := time.Now()
-	for _, dim := range plan.DimensionsInOrder {
-		s := time.Now()
-		if err := e.ensureDimension(ctx, dim, recs, cache); err != nil {
-			return err
-		}
-		logf("stage=dimension table=%s ok duration=%s", dim.Table.Name, time.Since(s).Truncate(time.Millisecond))
+	// Pass 1: ensure dimensions (streaming).
+	pass1Start := time.Now()
+	if err := e.ensureDimensionsStreaming(ctx, cfg, columns, plan); err != nil {
+		return err
 	}
-	logf("stage=dimensions ok duration=%s", time.Since(dimStart).Truncate(time.Millisecond))
+	logf("stage=pass1_ensure_dims ok duration=%s", durMS(pass1Start))
 
-	// 3) Facts
-	factStart := time.Now()
-	for _, fact := range plan.FactsInOrder {
-		s := time.Now()
-		if err := e.loadFact(ctx, fact, recs, cache, lenient); err != nil {
-			return err
-		}
-		logf("stage=fact table=%s ok duration=%s", fact.Table.Name, time.Since(s).Truncate(time.Millisecond))
+	// Pass 2: load facts (streaming).
+	pass2Start := time.Now()
+	if err := e.loadFactsStreaming(ctx, cfg, columns, plan, lenient); err != nil {
+		return err
 	}
-	logf("stage=facts ok duration=%s", time.Since(factStart).Truncate(time.Millisecond))
+	logf("stage=pass2_load_facts ok duration=%s", durMS(pass2Start))
 
 	return nil
 }
 
-func (e *Engine) logger() func(format string, v ...any) {
-	// Avoid untestable global logging. If no logger is provided,
-	// default to a logger that discards output (caller can inject one).
+func (e *Engine2Pass) logger() func(format string, v ...any) {
 	if e.Logger == nil {
 		l := log.New(discardWriter{}, "", 0)
 		return l.Printf
@@ -131,335 +74,464 @@ func (e *Engine) logger() func(format string, v ...any) {
 	return e.Logger.Printf
 }
 
-// ensureDimension ensures all dimension keys exist in the dimension table and are cached.
-//
-// Performance:
-// If Cache.Prewarm is true, we do a *targeted prewarm* (only keys needed for this run),
-// not a full-table scan. Full scans are too expensive for large dimensions and small batches.
-func (e *Engine) ensureDimension(ctx context.Context, dim TablePlan, recs []Record, cache *LookupCache) error {
+func durMS(start time.Time) time.Duration { return time.Since(start).Truncate(time.Millisecond) }
+
+// ensureDimensionsStreaming streams validated rows and calls EnsureDimensionKeys in batches.
+// It does not attempt global dedupe (which is memory-expensive and usually pointless for
+// high-cardinality keys).
+func (e *Engine2Pass) ensureDimensionsStreaming(
+	ctx context.Context,
+	cfg Pipeline,
+	columns []string,
+	plan indexedPlan,
+) error {
 	logf := e.logger()
 
-	if dim.Cache == nil {
-		return fmt.Errorf("dimension %s: missing cache spec", dim.Table.Name)
+	batchSize := cfg.Runtime.BatchSize
+	if batchSize <= 0 {
+		batchSize = 1024
 	}
 
-	keyCol := dim.Cache.KeyColumn
-	valCol := dim.Cache.ValueColumn
+	// Per-dimension pending typed values.
+	pending := make(map[string][]any, len(plan.Dimensions))
+	seenRows := 0
 
-	// Collect distinct needed keys (normalized for cache) and typed values for DB binding.
-	keysNeeded, typedByKey, err := collectDistinctKeyValuesFromRecords(recs, dim.DimensionSourceField)
+	// Optional within-batch dedupe (bounded).
+	dedupeWithinBatch := cfg.Runtime.DedupeDimensionKeysWithinBatch
+
+	stream, err := StreamValidatedRows(ctx, cfg, columns)
 	if err != nil {
-		return fmt.Errorf("dimension %s: collect keys: %w", dim.Table.Name, err)
+		return err
 	}
-	if len(keysNeeded) == 0 {
-		logf("stage=dimension table=%s needed_keys=0 (skipping)", dim.Table.Name)
+
+	flushDim := func(dim indexedDimension) error {
+		keys := pending[dim.Table.Name]
+		if len(keys) == 0 {
+			return nil
+		}
+		pending[dim.Table.Name] = pending[dim.Table.Name][:0]
+
+		if dedupeWithinBatch && len(keys) > 1 {
+			keys = dedupeTypedKeys(keys)
+		}
+
+		conflictCols := []string{dim.KeyColumn}
+		if dim.Table.Load.Conflict != nil && len(dim.Table.Load.Conflict.TargetColumns) > 0 {
+			conflictCols = dim.Table.Load.Conflict.TargetColumns
+		}
+
+		if err := e.Repo.EnsureDimensionKeys(ctx, dim.Table.Name, dim.KeyColumn, keys, conflictCols); err != nil {
+			return err
+		}
 		return nil
 	}
 
-	// Build the typed key list once (used for prewarm/select/insert).
-	allKeysAny := make([]any, 0, len(keysNeeded))
-	for _, k := range keysNeeded {
-		allKeysAny = append(allKeysAny, typedByKey[k])
+	flushAll := func() error {
+		for _, dim := range plan.Dimensions {
+			if err := flushDim(dim); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
-	// Prewarm cache if configured: targeted prewarm for needed keys only.
-	if dim.Cache.Prewarm {
-		s := time.Now()
-		kv, err := e.Repo.SelectKeyValueByKeys(ctx, dim.Table.Name, keyCol, valCol, allKeysAny)
-		if err != nil {
-			return err
-		}
-		for k, v := range kv {
-			cache.Put(dim.Table.Name, k, v)
-		}
-		logf("stage=dimension_prewarm table=%s mode=targeted needed_keys=%d cached=%d duration=%s",
-			dim.Table.Name, len(keysNeeded), len(kv), time.Since(s).Truncate(time.Millisecond))
+	// Ensure slices are initialized with batch capacity.
+	for _, dim := range plan.Dimensions {
+		pending[dim.Table.Name] = make([]any, 0, batchSize)
 	}
 
-	// Conflict columns fall back to the cache key column.
-	conflictCols := []string{keyCol}
-	if dim.Table.Load.Conflict != nil && len(dim.Table.Load.Conflict.TargetColumns) > 0 {
-		conflictCols = dim.Table.Load.Conflict.TargetColumns
+	// Stream rows, enqueue dim keys, flush when any dim hits batchSize.
+	for r := range stream.Rows {
+		seenRows++
+		for _, dim := range plan.Dimensions {
+			if dim.SourceIndex < 0 {
+				continue
+			}
+			v := r.V[dim.SourceIndex]
+			if normalizeKey(v) == "" {
+				continue
+			}
+			pending[dim.Table.Name] = append(pending[dim.Table.Name], typedBindValue(v))
+			if len(pending[dim.Table.Name]) >= batchSize {
+				if err := flushDim(dim); err != nil {
+					r.Free()
+					return err
+				}
+			}
+		}
+		r.Free()
 	}
 
-	// Insert missing keys.
-	var missing []any
-	for _, k := range keysNeeded {
-		if _, ok := cache.Get(dim.Table.Name, k); ok {
-			continue
-		}
-		missing = append(missing, typedByKey[k])
+	if err := flushAll(); err != nil {
+		return err
+	}
+	if err := stream.Wait(); err != nil {
+		return err
 	}
 
-	if len(missing) > 0 {
-		s := time.Now()
-		if err := e.Repo.EnsureDimensionKeys(ctx, dim.Table.Name, keyCol, missing, conflictCols); err != nil {
-			return err
-		}
-		logf("stage=dimension_insert table=%s inserted_or_ensured=%d duration=%s",
-			dim.Table.Name, len(missing), time.Since(s).Truncate(time.Millisecond))
-
-		// Refresh only the missing keys (cheap).
-		s2 := time.Now()
-		kv, err := e.Repo.SelectKeyValueByKeys(ctx, dim.Table.Name, keyCol, valCol, missing)
-		if err != nil {
-			return err
-		}
-		for k, v := range kv {
-			cache.Put(dim.Table.Name, k, v)
-		}
-		logf("stage=dimension_refresh table=%s refreshed=%d duration=%s",
-			dim.Table.Name, len(kv), time.Since(s2).Truncate(time.Millisecond))
-	}
-
-	// Verify coverage after insert+select.
-	for _, k := range keysNeeded {
-		if _, ok := cache.Get(dim.Table.Name, k); !ok {
-			return fmt.Errorf("failed to resolve %s for key=%q in %s", valCol, k, dim.Table.Name)
-		}
-	}
-
-	logf("stage=dimension table=%s needed_keys=%d ok", dim.Table.Name, len(keysNeeded))
+	logf("stage=pass1_rows seen_rows=%d", seenRows)
 	return nil
 }
 
-// loadFact loads the fact table rows. In lenient mode, unresolved lookups drop the row.
-// In strict mode, unresolved lookups fail the run.
-//
-// Performance note:
-// For lookup columns with on_missing=insert, we batch missing keys:
-//   - 1 insert (chunked in repo) + 1 select per lookup-table per fact load
-//
-// instead of per-row insert/select.
-func (e *Engine) loadFact(ctx context.Context, fact TablePlan, recs []Record, cache *LookupCache, lenient bool) error {
+// loadFactsStreaming streams validated rows again and inserts facts in batches.
+// Dimension ID resolution is done per batch using SelectKeyValueByKeys.
+func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, columns []string, plan indexedPlan, lenient bool) error {
 	logf := e.logger()
 
-	cols := make([]string, 0, len(fact.FactColumns))
-	for _, c := range fact.FactColumns {
-		cols = append(cols, c.TargetColumn)
+	batchSize := cfg.Runtime.BatchSize
+	if batchSize <= 0 {
+		batchSize = 1024
 	}
 
-	// Phase A: batch ensure + refresh cache for lookup columns with on_missing=insert.
-	type lookupKey struct {
-		table        string
-		matchColumn  string
-		returnColumn string
+	// cache[dimTable][normalizedKey] = id
+	cache := make(map[string]map[string]int64, len(plan.Dimensions))
+
+	stream, err := StreamValidatedRows(ctx, cfg, columns)
+	if err != nil {
+		return err
 	}
 
-	// missing[lk][normalizedKey] = typedValue
-	missing := make(map[lookupKey]map[string]any)
+	// Batch of pooled rows.
+	batch := make([]*transformer.Row, 0, batchSize)
 
-	for _, r := range recs {
-		for _, o := range fact.FactColumns {
-			if o.Lookup == nil || o.Lookup.OnMissing != "insert" {
-				continue
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		defer func() {
+			for _, r := range batch {
+				r.Free()
 			}
+			batch = batch[:0]
+		}()
 
-			v := r[o.Lookup.MatchField]
-			nk := normalizeKey(v)
-			if nk == "" {
-				continue
-			}
-			if _, ok := cache.Get(o.Lookup.LookupTable, nk); ok {
-				continue
-			}
+		if err := e.resolveBatchLookups(ctx, plan, batch, cache); err != nil {
+			return err
+		}
 
-			lk := lookupKey{
-				table:        o.Lookup.LookupTable,
-				matchColumn:  o.Lookup.MatchColumn,
-				returnColumn: o.Lookup.ReturnColumn,
+		for _, fact := range plan.Facts {
+			inserted, dropped, err := e.insertFactBatch(ctx, fact, batch, cache, lenient)
+			if err != nil {
+				return err
 			}
-			m := missing[lk]
-			if m == nil {
-				m = make(map[string]any)
-				missing[lk] = m
+			if lenient && dropped > 0 {
+				logf("stage=fact_batch table=%s inserted=%d dropped=%d", fact.Table.Name, inserted, dropped)
 			}
-			if _, exists := m[nk]; exists {
-				continue
-			}
+		}
+		return nil
+	}
 
-			// Typed bind value (preserve strings like "000").
-			m[nk] = typedBindValue(v)
+	seenRows := 0
+	for r := range stream.Rows {
+		seenRows++
+		batch = append(batch, r)
+		if len(batch) >= batchSize {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 	}
 
-	for lk, m := range missing {
+	if err := flush(); err != nil {
+		return err
+	}
+	if err := stream.Wait(); err != nil {
+		return err
+	}
+
+	logf("stage=pass2_rows seen_rows=%d", seenRows)
+	return nil
+}
+
+// resolveBatchLookups fetches (key->id) mappings needed by this batch for all lookup tables.
+func (e *Engine2Pass) resolveBatchLookups(
+	ctx context.Context,
+	plan indexedPlan,
+	batch []*transformer.Row,
+	cache map[string]map[string]int64,
+) error {
+	// needed[dimTable][normalizedKey] = typedValue
+	needed := make(map[string]map[string]any)
+
+	for _, fact := range plan.Facts {
+		for _, col := range fact.Columns {
+			if col.Lookup == nil {
+				continue
+			}
+			dimTable := col.Lookup.Table
+			matchIdx := col.Lookup.MatchFieldIndex
+			if matchIdx < 0 {
+				continue
+			}
+
+			for _, r := range batch {
+				v := r.V[matchIdx]
+				nk := normalizeKey(v)
+				if nk == "" {
+					continue
+				}
+				if cm := cache[dimTable]; cm != nil {
+					if _, ok := cm[nk]; ok {
+						continue
+					}
+				}
+				m := needed[dimTable]
+				if m == nil {
+					m = make(map[string]any)
+					needed[dimTable] = m
+				}
+				if _, exists := m[nk]; !exists {
+					m[nk] = typedBindValue(v)
+				}
+			}
+		}
+	}
+
+	// Bulk fetch per dimension table.
+	for _, dim := range plan.Dimensions {
+		m := needed[dim.Table.Name]
 		if len(m) == 0 {
 			continue
 		}
-		keysAny := make([]any, 0, len(m))
+
+		keys := make([]any, 0, len(m))
 		for _, v := range m {
-			keysAny = append(keysAny, v)
+			keys = append(keys, v)
 		}
 
-		if err := e.Repo.EnsureDimensionKeys(ctx, lk.table, lk.matchColumn, keysAny, []string{lk.matchColumn}); err != nil {
-			return err
-		}
-		kv, err := e.Repo.SelectKeyValueByKeys(ctx, lk.table, lk.matchColumn, lk.returnColumn, keysAny)
+		kv, err := e.Repo.SelectKeyValueByKeys(ctx, dim.Table.Name, dim.KeyColumn, dim.ValueColumn, keys)
 		if err != nil {
 			return err
 		}
-		for kk, vv := range kv {
-			cache.Put(lk.table, kk, vv)
+
+		cm := cache[dim.Table.Name]
+		if cm == nil {
+			cm = make(map[string]int64, len(kv))
+			cache[dim.Table.Name] = cm
+		}
+		for k, v := range kv {
+			cm[k] = v
 		}
 	}
 
-	// Phase B: build fact rows using cache.
-	outRows := make([][]any, 0, len(recs))
-	var dropped, misses int
+	return nil
+}
 
-	for _, r := range recs {
-		outRow := make([]any, 0, len(fact.FactColumns))
+func (e *Engine2Pass) insertFactBatch(
+	ctx context.Context,
+	fact indexedFact,
+	batch []*transformer.Row,
+	cache map[string]map[string]int64,
+	lenient bool,
+) (inserted int, dropped int, _ error) {
+	cols := fact.TargetColumns
+
+	outRows := make([][]any, 0, len(batch))
+	for _, r := range batch {
+		rowOut := make([]any, 0, len(fact.Columns))
 		drop := false
 
-		for _, o := range fact.FactColumns {
-			if o.Lookup != nil {
-				key := normalizeKey(r[o.Lookup.MatchField])
-				id, ok := cache.Get(o.Lookup.LookupTable, key)
+		for _, c := range fact.Columns {
+			if c.Lookup != nil {
+				dimTable := c.Lookup.Table
+				matchIdx := c.Lookup.MatchFieldIndex
+				key := normalizeKey(r.V[matchIdx])
+
+				var (
+					id int64
+					ok bool
+				)
+				if cm := cache[dimTable]; cm != nil {
+					id, ok = cm[key]
+				}
 				if !ok {
-					misses++
 					if lenient {
 						drop = true
 						break
 					}
-					return fmt.Errorf("fact %s: lookup miss table=%s key=%q", fact.Table.Name, o.Lookup.LookupTable, key)
+					return inserted, dropped, fmt.Errorf("fact %s: lookup miss table=%s key=%q", fact.Table.Name, dimTable, key)
 				}
-				outRow = append(outRow, id)
+				rowOut = append(rowOut, id)
 				continue
 			}
 
-			if o.SourceField != "" {
-				outRow = append(outRow, r[o.SourceField])
+			if c.SourceFieldIndex >= 0 {
+				rowOut = append(rowOut, r.V[c.SourceFieldIndex])
 				continue
 			}
-
-			outRow = append(outRow, nil)
+			rowOut = append(rowOut, nil)
 		}
 
 		if drop {
 			dropped++
 			continue
 		}
-		outRows = append(outRows, outRow)
+		outRows = append(outRows, rowOut)
 	}
 
 	if len(outRows) == 0 {
-		if lenient && (dropped > 0 || misses > 0) {
-			logf("stage=fact table=%s dropped=%d misses=%d (no rows inserted)", fact.Table.Name, dropped, misses)
+		return 0, dropped, nil
+	}
+
+	affected, err := e.Repo.InsertFactRows(ctx, fact.Table.Name, cols, outRows, fact.DedupeColumns)
+	if err != nil {
+		return 0, dropped, err
+	}
+	return int(affected), dropped, nil
+}
+
+// dedupeTypedKeys performs bounded dedupe for a slice of typed values.
+// It uses normalizeKey for keying but preserves the first typed value.
+func dedupeTypedKeys(in []any) []any {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]any, 0, len(in))
+	for _, v := range in {
+		k := normalizeKey(v)
+		if k == "" {
+			continue
 		}
-		return nil
-	}
-
-	var dedupeCols []string
-	if fact.Table.Load.Dedupe != nil && len(fact.Table.Load.Dedupe.ConflictColumns) > 0 {
-		dedupeCols = append(dedupeCols, fact.Table.Load.Dedupe.ConflictColumns...)
-	}
-
-	_, err := e.Repo.InsertFactRows(ctx, fact.Table.Name, cols, outRows, dedupeCols)
-	if err == nil && lenient && (dropped > 0 || misses > 0) {
-		logf("stage=fact table=%s inserted=%d dropped=%d misses=%d", fact.Table.Name, len(outRows), dropped, misses)
-	}
-	return err
-}
-
-// ---- Plan types + building ----
-
-// Plan is the minimal execution plan needed by Engine.
-type Plan struct {
-	DimensionsInOrder []TablePlan
-	FactsInOrder      []TablePlan
-}
-
-// AllTables returns the union of dimension + fact table specs.
-func (p Plan) AllTables() []storage.TableSpec {
-	out := make([]storage.TableSpec, 0, len(p.DimensionsInOrder)+len(p.FactsInOrder))
-	for _, t := range p.DimensionsInOrder {
-		out = append(out, t.Table)
-	}
-	for _, t := range p.FactsInOrder {
-		out = append(out, t.Table)
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, v)
 	}
 	return out
 }
 
-// TablePlan describes either a dimension table or a fact table.
-type TablePlan struct {
-	Table storage.TableSpec
+// ---- Plan compilation with column indices (avoid per-row map allocs) ----
 
-	// Dimension fields
-	DimensionSourceField string
-	Cache                *storage.CacheSpec
-
-	// Fact fields
-	FactColumns []FactColumnPlan
+type indexedPlan struct {
+	Dimensions []indexedDimension
+	Facts      []indexedFact
 }
 
-// FactColumnPlan describes how to populate one target column in the fact table.
-type FactColumnPlan struct {
-	TargetColumn string
-	SourceField  string
-	Lookup       *LookupPlan
+func (p indexedPlan) AllTables() []storage.TableSpec {
+	out := make([]storage.TableSpec, 0, len(p.Dimensions)+len(p.Facts))
+	for _, d := range p.Dimensions {
+		out = append(out, d.Table)
+	}
+	for _, f := range p.Facts {
+		out = append(out, f.Table)
+	}
+	return out
 }
 
-// LookupPlan describes a dimension lookup for a fact column.
-type LookupPlan struct {
-	LookupTable  string
-	MatchColumn  string
-	MatchField   string
-	ReturnColumn string
-	OnMissing    string
+type indexedDimension struct {
+	Table       storage.TableSpec
+	SourceIndex int
+
+	KeyColumn   string
+	ValueColumn string
 }
 
-// buildPlanFromPipeline builds Engine's plan from Pipeline config.
-func buildPlanFromPipeline(cfg Pipeline) (Plan, error) {
-	var plan Plan
+type indexedFact struct {
+	Table         storage.TableSpec
+	TargetColumns []string
+	DedupeColumns []string
+	Columns       []indexedFactColumn
+}
+
+type indexedFactColumn struct {
+	TargetColumn     string
+	SourceFieldIndex int
+	Lookup           *indexedLookup
+}
+
+type indexedLookup struct {
+	Table           string
+	MatchFieldIndex int
+}
+
+func buildIndexedPlan(cfg Pipeline, columns []string) (indexedPlan, error) {
+	colIndex := make(map[string]int, len(columns))
+	for i, c := range columns {
+		colIndex[c] = i
+	}
+
+	var plan indexedPlan
+
 	for _, t := range cfg.Storage.DB.Tables {
 		switch t.Load.Kind {
 		case "dimension":
-			var src string
+			src := ""
+			targetKeyCol := ""
 			if len(t.Load.FromRows) > 0 {
 				src = t.Load.FromRows[0].SourceField
+				targetKeyCol = t.Load.FromRows[0].TargetColumn
 			}
-			plan.DimensionsInOrder = append(plan.DimensionsInOrder, TablePlan{
-				Table:                t,
-				DimensionSourceField: src,
-				Cache:                t.Load.Cache,
+
+			srcIdx := -1
+			if src != "" {
+				if i, ok := colIndex[src]; ok {
+					srcIdx = i
+				}
+			}
+
+			keyCol := targetKeyCol
+			valCol := ""
+			if t.Load.Cache != nil {
+				keyCol = t.Load.Cache.KeyColumn
+				valCol = t.Load.Cache.ValueColumn
+			}
+
+			plan.Dimensions = append(plan.Dimensions, indexedDimension{
+				Table:       t,
+				SourceIndex: srcIdx,
+				KeyColumn:   keyCol,
+				ValueColumn: valCol,
 			})
 
 		case "fact":
-			tp := TablePlan{Table: t}
+			f := indexedFact{Table: t}
+
 			for _, fr := range t.Load.FromRows {
+				f.TargetColumns = append(f.TargetColumns, fr.TargetColumn)
+				col := indexedFactColumn{
+					TargetColumn:     fr.TargetColumn,
+					SourceFieldIndex: -1,
+				}
+
 				if fr.Lookup != nil {
-					// Support a single match mapping.
-					var matchCol, matchField string
-					for k, v := range fr.Lookup.Match {
-						matchCol = k
+					matchField := ""
+					for _, v := range fr.Lookup.Match {
 						matchField = v
 						break
 					}
-					tp.FactColumns = append(tp.FactColumns, FactColumnPlan{
-						TargetColumn: fr.TargetColumn,
-						Lookup: &LookupPlan{
-							LookupTable:  fr.Lookup.Table,
-							MatchColumn:  matchCol,
-							MatchField:   matchField,
-							ReturnColumn: fr.Lookup.Return,
-							OnMissing:    fr.Lookup.OnMissing,
-						},
-					})
-				} else {
-					tp.FactColumns = append(tp.FactColumns, FactColumnPlan{
-						TargetColumn: fr.TargetColumn,
-						SourceField:  fr.SourceField,
-					})
+					matchIdx := -1
+					if matchField != "" {
+						if i, ok := colIndex[matchField]; ok {
+							matchIdx = i
+						}
+					}
+					col.Lookup = &indexedLookup{
+						Table:           fr.Lookup.Table,
+						MatchFieldIndex: matchIdx,
+					}
+				} else if fr.SourceField != "" {
+					if i, ok := colIndex[fr.SourceField]; ok {
+						col.SourceFieldIndex = i
+					}
 				}
+
+				f.Columns = append(f.Columns, col)
 			}
-			plan.FactsInOrder = append(plan.FactsInOrder, tp)
+
+			if t.Load.Dedupe != nil && len(t.Load.Dedupe.ConflictColumns) > 0 {
+				f.DedupeColumns = append(f.DedupeColumns, t.Load.Dedupe.ConflictColumns...)
+			}
+
+			plan.Facts = append(plan.Facts, f)
 
 		default:
 			return plan, fmt.Errorf("table %s: unknown load kind %q", t.Name, t.Load.Kind)
 		}
 	}
+
+	// Stable order for determinism.
+	sort.SliceStable(plan.Dimensions, func(i, j int) bool { return plan.Dimensions[i].Table.Name < plan.Dimensions[j].Table.Name })
+	sort.SliceStable(plan.Facts, func(i, j int) bool { return plan.Facts[i].Table.Name < plan.Facts[j].Table.Name })
+
 	return plan, nil
 }
 
@@ -477,44 +549,6 @@ func isLenient(ts []config.Transform) bool {
 	return false
 }
 
-// collectDistinctKeyValuesFromRecords returns:
-//  1. sorted normalized keys (for cache keying)
-//  2. mapping normalized key -> typed value (for DB binding)
-//
-// This intentionally avoids guessing/parsing keys; it preserves transform output
-// (e.g., "000" stays "000" when coerced as text).
-func collectDistinctKeyValuesFromRecords(recs []Record, sourceField string) ([]string, map[string]any, error) {
-	if sourceField == "" {
-		return nil, nil, fmt.Errorf("sourceField is empty")
-	}
-
-	set := make(map[string]struct{})
-	typed := make(map[string]any, len(recs))
-
-	for _, r := range recs {
-		v, ok := r[sourceField]
-		if !ok || v == nil {
-			continue
-		}
-		k := normalizeKey(v)
-		if k == "" {
-			continue
-		}
-		if _, exists := set[k]; !exists {
-			set[k] = struct{}{}
-			typed[k] = typedBindValue(v)
-		}
-	}
-
-	out := make([]string, 0, len(set))
-	for k := range set {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out, typed, nil
-}
-
-// normalizeKey creates a stable cache key representation.
 func normalizeKey(v any) string {
 	switch t := v.(type) {
 	case nil:
@@ -528,7 +562,6 @@ func normalizeKey(v any) string {
 	}
 }
 
-// typedBindValue returns a value suitable for DB binding that preserves strings.
 func typedBindValue(v any) any {
 	switch t := v.(type) {
 	case string:
@@ -540,8 +573,6 @@ func typedBindValue(v any) any {
 	}
 }
 
-// discardWriter is an io.Writer that discards all writes.
-// Avoids depending on io.Discard to keep this file self-contained.
 type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (n int, err error) { return len(p), nil }

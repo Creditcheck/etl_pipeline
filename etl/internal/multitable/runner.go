@@ -44,19 +44,13 @@ func (r *Runner) Run(ctx context.Context, cfg Pipeline) error {
 
 	columns := requiredInputColumns(cfg)
 
-	recs, err := StreamAndCollectRecords(ctx, cfg, columns)
-	if err != nil {
-		return err
-	}
-
-	// Timestamped, testable logger (injectable).
 	logger := log.New(os.Stdout, "", log.LstdFlags)
 
-	engine := &Engine{
+	engine := &Engine2Pass{
 		Repo:   mr,
 		Logger: logger,
 	}
-	return engine.Run(ctx, cfg, recs)
+	return engine.Run(ctx, cfg, columns)
 }
 
 func validateMultiConfig(cfg Pipeline) error {
@@ -78,12 +72,6 @@ func validateMultiConfig(cfg Pipeline) error {
 	return nil
 }
 
-// requiredInputColumns derives the minimal set of canonical fields that must be present
-// in the transformed record stream.
-// It includes fields referenced by:
-// - storage.db.tables[].load.from_rows (source_field + lookup.match source fields)
-// - transform.coerce.options.types keys
-// - validate.contract.fields names
 func requiredInputColumns(cfg Pipeline) []string {
 	set := map[string]struct{}{}
 

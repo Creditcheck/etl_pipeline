@@ -47,10 +47,32 @@ type MultiDB struct {
 	Tables []storage.TableSpec `json:"tables"`
 }
 
+// RuntimeConfig controls pipeline execution behavior.
 type RuntimeConfig struct {
-	BatchSize        int `json:"batch_size"`
-	ChannelBuffer    int `json:"channel_buffer"`
-	LoaderWorkers    int `json:"loader_workers"`
 	ReaderWorkers    int `json:"reader_workers"`
 	TransformWorkers int `json:"transform_workers"`
+	LoaderWorkers    int `json:"loader_workers"`
+	BatchSize        int `json:"batch_size"`
+	ChannelBuffer    int `json:"channel_buffer"`
+
+	// DedupeDimensionKeys controls whether the engine deduplicates dimension keys.
+	// When false (recommended), the engine streams keys to the DB and relies on the
+	// backend's idempotent semantics (ON CONFLICT DO NOTHING / OR IGNORE / MERGE, etc).
+	//
+	// This should be false for high-cardinality dimensions (e.g., nearly-unique PCV),
+	// because global dedupe is memory-expensive and provides little benefit.
+	DedupeDimensionKeys bool `json:"dedupe_dimension_keys"`
+
+	// DedupeDimensionKeysWithinBatch controls whether the engine performs a small
+	// in-memory dedupe inside each batch before calling EnsureDimensionKeys.
+	// This is cheap and bounded and can reduce redundant DB work when input is noisy.
+	DedupeDimensionKeysWithinBatch bool `json:"dedupe_dimension_keys_within_batch"`
 }
+
+//type RuntimeConfig struct {
+//	BatchSize        int `json:"batch_size"`
+//	ChannelBuffer    int `json:"channel_buffer"`
+//	LoaderWorkers    int `json:"loader_workers"`
+//	ReaderWorkers    int `json:"reader_workers"`
+//	TransformWorkers int `json:"transform_workers"`
+//}
