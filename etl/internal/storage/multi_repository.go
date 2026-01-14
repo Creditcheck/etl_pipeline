@@ -3,52 +3,72 @@ package storage
 import (
 	"context"
 	"fmt"
+	"sync"
 )
 
-// MultiRepository is like Repository, but it can write to multiple destination tables.
-// It’s intentionally tiny: enough to support dimension/fact loading while allowing
-// reuse of the existing batched loader (LoadBatches) via BindTable.
+// MultiConfig is the minimal config needed to create a multi-table repository.
+type MultiConfig struct {
+	Kind string
+	DSN  string
+}
+
+// MultiRepository is a backend-agnostic interface for multi-table ETL.
+//
+// IMPORTANT: This interface is intentionally minimal and focused on the
+// operations the multi-table engine needs. Each backend implements these
+// semantics in its own idiomatic way (Postgres ON CONFLICT, SQLite OR IGNORE,
+// etc).
 type MultiRepository interface {
-	// CopyFromTable inserts rows into the given fully-qualified table name.
-	// The provided columns define the row order.
-	CopyFromTable(ctx context.Context, table string, columns []string, rows [][]any) (int64, error)
-
-	// Exec runs an arbitrary statement (DDL, etc.).
-	Exec(ctx context.Context, sql string) error
-
-	// Close releases held resources.
 	Close()
+
+	// EnsureTables creates tables and constraints as needed.
+	// (Backends may implement "create-if-not-exists" semantics, mirroring single-table.)
+	EnsureTables(ctx context.Context, tables []TableSpec) error
+
+	// Dimension APIs: idempotent key ensure + lookup.
+	EnsureDimensionKeys(ctx context.Context, table string, keyColumn string, keys []any, conflictColumns []string) error
+	SelectKeyValueByKeys(ctx context.Context, table string, keyColumn string, valueColumn string, keys []any) (map[string]int64, error)
+	SelectAllKeyValue(ctx context.Context, table string, keyColumn string, valueColumn string) (map[string]int64, error)
+
+	// Fact insert. Must be able to behave idempotently if dedupeColumns is provided.
+	InsertFactRows(ctx context.Context, table string, columns []string, rows [][]any, dedupeColumns []string) (int64, error)
 }
 
-// BindTable adapts a MultiRepository to the existing single-table Repository
-// interface by binding a fixed table name. This is the “minimal refactor” bridge:
-// existing code can keep using Repository + LoadBatches, while new code can
-// route to different tables by creating multiple bound repos.
-func BindTable(mr MultiRepository, table string) (Repository, error) {
-	if mr == nil {
-		return nil, fmt.Errorf("multi repository must not be nil")
+// ---- multi factories (mirrors storage.New for single-table) ----
+
+type multiFactory func(ctx context.Context, cfg MultiConfig) (MultiRepository, error)
+
+var (
+	multiMu        sync.RWMutex
+	multiFactories = map[string]multiFactory{}
+)
+
+// RegisterMulti registers a multi-table backend under a kind (e.g. "postgres", "sqlite").
+func RegisterMulti(kind string, f multiFactory) {
+	multiMu.Lock()
+	defer multiMu.Unlock()
+	if kind == "" {
+		panic("storage: RegisterMulti called with empty kind")
 	}
-	if table == "" {
-		return nil, fmt.Errorf("table must not be empty")
+	if f == nil {
+		panic("storage: RegisterMulti called with nil factory")
 	}
-	return &boundRepo{mr: mr, table: table}, nil
+	if _, exists := multiFactories[kind]; exists {
+		panic(fmt.Sprintf("storage: multi factory already registered for kind=%q", kind))
+	}
+	multiFactories[kind] = f
 }
 
-type boundRepo struct {
-	mr    MultiRepository
-	table string
-}
-
-var _ Repository = (*boundRepo)(nil)
-
-func (b *boundRepo) CopyFrom(ctx context.Context, columns []string, rows [][]any) (int64, error) {
-	return b.mr.CopyFromTable(ctx, b.table, columns, rows)
-}
-
-func (b *boundRepo) Exec(ctx context.Context, sql string) error {
-	return b.mr.Exec(ctx, sql)
-}
-
-func (b *boundRepo) Close() {
-	b.mr.Close()
+// NewMulti constructs a MultiRepository using the registered backend factory.
+func NewMulti(ctx context.Context, cfg MultiConfig) (MultiRepository, error) {
+	if cfg.Kind == "" {
+		return nil, fmt.Errorf("storage: missing multi.Kind")
+	}
+	multiMu.RLock()
+	f := multiFactories[cfg.Kind]
+	multiMu.RUnlock()
+	if f == nil {
+		return nil, fmt.Errorf("unsupported multi storage.kind=%s", cfg.Kind)
+	}
+	return f(ctx, cfg)
 }

@@ -4,10 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sort"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"etl/internal/config"
 	"etl/internal/schema"
@@ -15,19 +14,14 @@ import (
 )
 
 type Runner struct {
-	NewPool func(ctx context.Context, dsn string) (*pgxpool.Pool, error)
-
-	// storage-agnostic factory seam
-	NewRepository func(ctx context.Context, cfg storage.Config) (storage.Repository, error)
+	// Factory seam so runner is unit-testable.
+	NewMultiRepo func(ctx context.Context, cfg storage.MultiConfig) (storage.MultiRepository, error)
 }
 
 func NewDefaultRunner() *Runner {
 	return &Runner{
-		NewPool: func(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
-			return pgxpool.New(ctx, dsn)
-		},
-		NewRepository: func(ctx context.Context, cfg storage.Config) (storage.Repository, error) {
-			return storage.New(ctx, cfg)
+		NewMultiRepo: func(ctx context.Context, cfg storage.MultiConfig) (storage.MultiRepository, error) {
+			return storage.NewMulti(ctx, cfg)
 		},
 	}
 }
@@ -39,31 +33,30 @@ func (r *Runner) Run(ctx context.Context, cfg Pipeline) error {
 
 	dsn := os.ExpandEnv(cfg.Storage.DB.DSN)
 
-	pool, err := r.NewPool(ctx, dsn)
+	mr, err := r.NewMultiRepo(ctx, storage.MultiConfig{
+		Kind: cfg.Storage.Kind,
+		DSN:  dsn,
+	})
 	if err != nil {
-		return fmt.Errorf("db pool: %w", err)
+		return fmt.Errorf("multi repo: %w", err)
 	}
-	defer pool.Close()
+	defer mr.Close()
 
-	// Derive canonical input fields needed from config (no hardcoding).
 	columns := requiredInputColumns(cfg)
 
-	// Option 1: reuse existing parsing + transformer stack to produce typed, validated records.
-	// Implement this in internal/multitable/stream_stack.go (see below).
 	recs, err := StreamAndCollectRecords(ctx, cfg, columns)
 	if err != nil {
 		return err
 	}
 
-	// COPY router uses storage.New(), no backend imports here.
-	copyer := NewTableCopyer(r.NewRepository, storage.Config{
-		Kind: cfg.Storage.Kind,
-		DSN:  dsn,
-	})
-	defer copyer.Close()
+	// Timestamped, testable logger (injectable).
+	logger := log.New(os.Stdout, "", log.LstdFlags)
 
-	engine := &Engine{Pool: pool}
-	return engine.Run(ctx, cfg, recs, copyer)
+	engine := &Engine{
+		Repo:   mr,
+		Logger: logger,
+	}
+	return engine.Run(ctx, cfg, recs)
 }
 
 func validateMultiConfig(cfg Pipeline) error {
@@ -83,31 +76,6 @@ func validateMultiConfig(cfg Pipeline) error {
 		return fmt.Errorf("storage.db.tables must not be empty")
 	}
 	return nil
-}
-
-// requiredInputColumns derives the minimal set of canonical fields required by storage.db.tables[].load rules.
-func XXXrequiredInputColumns(cfg Pipeline) []string {
-	set := map[string]struct{}{}
-
-	for _, t := range cfg.Storage.DB.Tables {
-		for _, fr := range t.Load.FromRows {
-			if fr.SourceField != "" {
-				set[fr.SourceField] = struct{}{}
-			}
-			if fr.Lookup != nil {
-				for _, srcField := range fr.Lookup.Match {
-					set[srcField] = struct{}{}
-				}
-			}
-		}
-	}
-
-	out := make([]string, 0, len(set))
-	for c := range set {
-		out = append(out, c)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // requiredInputColumns derives the minimal set of canonical fields that must be present

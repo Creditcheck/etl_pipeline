@@ -2,347 +2,495 @@ package multitable
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"etl/internal/config"
+	"etl/internal/storage"
 )
 
-// Engine is a config-driven multi-table loader.
-// It is designed so planning and row-building can be unit-tested without Postgres.
-type Engine struct {
-	Pool *pgxpool.Pool
+// Record is the canonical row representation used inside the multitable pipeline.
+// Values are expected to already be coerced/validated by the transform layer.
+type Record map[string]any
+
+// Logger is the minimal logging interface used by Engine.
+// *log.Logger satisfies this interface.
+type Logger interface {
+	Printf(format string, v ...any)
 }
 
-// Run executes a multi-table pipeline in a generic, config-driven way:
-//  1. Create tables (DDL)
-//  2. Build plan (dimensions, lookups, caches)
-//  3. Ensure dimension tables contain required keys and build caches
-//  4. COPY load fact tables using lookups resolved from caches
+// LookupCache stores dimension key -> id mappings per table.
+// It is safe for concurrent use.
+type LookupCache struct {
+	mu   sync.RWMutex
+	data map[string]map[string]int64 // table -> normalizedKey -> id
+}
+
+// NewLookupCache returns an initialized lookup cache.
+func NewLookupCache() *LookupCache {
+	return &LookupCache{data: make(map[string]map[string]int64)}
+}
+
+// Get returns the cached ID for (table,key).
+func (c *LookupCache) Get(table, key string) (int64, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	m := c.data[table]
+	if m == nil {
+		return 0, false
+	}
+	v, ok := m[key]
+	return v, ok
+}
+
+// Put stores (table,key)->id in the cache.
+func (c *LookupCache) Put(table, key string, id int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	m := c.data[table]
+	if m == nil {
+		m = make(map[string]int64)
+		c.data[table] = m
+	}
+	m[key] = id
+}
+
+// Engine loads dimension and fact tables based on Pipeline configuration.
+// It is intentionally small and testable: storage access and logging are injected.
+type Engine struct {
+	Repo   storage.MultiRepository
+	Logger Logger
+}
+
+// Run executes a multi-table pipeline over already transformed records.
 //
-// IMPORTANT: The runner is responsible for producing typed, validated records
-// using the existing transformer stack (Option 1).
-func (e *Engine) Run(ctx context.Context, cfg Pipeline, recs []Record, mr MultiCopyer) error {
-	if e.Pool == nil {
-		return fmt.Errorf("engine requires Pool")
-	}
-	if mr == nil {
-		return fmt.Errorf("engine requires MultiCopyer")
-	}
-	if err := validateMulti(cfg); err != nil {
-		return err
+// Stages (timed):
+//  1. Ensure tables exist (DDL)
+//  2. Ensure + cache dimensions
+//  3. Load facts
+func (e *Engine) Run(ctx context.Context, cfg Pipeline, recs []Record) error {
+	if e.Repo == nil {
+		return fmt.Errorf("engine: Repo is required")
 	}
 
-	// 1) DDL
-	if err := ensureTables(ctx, e.Pool, cfg.Storage.DB.Tables); err != nil {
-		return err
-	}
+	logf := e.logger()
+	lenient := isLenient(cfg.Transform)
 
-	// 2) Build plan (dimensions needed, lookups, caches)
-	plan, err := BuildPlan(cfg)
+	plan, err := buildPlanFromPipeline(cfg)
 	if err != nil {
 		return err
 	}
 
-	// 3) Execute dimension loads + build caches
+	// 1) DDL
+	ddlStart := time.Now()
+	if err := e.Repo.EnsureTables(ctx, plan.AllTables()); err != nil {
+		return err
+	}
+	logf("stage=ddl ok duration=%s", time.Since(ddlStart).Truncate(time.Millisecond))
+
 	cache := NewLookupCache()
+
+	// 2) Dimensions
+	dimStart := time.Now()
 	for _, dim := range plan.DimensionsInOrder {
+		s := time.Now()
 		if err := e.ensureDimension(ctx, dim, recs, cache); err != nil {
 			return err
 		}
+		logf("stage=dimension table=%s ok duration=%s", dim.Table.Name, time.Since(s).Truncate(time.Millisecond))
 	}
+	logf("stage=dimensions ok duration=%s", time.Since(dimStart).Truncate(time.Millisecond))
 
-	// 4) Execute facts
+	// 3) Facts
+	factStart := time.Now()
 	for _, fact := range plan.FactsInOrder {
-		if err := e.loadFact(ctx, fact, recs, cache, mr); err != nil {
+		s := time.Now()
+		if err := e.loadFact(ctx, fact, recs, cache, lenient); err != nil {
 			return err
 		}
+		logf("stage=fact table=%s ok duration=%s", fact.Table.Name, time.Since(s).Truncate(time.Millisecond))
 	}
+	logf("stage=facts ok duration=%s", time.Since(factStart).Truncate(time.Millisecond))
 
 	return nil
 }
 
-// -------------------------
-// Plan
-// -------------------------
-
-type Plan struct {
-	DimensionsInOrder []TablePlan
-	FactsInOrder      []TablePlan
-
-	// quick access by table name
-	ByName map[string]TablePlan
-}
-
-type TablePlan struct {
-	Table TableSpec
-
-	// CacheSpec (optional): key -> id
-	Cache *CacheSpec
-
-	// For dimensions: which source fields are needed to produce their key column.
-	// For cache-based dims we currently assume one key column.
-	DimensionKeyColumn   string
-	DimensionSourceField string // canonical source field name
-
-	// For facts: list of output columns in final row order and how to produce them
-	Outputs []OutputExpr
-}
-
-type OutputExpr struct {
-	TargetColumn string
-
-	// Exactly one of:
-	SourceField string      // take value from record field
-	Lookup      *LookupExpr // resolve from cache
-}
-
-type LookupExpr struct {
-	LookupTable string // e.g. "public.vehicles"
-	// Match: db key column -> source field
-	LookupKeyColumn string // e.g. "pcv" or "name"
-	SourceField     string // e.g. "pcv" or "stat"
-	ReturnColumn    string // e.g. "vehicle_id" or "country_id" (must be int64)
-	OnMissing       string // "insert" (supported)
-}
-
-// BuildPlan inspects cfg.storage.db.tables and builds a generic execution plan.
-// It is pure and unit-testable.
-func BuildPlan(cfg Pipeline) (Plan, error) {
-	p := Plan{ByName: map[string]TablePlan{}}
-
-	// Index tables by name
-	specByName := map[string]TableSpec{}
-	for _, t := range cfg.Storage.DB.Tables {
-		if t.Name == "" {
-			return Plan{}, fmt.Errorf("table has empty name")
-		}
-		specByName[t.Name] = t
+func (e *Engine) logger() func(format string, v ...any) {
+	// Avoid untestable global logging. If no logger is provided,
+	// default to a logger that discards output (caller can inject one).
+	if e.Logger == nil {
+		l := log.New(discardWriter{}, "", 0)
+		return l.Printf
 	}
-
-	// First create plans for all tables
-	for _, t := range cfg.Storage.DB.Tables {
-		tp := TablePlan{Table: t}
-
-		if t.Load.Cache != nil {
-			tp.Cache = t.Load.Cache
-		}
-
-		switch t.Load.Kind {
-		case "dimension":
-			// Minimal requirement: cache.key/value so we can resolve lookups generically.
-			if tp.Cache == nil {
-				return Plan{}, fmt.Errorf("dimension table %s must define load.cache (minimal engine requirement)", t.Name)
-			}
-			tp.DimensionKeyColumn = tp.Cache.KeyColumn
-
-			// Determine source field for the dimension key from from_rows mapping
-			src, err := findSourceFieldForTarget(t.Load.FromRows, tp.DimensionKeyColumn)
-			if err != nil {
-				return Plan{}, fmt.Errorf("dimension %s: %w", t.Name, err)
-			}
-			tp.DimensionSourceField = src
-
-			p.DimensionsInOrder = append(p.DimensionsInOrder, tp)
-
-		case "fact":
-			outs, err := buildFactOutputs(t.Load.FromRows)
-			if err != nil {
-				return Plan{}, fmt.Errorf("fact %s: %w", t.Name, err)
-			}
-			tp.Outputs = outs
-			p.FactsInOrder = append(p.FactsInOrder, tp)
-
-		default:
-			return Plan{}, fmt.Errorf("table %s has unsupported load.kind: %s", t.Name, t.Load.Kind)
-		}
-
-		p.ByName[t.Name] = tp
-	}
-
-	// Ensure required lookup tables exist in config
-	requiredDims := map[string]struct{}{}
-	for _, fact := range p.FactsInOrder {
-		for _, out := range fact.Outputs {
-			if out.Lookup != nil {
-				requiredDims[out.Lookup.LookupTable] = struct{}{}
-			}
-		}
-	}
-	for name := range requiredDims {
-		if _, ok := p.ByName[name]; !ok {
-			return Plan{}, fmt.Errorf("fact requires lookup table %s but it is not in storage.db.tables", name)
-		}
-	}
-
-	return p, nil
+	return e.Logger.Printf
 }
 
-func findSourceFieldForTarget(from []FromRowSpec, target string) (string, error) {
-	for _, fr := range from {
-		if fr.TargetColumn != target {
-			continue
-		}
-		if fr.SourceField == "" {
-			return "", fmt.Errorf("target_column %q has no source_field", target)
-		}
-		return fr.SourceField, nil
-	}
-	return "", fmt.Errorf("no from_rows mapping found for target_column %q", target)
-}
-
-func buildFactOutputs(from []FromRowSpec) ([]OutputExpr, error) {
-	var outs []OutputExpr
-	for _, fr := range from {
-		if fr.TargetColumn == "" {
-			return nil, fmt.Errorf("from_rows entry has empty target_column")
-		}
-		oe := OutputExpr{TargetColumn: fr.TargetColumn}
-		if fr.Lookup != nil {
-			lk, err := toLookupExpr(*fr.Lookup)
-			if err != nil {
-				return nil, err
-			}
-			oe.Lookup = &lk
-		} else {
-			if fr.SourceField == "" {
-				return nil, fmt.Errorf("target_column %q requires source_field or lookup", fr.TargetColumn)
-			}
-			oe.SourceField = fr.SourceField
-		}
-		outs = append(outs, oe)
-	}
-	return outs, nil
-}
-
-func toLookupExpr(l LookupSpec) (LookupExpr, error) {
-	if l.Table == "" || l.Return == "" || len(l.Match) != 1 {
-		return LookupExpr{}, fmt.Errorf("lookup must specify table, return and exactly one match column (minimal engine requirement)")
-	}
-	var keyCol, srcField string
-	for k, v := range l.Match {
-		keyCol, srcField = k, v
-	}
-	if keyCol == "" || srcField == "" {
-		return LookupExpr{}, fmt.Errorf("lookup.match must map db key column -> source field")
-	}
-	return LookupExpr{
-		LookupTable:     l.Table,
-		LookupKeyColumn: keyCol,
-		SourceField:     srcField,
-		ReturnColumn:    l.Return,
-		OnMissing:       l.OnMissing,
-	}, nil
-}
-
-// -------------------------
-// Record model
-// -------------------------
-
-// Record is a canonical field map after header mapping.
-// Values must already be typed+validated by the runner (transformer stack).
-type Record map[string]any
-
-// -------------------------
-// Lookup cache (generic)
-// -------------------------
-
-// LookupCache stores single-column key -> int64 id for any lookup table.
-type LookupCache struct {
-	// tableName -> keyString -> id
-	m map[string]map[string]int64
-}
-
-func NewLookupCache() *LookupCache {
-	return &LookupCache{m: map[string]map[string]int64{}}
-}
-
-func (c *LookupCache) Get(table, key string) (int64, bool) {
-	tm, ok := c.m[table]
-	if !ok {
-		return 0, false
-	}
-	v, ok := tm[key]
-	return v, ok
-}
-
-func (c *LookupCache) Put(table, key string, id int64) {
-	tm, ok := c.m[table]
-	if !ok {
-		tm = map[string]int64{}
-		c.m[table] = tm
-	}
-	tm[key] = id
-}
-
-// -------------------------
-// Dimension ensuring (generic)
-// -------------------------
-
+// ensureDimension ensures all dimension keys exist in the dimension table and are cached.
+//
+// Performance:
+// If Cache.Prewarm is true, we do a *targeted prewarm* (only keys needed for this run),
+// not a full-table scan. Full scans are too expensive for large dimensions and small batches.
 func (e *Engine) ensureDimension(ctx context.Context, dim TablePlan, recs []Record, cache *LookupCache) error {
+	logf := e.logger()
+
 	if dim.Cache == nil {
-		return fmt.Errorf("dimension %s has no cache spec", dim.Table.Name)
+		return fmt.Errorf("dimension %s: missing cache spec", dim.Table.Name)
 	}
+
 	keyCol := dim.Cache.KeyColumn
 	valCol := dim.Cache.ValueColumn
 
-	// 1) Prewarm cache if requested
+	// Collect distinct needed keys (normalized for cache) and typed values for DB binding.
+	keysNeeded, typedByKey, err := collectDistinctKeyValuesFromRecords(recs, dim.DimensionSourceField)
+	if err != nil {
+		return fmt.Errorf("dimension %s: collect keys: %w", dim.Table.Name, err)
+	}
+	if len(keysNeeded) == 0 {
+		logf("stage=dimension table=%s needed_keys=0 (skipping)", dim.Table.Name)
+		return nil
+	}
+
+	// Build the typed key list once (used for prewarm/select/insert).
+	allKeysAny := make([]any, 0, len(keysNeeded))
+	for _, k := range keysNeeded {
+		allKeysAny = append(allKeysAny, typedByKey[k])
+	}
+
+	// Prewarm cache if configured: targeted prewarm for needed keys only.
 	if dim.Cache.Prewarm {
-		kv, err := e.selectAllKeyValue(ctx, dim.Table.Name, keyCol, valCol)
+		s := time.Now()
+		kv, err := e.Repo.SelectKeyValueByKeys(ctx, dim.Table.Name, keyCol, valCol, allKeysAny)
 		if err != nil {
 			return err
 		}
 		for k, v := range kv {
 			cache.Put(dim.Table.Name, k, v)
 		}
+		logf("stage=dimension_prewarm table=%s mode=targeted needed_keys=%d cached=%d duration=%s",
+			dim.Table.Name, len(keysNeeded), len(kv), time.Since(s).Truncate(time.Millisecond))
 	}
 
-	// 2) Collect required keys from records
-	keysNeeded, err := collectDistinctKeysFromRecords(recs, dim.DimensionSourceField)
-	if err != nil {
-		return fmt.Errorf("collect keys for %s: %w", dim.Table.Name, err)
+	// Conflict columns fall back to the cache key column.
+	conflictCols := []string{keyCol}
+	if dim.Table.Load.Conflict != nil && len(dim.Table.Load.Conflict.TargetColumns) > 0 {
+		conflictCols = dim.Table.Load.Conflict.TargetColumns
 	}
 
-	// 3) Insert missing keys
+	// Insert missing keys.
 	var missing []any
 	for _, k := range keysNeeded {
-		if _, ok := cache.Get(dim.Table.Name, k); !ok {
-			missing = append(missing, parseKeyAny(k))
+		if _, ok := cache.Get(dim.Table.Name, k); ok {
+			continue
 		}
+		missing = append(missing, typedByKey[k])
 	}
+
 	if len(missing) > 0 {
-		if err := e.insertDimensionKeys(ctx, dim.Table, keyCol, missing); err != nil {
+		s := time.Now()
+		if err := e.Repo.EnsureDimensionKeys(ctx, dim.Table.Name, keyCol, missing, conflictCols); err != nil {
 			return err
 		}
+		logf("stage=dimension_insert table=%s inserted_or_ensured=%d duration=%s",
+			dim.Table.Name, len(missing), time.Since(s).Truncate(time.Millisecond))
+
+		// Refresh only the missing keys (cheap).
+		s2 := time.Now()
+		kv, err := e.Repo.SelectKeyValueByKeys(ctx, dim.Table.Name, keyCol, valCol, missing)
+		if err != nil {
+			return err
+		}
+		for k, v := range kv {
+			cache.Put(dim.Table.Name, k, v)
+		}
+		logf("stage=dimension_refresh table=%s refreshed=%d duration=%s",
+			dim.Table.Name, len(kv), time.Since(s2).Truncate(time.Millisecond))
 	}
 
-	// 4) Fetch ids for all keys and populate cache
-	kv, err := e.selectKeyValueByKeys(ctx, dim.Table.Name, keyCol, valCol, keysNeeded)
-	if err != nil {
-		return err
-	}
-	for k, v := range kv {
-		cache.Put(dim.Table.Name, k, v)
-	}
-
-	// 5) Validate completeness
+	// Verify coverage after insert+select.
 	for _, k := range keysNeeded {
 		if _, ok := cache.Get(dim.Table.Name, k); !ok {
 			return fmt.Errorf("failed to resolve %s for key=%q in %s", valCol, k, dim.Table.Name)
 		}
 	}
 
+	logf("stage=dimension table=%s needed_keys=%d ok", dim.Table.Name, len(keysNeeded))
 	return nil
 }
 
-func collectDistinctKeysFromRecords(recs []Record, sourceField string) ([]string, error) {
-	if sourceField == "" {
-		return nil, fmt.Errorf("sourceField is empty")
+// loadFact loads the fact table rows. In lenient mode, unresolved lookups drop the row.
+// In strict mode, unresolved lookups fail the run.
+//
+// Performance note:
+// For lookup columns with on_missing=insert, we batch missing keys:
+//   - 1 insert (chunked in repo) + 1 select per lookup-table per fact load
+//
+// instead of per-row insert/select.
+func (e *Engine) loadFact(ctx context.Context, fact TablePlan, recs []Record, cache *LookupCache, lenient bool) error {
+	logf := e.logger()
+
+	cols := make([]string, 0, len(fact.FactColumns))
+	for _, c := range fact.FactColumns {
+		cols = append(cols, c.TargetColumn)
 	}
-	set := map[string]struct{}{}
+
+	// Phase A: batch ensure + refresh cache for lookup columns with on_missing=insert.
+	type lookupKey struct {
+		table        string
+		matchColumn  string
+		returnColumn string
+	}
+
+	// missing[lk][normalizedKey] = typedValue
+	missing := make(map[lookupKey]map[string]any)
+
+	for _, r := range recs {
+		for _, o := range fact.FactColumns {
+			if o.Lookup == nil || o.Lookup.OnMissing != "insert" {
+				continue
+			}
+
+			v := r[o.Lookup.MatchField]
+			nk := normalizeKey(v)
+			if nk == "" {
+				continue
+			}
+			if _, ok := cache.Get(o.Lookup.LookupTable, nk); ok {
+				continue
+			}
+
+			lk := lookupKey{
+				table:        o.Lookup.LookupTable,
+				matchColumn:  o.Lookup.MatchColumn,
+				returnColumn: o.Lookup.ReturnColumn,
+			}
+			m := missing[lk]
+			if m == nil {
+				m = make(map[string]any)
+				missing[lk] = m
+			}
+			if _, exists := m[nk]; exists {
+				continue
+			}
+
+			// Typed bind value (preserve strings like "000").
+			m[nk] = typedBindValue(v)
+		}
+	}
+
+	for lk, m := range missing {
+		if len(m) == 0 {
+			continue
+		}
+		keysAny := make([]any, 0, len(m))
+		for _, v := range m {
+			keysAny = append(keysAny, v)
+		}
+
+		if err := e.Repo.EnsureDimensionKeys(ctx, lk.table, lk.matchColumn, keysAny, []string{lk.matchColumn}); err != nil {
+			return err
+		}
+		kv, err := e.Repo.SelectKeyValueByKeys(ctx, lk.table, lk.matchColumn, lk.returnColumn, keysAny)
+		if err != nil {
+			return err
+		}
+		for kk, vv := range kv {
+			cache.Put(lk.table, kk, vv)
+		}
+	}
+
+	// Phase B: build fact rows using cache.
+	outRows := make([][]any, 0, len(recs))
+	var dropped, misses int
+
+	for _, r := range recs {
+		outRow := make([]any, 0, len(fact.FactColumns))
+		drop := false
+
+		for _, o := range fact.FactColumns {
+			if o.Lookup != nil {
+				key := normalizeKey(r[o.Lookup.MatchField])
+				id, ok := cache.Get(o.Lookup.LookupTable, key)
+				if !ok {
+					misses++
+					if lenient {
+						drop = true
+						break
+					}
+					return fmt.Errorf("fact %s: lookup miss table=%s key=%q", fact.Table.Name, o.Lookup.LookupTable, key)
+				}
+				outRow = append(outRow, id)
+				continue
+			}
+
+			if o.SourceField != "" {
+				outRow = append(outRow, r[o.SourceField])
+				continue
+			}
+
+			outRow = append(outRow, nil)
+		}
+
+		if drop {
+			dropped++
+			continue
+		}
+		outRows = append(outRows, outRow)
+	}
+
+	if len(outRows) == 0 {
+		if lenient && (dropped > 0 || misses > 0) {
+			logf("stage=fact table=%s dropped=%d misses=%d (no rows inserted)", fact.Table.Name, dropped, misses)
+		}
+		return nil
+	}
+
+	var dedupeCols []string
+	if fact.Table.Load.Dedupe != nil && len(fact.Table.Load.Dedupe.ConflictColumns) > 0 {
+		dedupeCols = append(dedupeCols, fact.Table.Load.Dedupe.ConflictColumns...)
+	}
+
+	_, err := e.Repo.InsertFactRows(ctx, fact.Table.Name, cols, outRows, dedupeCols)
+	if err == nil && lenient && (dropped > 0 || misses > 0) {
+		logf("stage=fact table=%s inserted=%d dropped=%d misses=%d", fact.Table.Name, len(outRows), dropped, misses)
+	}
+	return err
+}
+
+// ---- Plan types + building ----
+
+// Plan is the minimal execution plan needed by Engine.
+type Plan struct {
+	DimensionsInOrder []TablePlan
+	FactsInOrder      []TablePlan
+}
+
+// AllTables returns the union of dimension + fact table specs.
+func (p Plan) AllTables() []storage.TableSpec {
+	out := make([]storage.TableSpec, 0, len(p.DimensionsInOrder)+len(p.FactsInOrder))
+	for _, t := range p.DimensionsInOrder {
+		out = append(out, t.Table)
+	}
+	for _, t := range p.FactsInOrder {
+		out = append(out, t.Table)
+	}
+	return out
+}
+
+// TablePlan describes either a dimension table or a fact table.
+type TablePlan struct {
+	Table storage.TableSpec
+
+	// Dimension fields
+	DimensionSourceField string
+	Cache                *storage.CacheSpec
+
+	// Fact fields
+	FactColumns []FactColumnPlan
+}
+
+// FactColumnPlan describes how to populate one target column in the fact table.
+type FactColumnPlan struct {
+	TargetColumn string
+	SourceField  string
+	Lookup       *LookupPlan
+}
+
+// LookupPlan describes a dimension lookup for a fact column.
+type LookupPlan struct {
+	LookupTable  string
+	MatchColumn  string
+	MatchField   string
+	ReturnColumn string
+	OnMissing    string
+}
+
+// buildPlanFromPipeline builds Engine's plan from Pipeline config.
+func buildPlanFromPipeline(cfg Pipeline) (Plan, error) {
+	var plan Plan
+	for _, t := range cfg.Storage.DB.Tables {
+		switch t.Load.Kind {
+		case "dimension":
+			var src string
+			if len(t.Load.FromRows) > 0 {
+				src = t.Load.FromRows[0].SourceField
+			}
+			plan.DimensionsInOrder = append(plan.DimensionsInOrder, TablePlan{
+				Table:                t,
+				DimensionSourceField: src,
+				Cache:                t.Load.Cache,
+			})
+
+		case "fact":
+			tp := TablePlan{Table: t}
+			for _, fr := range t.Load.FromRows {
+				if fr.Lookup != nil {
+					// Support a single match mapping.
+					var matchCol, matchField string
+					for k, v := range fr.Lookup.Match {
+						matchCol = k
+						matchField = v
+						break
+					}
+					tp.FactColumns = append(tp.FactColumns, FactColumnPlan{
+						TargetColumn: fr.TargetColumn,
+						Lookup: &LookupPlan{
+							LookupTable:  fr.Lookup.Table,
+							MatchColumn:  matchCol,
+							MatchField:   matchField,
+							ReturnColumn: fr.Lookup.Return,
+							OnMissing:    fr.Lookup.OnMissing,
+						},
+					})
+				} else {
+					tp.FactColumns = append(tp.FactColumns, FactColumnPlan{
+						TargetColumn: fr.TargetColumn,
+						SourceField:  fr.SourceField,
+					})
+				}
+			}
+			plan.FactsInOrder = append(plan.FactsInOrder, tp)
+
+		default:
+			return plan, fmt.Errorf("table %s: unknown load kind %q", t.Name, t.Load.Kind)
+		}
+	}
+	return plan, nil
+}
+
+// isLenient returns true if any validate transform has policy "lenient".
+func isLenient(ts []config.Transform) bool {
+	for _, t := range ts {
+		if t.Kind != "validate" {
+			continue
+		}
+		p := strings.ToLower(strings.TrimSpace(fmt.Sprint(t.Options.Any("policy"))))
+		if p == "lenient" {
+			return true
+		}
+	}
+	return false
+}
+
+// collectDistinctKeyValuesFromRecords returns:
+//  1. sorted normalized keys (for cache keying)
+//  2. mapping normalized key -> typed value (for DB binding)
+//
+// This intentionally avoids guessing/parsing keys; it preserves transform output
+// (e.g., "000" stays "000" when coerced as text).
+func collectDistinctKeyValuesFromRecords(recs []Record, sourceField string) ([]string, map[string]any, error) {
+	if sourceField == "" {
+		return nil, nil, fmt.Errorf("sourceField is empty")
+	}
+
+	set := make(map[string]struct{})
+	typed := make(map[string]any, len(recs))
+
 	for _, r := range recs {
 		v, ok := r[sourceField]
 		if !ok || v == nil {
@@ -352,455 +500,48 @@ func collectDistinctKeysFromRecords(recs []Record, sourceField string) ([]string
 		if k == "" {
 			continue
 		}
-		set[k] = struct{}{}
+		if _, exists := set[k]; !exists {
+			set[k] = struct{}{}
+			typed[k] = typedBindValue(v)
+		}
 	}
+
 	out := make([]string, 0, len(set))
 	for k := range set {
 		out = append(out, k)
 	}
 	sort.Strings(out)
-	return out, nil
+	return out, typed, nil
 }
 
+// normalizeKey creates a stable cache key representation.
 func normalizeKey(v any) string {
 	switch t := v.(type) {
+	case nil:
+		return ""
 	case string:
 		return strings.TrimSpace(t)
-	case int64:
-		return fmt.Sprintf("%d", t)
-	case int:
-		return fmt.Sprintf("%d", t)
+	case []byte:
+		return strings.TrimSpace(string(t))
 	default:
 		return strings.TrimSpace(fmt.Sprint(v))
 	}
 }
 
-// parseKeyAny keeps numeric keys numeric for insert if possible.
-func parseKeyAny(key string) any {
-	if key == "" {
-		return ""
+// typedBindValue returns a value suitable for DB binding that preserves strings.
+func typedBindValue(v any) any {
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t)
+	case []byte:
+		return strings.TrimSpace(string(t))
+	default:
+		return v
 	}
-	n, err := parseInt64(key)
-	if err == nil {
-		return n
-	}
-	return key
 }
 
-func (e *Engine) insertDimensionKeys(ctx context.Context, table TableSpec, keyCol string, keys []any) error {
-	if len(keys) == 0 {
-		return nil
-	}
+// discardWriter is an io.Writer that discards all writes.
+// Avoids depending on io.Discard to keep this file self-contained.
+type discardWriter struct{}
 
-	var b strings.Builder
-	b.WriteString("INSERT INTO ")
-	b.WriteString(table.Name)
-	b.WriteString(" (")
-	b.WriteString(pgIdent(keyCol))
-	b.WriteString(") VALUES ")
-
-	args := make([]any, 0, len(keys))
-	for i, k := range keys {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(fmt.Sprintf("($%d)", i+1))
-		args = append(args, k)
-	}
-
-	conflictCols := []string{keyCol}
-	if table.Load.Conflict != nil && len(table.Load.Conflict.TargetColumns) > 0 {
-		conflictCols = table.Load.Conflict.TargetColumns
-	}
-
-	b.WriteString(" ON CONFLICT (")
-	for i, c := range conflictCols {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(pgIdent(c))
-	}
-	b.WriteString(") DO NOTHING;")
-
-	if _, err := e.Pool.Exec(ctx, b.String(), args...); err != nil {
-		return fmt.Errorf("insert dimension keys into %s: %w", table.Name, err)
-	}
-	return nil
-}
-
-func (e *Engine) selectAllKeyValue(ctx context.Context, table, keyCol, valCol string) (map[string]int64, error) {
-	q := fmt.Sprintf(`SELECT %s, %s FROM %s`, pgIdent(keyCol), pgIdent(valCol), table)
-	rows, err := e.Pool.Query(ctx, q)
-	if err != nil {
-		return nil, fmt.Errorf("select prewarm %s: %w", table, err)
-	}
-	defer rows.Close()
-
-	out := map[string]int64{}
-	for rows.Next() {
-		var key any
-		var id int64
-		if err := rows.Scan(&key, &id); err != nil {
-			return nil, fmt.Errorf("prewarm scan %s: %w", table, err)
-		}
-		out[normalizeKey(key)] = id
-	}
-	return out, rows.Err()
-}
-
-func (e *Engine) selectKeyValueByKeys(ctx context.Context, table, keyCol, valCol string, keys []string) (map[string]int64, error) {
-	if len(keys) == 0 {
-		return map[string]int64{}, nil
-	}
-
-	// If all keys parse as int64, query with []int64; else query with []string.
-	allNumeric := true
-	ints := make([]int64, 0, len(keys))
-	for _, k := range keys {
-		n, err := parseInt64(k)
-		if err != nil {
-			allNumeric = false
-			break
-		}
-		ints = append(ints, n)
-	}
-
-	var (
-		rows any
-		err  error
-	)
-
-	q := fmt.Sprintf(`SELECT %s, %s FROM %s WHERE %s = ANY($1)`,
-		pgIdent(keyCol), pgIdent(valCol), table, pgIdent(keyCol),
-	)
-
-	if allNumeric {
-		r, e2 := e.Pool.Query(ctx, q, ints)
-		rows, err = r, e2
-	} else {
-		r, e2 := e.Pool.Query(ctx, q, keys)
-		rows, err = r, e2
-	}
-	if err != nil {
-		return nil, fmt.Errorf("select %s by keys: %w", table, err)
-	}
-
-	pgxRows, ok := rows.(interface {
-		Next() bool
-		Scan(...any) error
-		Close()
-		Err() error
-	})
-	if !ok {
-		return nil, errors.New("internal: unexpected rows type")
-	}
-	defer pgxRows.Close()
-
-	out := map[string]int64{}
-	for pgxRows.Next() {
-		var key any
-		var id int64
-		if err := pgxRows.Scan(&key, &id); err != nil {
-			return nil, fmt.Errorf("select scan %s: %w", table, err)
-		}
-		out[normalizeKey(key)] = id
-	}
-	return out, pgxRows.Err()
-}
-
-func parseInt64(s string) (int64, error) {
-	var neg bool
-	if strings.HasPrefix(s, "-") {
-		neg = true
-		s = strings.TrimPrefix(s, "-")
-	}
-	if s == "" {
-		return 0, fmt.Errorf("empty int")
-	}
-	var n int64
-	for _, ch := range s {
-		if ch < '0' || ch > '9' {
-			return 0, fmt.Errorf("invalid digit %q", ch)
-		}
-		n = n*10 + int64(ch-'0')
-	}
-	if neg {
-		n = -n
-	}
-	return n, nil
-}
-
-// -------------------------
-// Fact load (generic)
-// -------------------------
-
-// MultiCopyer is the minimal interface the Engine needs to COPY into any table.
-// It matches your earlier MultiRepository.CopyFromTable.
-type MultiCopyer interface {
-	CopyFromTable(ctx context.Context, table string, columns []string, rows [][]any) (int64, error)
-}
-
-func (e *Engine) loadFact(ctx context.Context, fact TablePlan, recs []Record, cache *LookupCache, mr MultiCopyer) error {
-	if fact.Table.Load.Kind != "fact" {
-		return fmt.Errorf("table %s is not fact", fact.Table.Name)
-	}
-
-	columns := make([]string, 0, len(fact.Outputs))
-	for _, o := range fact.Outputs {
-		columns = append(columns, o.TargetColumn)
-	}
-
-	rows := make([][]any, 0, len(recs))
-	for _, r := range recs {
-		outRow := make([]any, 0, len(fact.Outputs))
-		for _, o := range fact.Outputs {
-			if o.Lookup != nil {
-				keyVal, ok := r[o.Lookup.SourceField]
-				if !ok || keyVal == nil {
-					return fmt.Errorf("fact %s: missing lookup source field %q", fact.Table.Name, o.Lookup.SourceField)
-				}
-				key := normalizeKey(keyVal)
-
-				id, ok := cache.Get(o.Lookup.LookupTable, key)
-				if !ok {
-					return fmt.Errorf("fact %s: lookup miss table=%s key=%q (ensure dimension first)", fact.Table.Name, o.Lookup.LookupTable, key)
-				}
-				outRow = append(outRow, id)
-			} else {
-				outRow = append(outRow, r[o.SourceField])
-			}
-		}
-		rows = append(rows, outRow)
-	}
-
-	// If no dedupe requested, keep current behavior (fast append).
-	if fact.Table.Load.Dedupe == nil {
-		_, err := mr.CopyFromTable(ctx, fact.Table.Name, columns, rows)
-		if err != nil {
-			return fmt.Errorf("copy fact %s: %w", fact.Table.Name, err)
-		}
-		return nil
-	}
-
-	// Dedupe requested: COPY into temp staging, then INSERT ... ON CONFLICT ...
-	d := fact.Table.Load.Dedupe
-	if len(d.ConflictColumns) == 0 {
-		return fmt.Errorf("fact %s: dedupe.conflict_columns is empty", fact.Table.Name)
-	}
-	if d.Action != "do_nothing" {
-		return fmt.Errorf("fact %s: unsupported dedupe.action=%q (supported: do_nothing)", fact.Table.Name, d.Action)
-	}
-
-	// IMPORTANT: ON CONFLICT requires a UNIQUE/PK constraint that matches conflict_columns.
-	// Also note: UNIQUE constraints do NOT treat NULLs as equal in Postgres.
-	//
-	// Use a single transaction with a TEMP table so reruns are idempotent.
-	conn, err := e.Pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("fact %s: acquire conn: %w", fact.Table.Name, err)
-	}
-	defer conn.Release()
-
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("fact %s: begin: %w", fact.Table.Name, err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	tmp := tempTableNameFor(fact.Table.Name)
-
-	// Create temp table with the same shape as target table.
-	// We do NOT include constraints on the temp table.
-	createTmp := fmt.Sprintf(`CREATE TEMP TABLE %s (LIKE %s INCLUDING DEFAULTS)`, pgIdent(tmp), fact.Table.Name)
-	if _, err := tx.Exec(ctx, createTmp); err != nil {
-		return fmt.Errorf("fact %s: create temp table: %w", fact.Table.Name, err)
-	}
-
-	// COPY into temp table
-	// Use pgx.Tx.CopyFrom to keep it in the same transaction/connection.
-	ident, err := pgxIdentFromQualified(tmp)
-	if err != nil {
-		return fmt.Errorf("fact %s: temp ident: %w", fact.Table.Name, err)
-	}
-	pgxCols := make([]string, 0, len(columns))
-	for _, c := range columns {
-		pgxCols = append(pgxCols, c)
-	}
-	if _, err := tx.CopyFrom(ctx, ident, pgxCols, pgx.CopyFromRows(rows)); err != nil {
-		return fmt.Errorf("fact %s: copy into temp: %w", fact.Table.Name, err)
-	}
-
-	// INSERT into target with ON CONFLICT DO NOTHING
-	ins := buildInsertOnConflictDoNothingSQL(fact.Table.Name, tmp, columns, d.ConflictColumns)
-	if _, err := tx.Exec(ctx, ins); err != nil {
-		return fmt.Errorf("fact %s: upsert insert: %w", fact.Table.Name, err)
-	}
-
-	// Drop temp table explicitly (TEMP tables are session-scoped; explicit drop avoids surprises).
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TABLE %s`, pgIdent(tmp))); err != nil {
-		return fmt.Errorf("fact %s: drop temp: %w", fact.Table.Name, err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("fact %s: commit: %w", fact.Table.Name, err)
-	}
-
-	return nil
-}
-
-// -------------------------
-// DDL (kept minimal)
-// -------------------------
-
-func ensureTables(ctx context.Context, pool *pgxpool.Pool, tables []TableSpec) error {
-	for _, t := range tables {
-		if !t.AutoCreateTable {
-			continue
-		}
-		sql, err := buildCreateTableSQL(t)
-		if err != nil {
-			return err
-		}
-		if _, err := pool.Exec(ctx, sql); err != nil {
-			return fmt.Errorf("create table %s: %w", t.Name, err)
-		}
-	}
-	return nil
-}
-
-func buildCreateTableSQL(t TableSpec) (string, error) {
-	if t.Name == "" {
-		return "", fmt.Errorf("table name is empty")
-	}
-	var parts []string
-
-	if t.PrimaryKey != nil {
-		pkType := strings.TrimSpace(t.PrimaryKey.Type)
-		if pkType == "" {
-			return "", fmt.Errorf("%s primary_key.type is empty", t.Name)
-		}
-		parts = append(parts, fmt.Sprintf("%s %s PRIMARY KEY", pgIdent(t.PrimaryKey.Name), pkType))
-	}
-
-	for _, c := range t.Columns {
-		if c.Name == "" || c.Type == "" {
-			return "", fmt.Errorf("%s has column with empty name/type", t.Name)
-		}
-		col := fmt.Sprintf("%s %s", pgIdent(c.Name), c.Type)
-
-		nullable := true
-		if c.Nullable != nil {
-			nullable = *c.Nullable
-		}
-		if !nullable {
-			col += " NOT NULL"
-		}
-		if c.References != "" {
-			col += " REFERENCES " + c.References
-		}
-		parts = append(parts, col)
-	}
-
-	for _, con := range t.Constraints {
-		switch con.Kind {
-		case "unique":
-			if len(con.Columns) == 0 {
-				return "", fmt.Errorf("%s unique constraint has no columns", t.Name)
-			}
-			cols := make([]string, 0, len(con.Columns))
-			for _, c := range con.Columns {
-				cols = append(cols, pgIdent(c))
-			}
-			parts = append(parts, fmt.Sprintf("UNIQUE (%s)", strings.Join(cols, ", ")))
-		default:
-			return "", fmt.Errorf("%s unsupported constraint kind: %s", t.Name, con.Kind)
-		}
-	}
-
-	return fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (\n  %s\n);", t.Name, strings.Join(parts, ",\n  ")), nil
-}
-
-func pgIdent(id string) string {
-	return `"` + strings.ReplaceAll(id, `"`, `""`) + `"`
-}
-
-// -------------------------
-// Validation
-// -------------------------
-
-func validateMulti(cfg Pipeline) error {
-	// Engine only needs storage/db tables at this point.
-	if cfg.Storage.Kind == "" {
-		return fmt.Errorf("storage.kind must not be empty")
-	}
-	if cfg.Storage.Kind != "postgres" {
-		return fmt.Errorf("storage.kind must be postgres")
-	}
-	if cfg.Storage.DB.Mode != "multi_table" {
-		return fmt.Errorf("storage.db.mode must be multi_table")
-	}
-	if len(cfg.Storage.DB.Tables) == 0 {
-		return fmt.Errorf("storage.db.tables must not be empty")
-	}
-	return nil
-}
-
-// tempTableNameFor creates a safe unqualified temp table name.
-func tempTableNameFor(qualifiedTarget string) string {
-	// "public.imports" -> "tmp_imports"
-	base := qualifiedTarget
-	if i := strings.LastIndex(base, "."); i >= 0 {
-		base = base[i+1:]
-	}
-	base = strings.Map(func(r rune) rune {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
-			return r
-		}
-		return '_'
-	}, base)
-	return "tmp_" + strings.ToLower(base)
-}
-
-func buildInsertOnConflictDoNothingSQL(targetTable, tmpTable string, cols []string, conflictCols []string) string {
-	colList := make([]string, 0, len(cols))
-	selList := make([]string, 0, len(cols))
-	for _, c := range cols {
-		colList = append(colList, pgIdent(c))
-		selList = append(selList, pgIdent(c))
-	}
-
-	confList := make([]string, 0, len(conflictCols))
-	for _, c := range conflictCols {
-		confList = append(confList, pgIdent(c))
-	}
-
-	return fmt.Sprintf(
-		`INSERT INTO %s (%s)
-SELECT %s FROM %s
-ON CONFLICT (%s) DO NOTHING`,
-		targetTable,
-		strings.Join(colList, ", "),
-		strings.Join(selList, ", "),
-		pgIdent(tmpTable),
-		strings.Join(confList, ", "),
-	)
-}
-
-// pgxIdentFromQualified parses "public.imports" or "tmp_imports" into pgx.Identifier.
-func pgxIdentFromQualified(name string) (pgx.Identifier, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return nil, fmt.Errorf("empty table name")
-	}
-	if strings.Contains(name, `"`) {
-		return nil, fmt.Errorf("quoted identifiers not supported here: %q", name)
-	}
-	parts := strings.Split(name, ".")
-	if len(parts) == 1 {
-		return pgx.Identifier{parts[0]}, nil
-	}
-	if len(parts) == 2 {
-		return pgx.Identifier{parts[0], parts[1]}, nil
-	}
-	return nil, fmt.Errorf("invalid table name %q", name)
-}
+func (discardWriter) Write(p []byte) (n int, err error) { return len(p), nil }

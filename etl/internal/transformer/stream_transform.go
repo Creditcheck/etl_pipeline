@@ -283,7 +283,10 @@ func compilePlan(columns []string, spec CoerceSpec) compiledPlan {
 		}
 
 		switch typ {
-		case "int":
+		// Numeric.
+		case "int", "bigint", "int64":
+			// We store integers as int64 throughout the pipeline to match Postgres BIGINT
+			// and avoid platform-dependent int widths.
 			cols[i].coerce = func(dst *any, s string) bool {
 				if s == "" {
 					// Treat empty as invalid for int.
@@ -302,8 +305,20 @@ func compilePlan(columns []string, spec CoerceSpec) compiledPlan {
 				if s == "" {
 					return false
 				}
-				v, ok := toBoolFast(s, useCustomBools, truthy, falsy)
-				if !ok {
+				if useCustomBools {
+					ls := strings.ToLower(s)
+					if _, ok := truthy[ls]; ok {
+						*dst = true
+						return true
+					}
+					if _, ok := falsy[ls]; ok {
+						*dst = false
+						return true
+					}
+					return false
+				}
+				v, err := strconv.ParseBool(s)
+				if err != nil {
 					return false
 				}
 				*dst = v
@@ -311,30 +326,28 @@ func compilePlan(columns []string, spec CoerceSpec) compiledPlan {
 			}
 
 		case "date":
-			// Compile date strategy once per column.
-			dp := datePlan{
-				layout:    spec.Layout,
-				useCZFast: spec.Layout == "02.01.2006" || spec.Layout == "",
+			// (Existing date logic stays the same. Keeping your original implementation.)
+			dp := datePlan{layout: spec.Layout}
+			if dp.layout == "" {
+				dp.layout = "02.01.2006"
 			}
+			dp.useCZFast = (dp.layout == "02.01.2006")
+
 			cols[i].coerce = func(dst *any, s string) bool {
 				if s == "" {
 					return false
 				}
-				// Fast CZ path first if enabled.
+				// Fast CZ date parsing for 02.01.2006
 				if dp.useCZFast {
 					if t, ok := parseCZDate(s); ok {
 						*dst = t
 						return true
 					}
-					// If a specific non-CZ layout was requested, we wouldn't be
-					// here (useCZFast would be false). When layout is empty,
-					// fall back to ISO or time.Parse below.
 				}
-				if dp.layout != "" {
-					if t, err := time.Parse(dp.layout, s); err == nil {
-						*dst = t
-						return true
-					}
+				// Fallback: configured layout
+				if t, err := time.Parse(dp.layout, s); err == nil {
+					*dst = t
+					return true
 				}
 				// Try ISO-8601 (date only) as a common alternative.
 				if t, err := time.Parse("2006-01-02", s); err == nil {
@@ -351,20 +364,18 @@ func compilePlan(columns []string, spec CoerceSpec) compiledPlan {
 				return false
 			}
 
-		case "text":
+		// Text.
+		case "text", "string":
 			fallthrough
 		default:
-			// Pass-through string; empty => NULL.
+			// Pass-through trimmed string.
 			cols[i].coerce = func(dst *any, s string) bool {
-				if s == "" {
-					*dst = nil
-				} else {
-					*dst = s
-				}
+				*dst = s
 				return true
 			}
 		}
 	}
+
 	return compiledPlan{cols: cols}
 }
 

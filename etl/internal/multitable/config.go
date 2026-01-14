@@ -4,13 +4,16 @@ package multitable
 // multi-table JSON config. It intentionally mirrors the config shown in chat.
 // It does not attempt to replace internal/config/config.go (single-table).
 
-import "etl/internal/config"
+import (
+	"etl/internal/config"
+	"etl/internal/storage"
+)
 
 type Pipeline struct {
 	Job       string             `json:"job"`
 	Source    Source             `json:"source"`
 	Parser    Parser             `json:"parser"`
-	Transform []config.Transform `json:"transform"` // <-- ADD THIS
+	Transform []config.Transform `json:"transform"`
 	Storage   Storage            `json:"storage"`
 	Runtime   RuntimeConfig      `json:"runtime"`
 }
@@ -26,86 +29,22 @@ type FileSource struct {
 
 type Parser struct {
 	Kind    string         `json:"kind"`
-	Options config.Options `json:"options"` // <-- CHANGE THIS (was CSVOptions)
+	Options config.Options `json:"options"`
 }
 
 type Storage struct {
-	Kind string          `json:"kind"` // "postgres"
-	DB   PostgresMultiDB `json:"db"`
+	// Backend kind: "postgres" | "mssql" | "sqlite"
+	Kind string  `json:"kind"`
+	DB   MultiDB `json:"db"`
 }
 
-type PostgresMultiDB struct {
-	DSN    string      `json:"dsn"`
-	Mode   string      `json:"mode"` // "multi_table"
-	Tables []TableSpec `json:"tables"`
-}
+type MultiDB struct {
+	DSN  string `json:"dsn"`
+	Mode string `json:"mode"` // must be "multi_table"
 
-type TableSpec struct {
-	Name            string           `json:"name"` // "public.countries"
-	AutoCreateTable bool             `json:"auto_create_table"`
-	PrimaryKey      *PrimaryKeySpec  `json:"primary_key,omitempty"`
-	Columns         []ColumnSpec     `json:"columns"`
-	Constraints     []ConstraintSpec `json:"constraints,omitempty"`
-	Load            LoadSpec         `json:"load"`
-}
-
-type PrimaryKeySpec struct {
-	Name string `json:"name"` // country_id
-	Type string `json:"type"` // serial
-}
-
-type ColumnSpec struct {
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Nullable   *bool  `json:"nullable,omitempty"`
-	References string `json:"references,omitempty"` // "public.countries(country_id)"
-}
-
-type ConstraintSpec struct {
-	Kind    string   `json:"kind"` // "unique"
-	Columns []string `json:"columns"`
-}
-
-type LoadSpec struct {
-	Kind     string        `json:"kind"` // "dimension" | "fact"
-	FromRows []FromRowSpec `json:"from_rows"`
-
-	// for dimensions
-	Conflict  *ConflictSpec `json:"conflict,omitempty"`
-	Returning []string      `json:"returning,omitempty"`
-	Cache     *CacheSpec    `json:"cache,omitempty"`
-
-	// for facts
-	Dedupe *DedupeSpec `json:"dedupe,omitempty"`
-}
-
-type FromRowSpec struct {
-	TargetColumn string          `json:"target_column"`
-	SourceField  string          `json:"source_field,omitempty"`
-	Transform    []TransformSpec `json:"transform,omitempty"`
-	Lookup       *LookupSpec     `json:"lookup,omitempty"`
-}
-
-type TransformSpec struct {
-	Kind string `json:"kind"` // "trim"
-}
-
-type ConflictSpec struct {
-	TargetColumns []string `json:"target_columns"`
-	Action        string   `json:"action"` // "do_nothing"
-}
-
-type CacheSpec struct {
-	KeyColumn   string `json:"key_column"`   // "name"
-	ValueColumn string `json:"value_column"` // "country_id"
-	Prewarm     bool   `json:"prewarm"`
-}
-
-type LookupSpec struct {
-	Table     string            `json:"table"`      // "public.countries"
-	Match     map[string]string `json:"match"`      // {"name": "stat"}
-	Return    string            `json:"return"`     // "country_id"
-	OnMissing string            `json:"on_missing"` // "insert"
+	// Tables + load rules used by Engine and by storage backends.
+	// These types live in internal/storage so backends can consume them.
+	Tables []storage.TableSpec `json:"tables"`
 }
 
 type RuntimeConfig struct {
@@ -114,9 +53,4 @@ type RuntimeConfig struct {
 	LoaderWorkers    int `json:"loader_workers"`
 	ReaderWorkers    int `json:"reader_workers"`
 	TransformWorkers int `json:"transform_workers"`
-}
-
-type DedupeSpec struct {
-	ConflictColumns []string `json:"conflict_columns"`
-	Action          string   `json:"action"` // "do_nothing" (supported)
 }

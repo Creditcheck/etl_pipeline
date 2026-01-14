@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strings"
 
-	// Correct import for v5
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -21,6 +20,7 @@ type Config struct {
 }
 
 // Repository is a Postgres-backed implementation of storage.Repository.
+// With CopyFromTable, it can also act as a multi-table repository.
 type Repository struct {
 	pool *pgxpool.Pool
 	cfg  Config
@@ -34,6 +34,13 @@ func NewRepository(ctx context.Context, cfg Config) (*Repository, func(), error)
 	}
 	close := func() { pool.Close() }
 	return &Repository{pool: pool, cfg: cfg}, close, nil
+}
+
+// Close releases held resources. This allows *Repository to satisfy a MultiRepository-style interface.
+func (r *Repository) Close() {
+	if r.pool != nil {
+		r.pool.Close()
+	}
 }
 
 // updateColumns generates a list of column updates in the format: "col = EXCLUDED.col"
@@ -122,8 +129,18 @@ func derefStr(p *string) string {
 	return *p
 }
 
+// CopyFrom preserves the existing single-table behavior by copying into cfg.Table.
+// This keeps the current ETL pipeline unchanged. :contentReference[oaicite:1]{index=1}
 func (r *Repository) CopyFrom(ctx context.Context, columns []string, rows [][]any) (int64, error) {
-	return r.pool.CopyFrom(ctx, splitFQN(r.cfg.Table), columns, pgx.CopyFromRows(rows))
+	return r.CopyFromTable(ctx, r.cfg.Table, columns, rows)
+}
+
+// CopyFromTable is the new multi-table primitive. It copies the given rows into the provided table.
+func (r *Repository) CopyFromTable(ctx context.Context, table string, columns []string, rows [][]any) (int64, error) {
+	if table == "" {
+		return 0, fmt.Errorf("table must not be empty")
+	}
+	return r.pool.CopyFrom(ctx, splitFQN(table), columns, pgx.CopyFromRows(rows))
 }
 
 // splitFQN converts "schema.table" into a pgx.Identifier {"schema","table"}.
@@ -146,27 +163,4 @@ func (r *Repository) Exec(ctx context.Context, sql string) error {
 		return fmt.Errorf("error executing SQL: %w", err)
 	}
 	return err
-
 }
-
-//func (r *Repository) Exec(ctx context.Context, sql string) error {
-//    log.Printf("DEBUG: Exec %v", sql)
-//
-//    tx, err := r.pool.BeginTx(ctx, nil)
-//    if err != nil {
-//        return fmt.Errorf("begin transaction: %w", err)
-//    }
-//    defer tx.Rollback()
-//
-//    _, err = tx.ExecContext(ctx, sql)
-//    if err != nil {
-//        return fmt.Errorf("error executing SQL: %w", err)
-//    }
-//
-//    if err := tx.Commit(); err != nil {
-//        return fmt.Errorf("commit transaction: %w", err)
-//    }
-//
-//    return nil
-//}
-//
