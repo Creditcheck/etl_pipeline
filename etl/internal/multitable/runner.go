@@ -2,12 +2,15 @@ package multitable
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"etl/internal/config"
+	"etl/internal/schema"
 	"etl/internal/storage"
 )
 
@@ -83,7 +86,7 @@ func validateMultiConfig(cfg Pipeline) error {
 }
 
 // requiredInputColumns derives the minimal set of canonical fields required by storage.db.tables[].load rules.
-func requiredInputColumns(cfg Pipeline) []string {
+func XXXrequiredInputColumns(cfg Pipeline) []string {
 	set := map[string]struct{}{}
 
 	for _, t := range cfg.Storage.DB.Tables {
@@ -105,4 +108,103 @@ func requiredInputColumns(cfg Pipeline) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// requiredInputColumns derives the minimal set of canonical fields that must be present
+// in the transformed record stream.
+// It includes fields referenced by:
+// - storage.db.tables[].load.from_rows (source_field + lookup.match source fields)
+// - transform.coerce.options.types keys
+// - validate.contract.fields names
+func requiredInputColumns(cfg Pipeline) []string {
+	set := map[string]struct{}{}
+
+	// 1) Storage-driven fields
+	for _, t := range cfg.Storage.DB.Tables {
+		for _, fr := range t.Load.FromRows {
+			if fr.SourceField != "" {
+				set[fr.SourceField] = struct{}{}
+			}
+			if fr.Lookup != nil {
+				for _, srcField := range fr.Lookup.Match {
+					set[srcField] = struct{}{}
+				}
+			}
+		}
+	}
+
+	// 2) Transform-driven fields (coerce types keys)
+	for _, field := range coerceFields(cfg.Transform) {
+		set[field] = struct{}{}
+	}
+
+	// 3) Validation-driven fields (contract fields)
+	for _, field := range contractFields(cfg.Transform) {
+		set[field] = struct{}{}
+	}
+
+	cols := make([]string, 0, len(set))
+	for c := range set {
+		cols = append(cols, c)
+	}
+	sort.Strings(cols)
+	return cols
+}
+
+func coerceFields(ts []config.Transform) []string {
+	fields := map[string]struct{}{}
+	for _, t := range ts {
+		if t.Kind != "coerce" {
+			continue
+		}
+		m := t.Options.StringMap("types")
+		for k := range m {
+			if k != "" {
+				fields[k] = struct{}{}
+			}
+		}
+	}
+	out := make([]string, 0, len(fields))
+	for k := range fields {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func contractFields(ts []config.Transform) []string {
+	c, err := contractFromTransforms(ts)
+	if err != nil || c == nil {
+		return nil
+	}
+	fields := make([]string, 0, len(c.Fields))
+	for _, f := range c.Fields {
+		if f.Name != "" {
+			fields = append(fields, f.Name)
+		}
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func contractFromTransforms(ts []config.Transform) (*schema.Contract, error) {
+	for _, t := range ts {
+		if t.Kind != "validate" {
+			continue
+		}
+		raw := t.Options.Any("contract")
+		if raw == nil {
+			return nil, nil
+		}
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return nil, err
+		}
+		var c schema.Contract
+		if err := json.Unmarshal(b, &c); err != nil {
+			return nil, err
+		}
+		return &c, nil
+	}
+	return nil, nil
 }

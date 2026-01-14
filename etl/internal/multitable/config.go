@@ -70,9 +70,13 @@ type LoadSpec struct {
 	Kind     string        `json:"kind"` // "dimension" | "fact"
 	FromRows []FromRowSpec `json:"from_rows"`
 
+	// for dimensions
 	Conflict  *ConflictSpec `json:"conflict,omitempty"`
 	Returning []string      `json:"returning,omitempty"`
 	Cache     *CacheSpec    `json:"cache,omitempty"`
+
+	// for facts
+	Dedupe *DedupeSpec `json:"dedupe,omitempty"`
 }
 
 type FromRowSpec struct {
@@ -110,4 +114,9 @@ type RuntimeConfig struct {
 	LoaderWorkers    int `json:"loader_workers"`
 	ReaderWorkers    int `json:"reader_workers"`
 	TransformWorkers int `json:"transform_workers"`
+}
+
+type DedupeSpec struct {
+	ConflictColumns []string `json:"conflict_columns"`
+	Action          string   `json:"action"` // "do_nothing" (supported)
 }

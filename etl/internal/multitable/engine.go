@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -572,10 +573,78 @@ func (e *Engine) loadFact(ctx context.Context, fact TablePlan, recs []Record, ca
 		rows = append(rows, outRow)
 	}
 
-	_, err := mr.CopyFromTable(ctx, fact.Table.Name, columns, rows)
-	if err != nil {
-		return fmt.Errorf("copy fact %s: %w", fact.Table.Name, err)
+	// If no dedupe requested, keep current behavior (fast append).
+	if fact.Table.Load.Dedupe == nil {
+		_, err := mr.CopyFromTable(ctx, fact.Table.Name, columns, rows)
+		if err != nil {
+			return fmt.Errorf("copy fact %s: %w", fact.Table.Name, err)
+		}
+		return nil
 	}
+
+	// Dedupe requested: COPY into temp staging, then INSERT ... ON CONFLICT ...
+	d := fact.Table.Load.Dedupe
+	if len(d.ConflictColumns) == 0 {
+		return fmt.Errorf("fact %s: dedupe.conflict_columns is empty", fact.Table.Name)
+	}
+	if d.Action != "do_nothing" {
+		return fmt.Errorf("fact %s: unsupported dedupe.action=%q (supported: do_nothing)", fact.Table.Name, d.Action)
+	}
+
+	// IMPORTANT: ON CONFLICT requires a UNIQUE/PK constraint that matches conflict_columns.
+	// Also note: UNIQUE constraints do NOT treat NULLs as equal in Postgres.
+	//
+	// Use a single transaction with a TEMP table so reruns are idempotent.
+	conn, err := e.Pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("fact %s: acquire conn: %w", fact.Table.Name, err)
+	}
+	defer conn.Release()
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("fact %s: begin: %w", fact.Table.Name, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tmp := tempTableNameFor(fact.Table.Name)
+
+	// Create temp table with the same shape as target table.
+	// We do NOT include constraints on the temp table.
+	createTmp := fmt.Sprintf(`CREATE TEMP TABLE %s (LIKE %s INCLUDING DEFAULTS)`, pgIdent(tmp), fact.Table.Name)
+	if _, err := tx.Exec(ctx, createTmp); err != nil {
+		return fmt.Errorf("fact %s: create temp table: %w", fact.Table.Name, err)
+	}
+
+	// COPY into temp table
+	// Use pgx.Tx.CopyFrom to keep it in the same transaction/connection.
+	ident, err := pgxIdentFromQualified(tmp)
+	if err != nil {
+		return fmt.Errorf("fact %s: temp ident: %w", fact.Table.Name, err)
+	}
+	pgxCols := make([]string, 0, len(columns))
+	for _, c := range columns {
+		pgxCols = append(pgxCols, c)
+	}
+	if _, err := tx.CopyFrom(ctx, ident, pgxCols, pgx.CopyFromRows(rows)); err != nil {
+		return fmt.Errorf("fact %s: copy into temp: %w", fact.Table.Name, err)
+	}
+
+	// INSERT into target with ON CONFLICT DO NOTHING
+	ins := buildInsertOnConflictDoNothingSQL(fact.Table.Name, tmp, columns, d.ConflictColumns)
+	if _, err := tx.Exec(ctx, ins); err != nil {
+		return fmt.Errorf("fact %s: upsert insert: %w", fact.Table.Name, err)
+	}
+
+	// Drop temp table explicitly (TEMP tables are session-scoped; explicit drop avoids surprises).
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`DROP TABLE %s`, pgIdent(tmp))); err != nil {
+		return fmt.Errorf("fact %s: drop temp: %w", fact.Table.Name, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("fact %s: commit: %w", fact.Table.Name, err)
+	}
+
 	return nil
 }
 
@@ -674,4 +743,64 @@ func validateMulti(cfg Pipeline) error {
 		return fmt.Errorf("storage.db.tables must not be empty")
 	}
 	return nil
+}
+
+// tempTableNameFor creates a safe unqualified temp table name.
+func tempTableNameFor(qualifiedTarget string) string {
+	// "public.imports" -> "tmp_imports"
+	base := qualifiedTarget
+	if i := strings.LastIndex(base, "."); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			return r
+		}
+		return '_'
+	}, base)
+	return "tmp_" + strings.ToLower(base)
+}
+
+func buildInsertOnConflictDoNothingSQL(targetTable, tmpTable string, cols []string, conflictCols []string) string {
+	colList := make([]string, 0, len(cols))
+	selList := make([]string, 0, len(cols))
+	for _, c := range cols {
+		colList = append(colList, pgIdent(c))
+		selList = append(selList, pgIdent(c))
+	}
+
+	confList := make([]string, 0, len(conflictCols))
+	for _, c := range conflictCols {
+		confList = append(confList, pgIdent(c))
+	}
+
+	return fmt.Sprintf(
+		`INSERT INTO %s (%s)
+SELECT %s FROM %s
+ON CONFLICT (%s) DO NOTHING`,
+		targetTable,
+		strings.Join(colList, ", "),
+		strings.Join(selList, ", "),
+		pgIdent(tmpTable),
+		strings.Join(confList, ", "),
+	)
+}
+
+// pgxIdentFromQualified parses "public.imports" or "tmp_imports" into pgx.Identifier.
+func pgxIdentFromQualified(name string) (pgx.Identifier, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, fmt.Errorf("empty table name")
+	}
+	if strings.Contains(name, `"`) {
+		return nil, fmt.Errorf("quoted identifiers not supported here: %q", name)
+	}
+	parts := strings.Split(name, ".")
+	if len(parts) == 1 {
+		return pgx.Identifier{parts[0]}, nil
+	}
+	if len(parts) == 2 {
+		return pgx.Identifier{parts[0], parts[1]}, nil
+	}
+	return nil, fmt.Errorf("invalid table name %q", name)
 }

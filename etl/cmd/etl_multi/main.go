@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"etl/internal/multitable"
+	_ "etl/internal/storage/all"
 )
 
 func main() {
