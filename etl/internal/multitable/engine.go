@@ -1,16 +1,19 @@
 package multitable
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"etl/internal/config"
 	"etl/internal/storage"
 	"etl/internal/transformer"
+	"etl/internal/transformer/builtin"
 )
 
 // Logger is the minimal logging interface used by the multitable engine.
@@ -110,6 +113,10 @@ func (e *Engine2Pass) ensureDimensionsStreaming(
 			return nil
 		}
 		pending[dim.Table.Name] = pending[dim.Table.Name][:0]
+		if cap(pending[dim.Table.Name]) > batchSize*4 {
+			// Drop oversized backing array to reduce retained heap.
+			pending[dim.Table.Name] = make([]any, 0, batchSize)
+		}
 
 		if dedupeWithinBatch && len(keys) > 1 {
 			keys = dedupeTypedKeys(keys)
@@ -175,6 +182,11 @@ func (e *Engine2Pass) ensureDimensionsStreaming(
 
 // loadFactsStreaming streams validated rows again and inserts facts in batches.
 // Dimension ID resolution is done per batch using SelectKeyValueByKeys.
+//
+// Performance note:
+// For SQL Server specifically, many small inserts on a single connection tend to be
+// single-core and slow. To drive higher throughput (and multiple SQL Server schedulers),
+// this stage supports configurable loader worker concurrency.
 func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, columns []string, plan indexedPlan, lenient bool) error {
 	logf := e.logger()
 
@@ -183,63 +195,183 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 		batchSize = 1024
 	}
 
-	// cache[dimTable][normalizedKey] = id
-	cache := make(map[string]map[string]int64, len(plan.Dimensions))
+	loaderWorkers := cfg.Runtime.LoaderWorkers
+	if loaderWorkers <= 0 {
+		loaderWorkers = 1
+	}
+
+	debug := cfg.Runtime.DebugTimings
 
 	stream, err := StreamValidatedRows(ctx, cfg, columns)
 	if err != nil {
 		return err
 	}
 
-	// Batch of pooled rows.
-	batch := make([]*transformer.Row, 0, batchSize)
+	// Producer: batches of pooled rows. Ownership transfers to the consumer worker,
+	// which must Free() each row exactly once.
+	batchCh := make(chan []*transformer.Row, loaderWorkers*2)
 
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
+	// Worker errors: first error cancels the operation.
+	var (
+		errOnce sync.Once
+		runErr  error
+	)
+	setErr := func(err error) {
+		if err == nil {
+			return
 		}
-		defer func() {
-			for _, r := range batch {
-				r.Free()
-			}
-			batch = batch[:0]
-		}()
-
-		if err := e.resolveBatchLookups(ctx, plan, batch, cache); err != nil {
-			return err
-		}
-
-		for _, fact := range plan.Facts {
-			inserted, dropped, err := e.insertFactBatch(ctx, fact, batch, cache, lenient)
-			if err != nil {
-				return err
-			}
-			if lenient && dropped > 0 {
-				logf("stage=fact_batch table=%s inserted=%d dropped=%d", fact.Table.Name, inserted, dropped)
-			}
-		}
-		return nil
+		errOnce.Do(func() { runErr = err })
 	}
 
+	// Worker pool: per-worker cache to avoid locks.
+	var wg sync.WaitGroup
+	wg.Add(loaderWorkers)
+	for w := 0; w < loaderWorkers; w++ {
+		go func(workerID int) {
+			defer wg.Done()
+
+			// cache[dimTable][normalizedKey] = id
+			cache := make(map[string]map[string]int64, len(plan.Dimensions))
+
+			for batch := range batchCh {
+				if runErr != nil {
+					// Drain + free quickly if we already failed.
+					for _, r := range batch {
+						r.Free()
+					}
+					continue
+				}
+
+				start := time.Now()
+				err := e.processFactBatch(ctx, plan, batch, cache, lenient, debug, logf)
+				dur := time.Since(start)
+
+				// Always free owned rows.
+				for _, r := range batch {
+					r.Free()
+				}
+
+				if err != nil {
+					setErr(err)
+					if debug {
+						logf("stage=pass2_batch worker=%d status=error duration=%s err=%v", workerID, dur.Truncate(time.Millisecond), err)
+					}
+				} else if debug {
+					logf("stage=pass2_batch worker=%d status=ok duration=%s rows=%d", workerID, dur.Truncate(time.Millisecond), len(batch))
+				}
+			}
+		}(w)
+	}
+
+	// Producer loop: build batches and hand off to workers.
 	seenRows := 0
+	batch := make([]*transformer.Row, 0, batchSize)
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		out := batch
+		batch = make([]*transformer.Row, 0, batchSize)
+
+		select {
+		case batchCh <- out:
+		case <-ctx.Done():
+			for _, r := range out {
+				r.Free()
+			}
+			setErr(ctx.Err())
+		}
+	}
+
 	for r := range stream.Rows {
+		if runErr != nil {
+			r.Free()
+			continue
+		}
+
 		seenRows++
 		batch = append(batch, r)
 		if len(batch) >= batchSize {
-			if err := flush(); err != nil {
-				return err
-			}
+			flush()
 		}
 	}
+	flush()
 
-	if err := flush(); err != nil {
-		return err
-	}
+	close(batchCh)
+	wg.Wait()
+
 	if err := stream.Wait(); err != nil {
 		return err
 	}
+	if runErr != nil {
+		return runErr
+	}
 
-	logf("stage=pass2_rows seen_rows=%d", seenRows)
+	logf("stage=pass2_rows seen_rows=%d loader_workers=%d", seenRows, loaderWorkers)
+	return nil
+}
+
+func (e *Engine2Pass) processFactBatch(
+	ctx context.Context,
+	plan indexedPlan,
+	batch []*transformer.Row,
+	cache map[string]map[string]int64,
+	lenient bool,
+	debug bool,
+	logf func(format string, v ...any),
+) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	// Time the lookup resolution separately, to make bottlenecks obvious.
+	lookupStart := time.Now()
+	if err := e.resolveBatchLookups(ctx, plan, batch, cache); err != nil {
+		return err
+	}
+	if debug {
+		logf("stage=pass2_resolve_lookups batch_rows=%d duration=%s", len(batch), time.Since(lookupStart).Truncate(time.Millisecond))
+	}
+
+	for _, fact := range plan.Facts {
+		start := time.Now()
+		inserted, ds, err := e.insertFactBatch(ctx, fact, batch, cache, lenient, debug)
+		dur := time.Since(start).Truncate(time.Millisecond)
+
+		if err != nil {
+			return err
+		}
+
+		droppedTotal := ds.TotalDropped()
+		if debug {
+			logf(
+				"stage=pass2_insert_fact table=%s batch_rows=%d inserted=%d dropped_total=%d dropped_lookup_miss=%d dropped_empty_key=%d dropped_conflict=%d duration=%s",
+				fact.Table.Name,
+				len(batch),
+				inserted,
+				droppedTotal,
+				ds.LookupMiss,
+				ds.EmptyKey,
+				ds.Conflict,
+				dur,
+			)
+			for _, s := range ds.Samples {
+				logf("stage=fact_drop_sample table=%s %s", fact.Table.Name, s)
+			}
+		} else if lenient && droppedTotal > 0 {
+			logf(
+				"stage=fact_batch table=%s inserted=%d dropped_total=%d dropped_lookup_miss=%d dropped_empty_key=%d dropped_conflict=%d",
+				fact.Table.Name,
+				inserted,
+				droppedTotal,
+				ds.LookupMiss,
+				ds.EmptyKey,
+				ds.Conflict,
+			)
+		}
+	}
+
 	return nil
 }
 
@@ -323,19 +455,32 @@ func (e *Engine2Pass) insertFactBatch(
 	batch []*transformer.Row,
 	cache map[string]map[string]int64,
 	lenient bool,
-) (inserted int, dropped int, _ error) {
+	debug bool,
+) (inserted int, ds dropStats, _ error) {
 	cols := fact.TargetColumns
 
 	outRows := make([][]any, 0, len(batch))
 	for _, r := range batch {
 		rowOut := make([]any, 0, len(fact.Columns))
 		drop := false
+		dropSample := ""
 
 		for _, c := range fact.Columns {
 			if c.Lookup != nil {
 				dimTable := c.Lookup.Table
 				matchIdx := c.Lookup.MatchFieldIndex
 				key := normalizeKey(r.V[matchIdx])
+				if key == "" {
+					if lenient {
+						ds.EmptyKey++
+						drop = true
+						if debug && dropSample == "" {
+							dropSample = fmt.Sprintf("reason=empty_lookup_key lookup_table=%s", dimTable)
+						}
+						break
+					}
+					return inserted, ds, fmt.Errorf("fact %s: empty lookup key table=%s", fact.Table.Name, dimTable)
+				}
 
 				var (
 					id int64
@@ -346,10 +491,14 @@ func (e *Engine2Pass) insertFactBatch(
 				}
 				if !ok {
 					if lenient {
+						ds.LookupMiss++
 						drop = true
+						if debug && dropSample == "" {
+							dropSample = fmt.Sprintf("reason=lookup_miss lookup_table=%s key=%q", dimTable, key)
+						}
 						break
 					}
-					return inserted, dropped, fmt.Errorf("fact %s: lookup miss table=%s key=%q", fact.Table.Name, dimTable, key)
+					return inserted, ds, fmt.Errorf("fact %s: lookup miss table=%s key=%q", fact.Table.Name, dimTable, key)
 				}
 				rowOut = append(rowOut, id)
 				continue
@@ -363,21 +512,65 @@ func (e *Engine2Pass) insertFactBatch(
 		}
 
 		if drop {
-			dropped++
+			if debug && dropSample != "" {
+				ds.AddSample(dropSample)
+			}
 			continue
 		}
 		outRows = append(outRows, rowOut)
 	}
 
 	if len(outRows) == 0 {
-		return 0, dropped, nil
+		return 0, ds, nil
 	}
 
 	affected, err := e.Repo.InsertFactRows(ctx, fact.Table.Name, cols, outRows, fact.DedupeColumns)
 	if err != nil {
-		return 0, dropped, err
+		return 0, ds, err
 	}
-	return int(affected), dropped, nil
+	inserted = int(affected)
+
+	// If a dedupe/conflict target is configured, some rows may be skipped by the
+	// database (e.g. ON CONFLICT DO NOTHING). We cannot observe the exact reason
+	// without backend-specific features, but we can reliably compute the delta.
+	if len(fact.DedupeColumns) > 0 {
+		conflict := len(outRows) - inserted
+		if conflict < 0 {
+			conflict = 0
+		}
+		ds.Conflict += conflict
+	}
+
+	return inserted, ds, nil
+}
+
+// dropStats tracks why rows were dropped before insertion (lenient mode) and why
+// inserts resulted in fewer affected rows than attempted (conflict dedupe).
+//
+// IMPORTANT: "Conflict" is inferred as (attempted - affected) when dedupe columns
+// are configured. This is backend-agnostic and works across Postgres/MSSQL/SQLite.
+type dropStats struct {
+	LookupMiss int
+	EmptyKey   int
+	Conflict   int
+
+	// Samples contains a small number of representative drop reasons (debug only).
+	Samples []string
+}
+
+func (d dropStats) TotalDropped() int {
+	return d.LookupMiss + d.EmptyKey + d.Conflict
+}
+
+func (d *dropStats) AddSample(s string) {
+	const maxSamples = 5
+	if d == nil {
+		return
+	}
+	if len(d.Samples) >= maxSamples {
+		return
+	}
+	d.Samples = append(d.Samples, s)
 }
 
 // dedupeTypedKeys performs bounded dedupe for a slice of typed values.
@@ -528,7 +721,6 @@ func buildIndexedPlan(cfg Pipeline, columns []string) (indexedPlan, error) {
 		}
 	}
 
-	// Stable order for determinism.
 	sort.SliceStable(plan.Dimensions, func(i, j int) bool { return plan.Dimensions[i].Table.Name < plan.Dimensions[j].Table.Name })
 	sort.SliceStable(plan.Facts, func(i, j int) bool { return plan.Facts[i].Table.Name < plan.Facts[j].Table.Name })
 
@@ -554,20 +746,35 @@ func normalizeKey(v any) string {
 	case nil:
 		return ""
 	case string:
-		return strings.TrimSpace(t)
+		if builtin.HasEdgeSpace(t) {
+			return strings.TrimSpace(t)
+		}
+		return t
 	case []byte:
-		return strings.TrimSpace(string(t))
+		if builtin.HasEdgeSpace(string(t)) {
+			return strings.TrimSpace(string(t))
+		}
+		return string(t)
 	default:
-		return strings.TrimSpace(fmt.Sprint(v))
+		val := fmt.Sprint(v)
+		if builtin.HasEdgeSpace(val) {
+			return strings.TrimSpace(val)
+		}
+		return val
 	}
 }
 
 func typedBindValue(v any) any {
 	switch t := v.(type) {
+	case nil:
+		return nil
 	case string:
-		return strings.TrimSpace(t)
+		if builtin.HasEdgeSpace(t) {
+			return strings.TrimSpace(t)
+		}
+		return t
 	case []byte:
-		return strings.TrimSpace(string(t))
+		return bytes.TrimSpace(t)
 	default:
 		return v
 	}

@@ -11,6 +11,7 @@ import (
 )
 
 const pgMaxParams = 65535
+const chunkSize = 1024
 
 type MultiRepo struct {
 	pool *pgxpool.Pool
@@ -84,7 +85,7 @@ func (r *MultiRepo) EnsureDimensionKeys(ctx context.Context, table, keyColumn st
 		}
 	}
 
-	chunkSize := 1000 // batch size (safe + predictable)
+	//chunkSize := 1024 // batch size (safe + predictable)
 
 	for start := 0; ; {
 		var (

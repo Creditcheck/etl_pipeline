@@ -4,7 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/microsoft/go-mssqldb"
 
@@ -13,13 +17,39 @@ import (
 
 // SQL Server supports a maximum of 2100 parameters per statement.
 // We keep a small safety margin because some statements can add params later.
+//
+// References:
+//   - SQL Server parameter limit: 2100 total parameters per statement.
 const (
 	mssqlMaxParams       = 2100
 	mssqlParamSafetyMarg = 50
+
+	// Debug and performance knobs are intentionally env-based to avoid widening the
+	// backend-agnostic config surface.
+	//
+	// ETL_MSSQL_DEBUG=1 enables detailed per-call and per-chunk timings inside the repo.
+	// This is useful when the engine already logs per InsertFactRows call, but the repo
+	// may split that call into multiple SQL statements due to the 2100 parameter limit.
+	//
+	// ETL_MSSQL_TABLOCK=1 adds "WITH (TABLOCK)" to INSERT targets. For ETL-style loads,
+	// this can reduce lock overhead and improve throughput in SQL Server. It is off by
+	// default because it changes locking behavior (table-level locks).
+	envDebug   = "ETL_MSSQL_DEBUG"
+	envTablock = "ETL_MSSQL_TABLOCK"
 )
 
 type MultiRepo struct {
 	db *sql.DB
+
+	// dbg enables verbose timing logs to help diagnose performance bottlenecks.
+	dbg bool
+
+	// tablock enables INSERT ... WITH (TABLOCK).
+	// This can speed up ETL inserts but may increase contention with other workloads.
+	tablock bool
+
+	// lg is used only when dbg is enabled.
+	lg *log.Logger
 }
 
 func NewMulti(ctx context.Context, cfg storage.MultiConfig) (storage.MultiRepository, error) {
@@ -27,11 +57,23 @@ func NewMulti(ctx context.Context, cfg storage.MultiConfig) (storage.MultiReposi
 	if err != nil {
 		return nil, err
 	}
+
+	// Important for throughput: allow multiple loader workers to hold multiple physical connections.
+	// If these are too low, the client becomes the bottleneck even if loader_workers > 1.
+	db.SetMaxOpenConns(64)
+	db.SetMaxIdleConns(64)
+
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	return &MultiRepo{db: db}, nil
+
+	return &MultiRepo{
+		db:      db,
+		dbg:     envBool(envDebug),
+		tablock: envBool(envTablock),
+		lg:      log.New(os.Stdout, "", log.LstdFlags),
+	}, nil
 }
 
 func (r *MultiRepo) Close() { _ = r.db.Close() }
@@ -52,6 +94,24 @@ func (r *MultiRepo) EnsureTables(ctx context.Context, tables []storage.TableSpec
 	return nil
 }
 
+// EnsureDimensionKeys inserts missing dimension keys idempotently.
+//
+// Postgres implements this via INSERT ... ON CONFLICT DO NOTHING.
+//
+// For SQL Server, avoid MERGE:
+//   - MERGE is notoriously tricky and can be slow/buggy at scale.
+//   - MERGE can fail when the source contains duplicate keys or has concurrency edge cases.
+//
+// Safer pattern used here:
+//
+//	INSERT INTO T(key)
+//	SELECT S.key
+//	FROM (VALUES (...), (...)) AS S(key)
+//	LEFT JOIN T ON T.key = S.key
+//	WHERE T.key IS NULL;
+//
+// We also dedupe keys in-memory before issuing a statement to avoid unique violations
+// when the same key appears multiple times inside a single batch.
 func (r *MultiRepo) EnsureDimensionKeys(
 	ctx context.Context,
 	table string,
@@ -72,29 +132,80 @@ func (r *MultiRepo) EnsureDimensionKeys(
 		return fmt.Errorf("mssql: EnsureDimensionKeys requires conflict_columns == [%s] (got %v)", keyColumn, conflictColumns)
 	}
 
-	// Each key is 1 parameter, so batch by ~ (2100 - margin).
+	// Critical: SQL Server statements do not automatically dedupe the source set.
+	// If the same key appears twice and the target doesn't have it yet, both rows can
+	// attempt insertion and hit a UNIQUE constraint.
+	keys = dedupeAnyByNormalizeKey(keys)
+	if len(keys) == 0 {
+		return nil
+	}
+
 	maxKeys := mssqlMaxParams - mssqlParamSafetyMarg
+
+	// Performance: execute all chunks in a single transaction.
+	// Autocommit per batch is extremely expensive on SQL Server at scale.
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("mssql: begin tx EnsureDimensionKeys: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	startAll := time.Now()
+	chunks := 0
+
 	for start := 0; start < len(keys); start += maxKeys {
 		end := start + maxKeys
 		if end > len(keys) {
 			end = len(keys)
 		}
-		if err := r.ensureDimensionKeysBatch(ctx, table, keyColumn, keys[start:end]); err != nil {
+
+		chunks++
+		startChunk := time.Now()
+
+		if err := r.ensureDimensionKeysBatchTx(ctx, tx, table, keyColumn, keys[start:end]); err != nil {
 			return err
 		}
+
+		if r.dbg {
+			r.lg.Printf("stage=mssql_dim_ensure table=%s keys=%d chunk=%d duration=%s",
+				table, end-start, chunks, time.Since(startChunk).Truncate(time.Millisecond))
+		}
 	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("mssql: commit EnsureDimensionKeys: %w", err)
+	}
+
+	if r.dbg {
+		r.lg.Printf("stage=mssql_dim_ensure_done table=%s total_keys=%d chunks=%d duration=%s",
+			table, len(keys), chunks, time.Since(startAll).Truncate(time.Millisecond))
+	}
+
 	return nil
 }
 
-func (r *MultiRepo) ensureDimensionKeysBatch(ctx context.Context, table string, keyColumn string, keys []any) error {
-	// MERGE INTO T
-	// USING (VALUES (@p1),(@p2),...) AS S([key])
-	// ON T.[key]=S.[key]
-	// WHEN NOT MATCHED THEN INSERT([key]) VALUES(S.[key]);
+func (r *MultiRepo) ensureDimensionKeysBatchTx(ctx context.Context, tx *sql.Tx, table string, keyColumn string, keys []any) error {
+	keys = dedupeAnyByNormalizeKey(keys)
+	if len(keys) == 0 {
+		return nil
+	}
+
+	// INSERT INTO T (key) [WITH (TABLOCK)]
+	// SELECT S.key
+	// FROM (VALUES (@p1),(@p2),...) AS S([key])
+	// LEFT JOIN T ON T.key = S.key
+	// WHERE T.key IS NULL;
 	var b strings.Builder
-	b.WriteString("MERGE INTO ")
+	b.WriteString("INSERT INTO ")
 	b.WriteString(mssqlFQN(table))
-	b.WriteString(" AS T USING (VALUES ")
+	if r.tablock {
+		b.WriteString(" WITH (TABLOCK)")
+	}
+	b.WriteString(" (")
+	b.WriteString(mssqlIdent(keyColumn))
+	b.WriteString(") SELECT S.")
+	b.WriteString(mssqlIdent(keyColumn))
+	b.WriteString(" FROM (VALUES ")
 
 	args := make([]any, 0, len(keys))
 	for i := range keys {
@@ -106,19 +217,20 @@ func (r *MultiRepo) ensureDimensionKeysBatch(ctx context.Context, table string, 
 		b.WriteString(")")
 		args = append(args, keys[i])
 	}
+
 	b.WriteString(") AS S(")
 	b.WriteString(mssqlIdent(keyColumn))
-	b.WriteString(") ON T.")
+	b.WriteString(") LEFT JOIN ")
+	b.WriteString(mssqlFQN(table))
+	b.WriteString(" AS T ON T.")
 	b.WriteString(mssqlIdent(keyColumn))
 	b.WriteString(" = S.")
 	b.WriteString(mssqlIdent(keyColumn))
-	b.WriteString(" WHEN NOT MATCHED THEN INSERT (")
+	b.WriteString(" WHERE T.")
 	b.WriteString(mssqlIdent(keyColumn))
-	b.WriteString(") VALUES (S.")
-	b.WriteString(mssqlIdent(keyColumn))
-	b.WriteString(");")
+	b.WriteString(" IS NULL;")
 
-	if _, err := r.db.ExecContext(ctx, b.String(), args...); err != nil {
+	if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
 		return fmt.Errorf("mssql: ensure dimension keys into %s: %w", table, err)
 	}
 	return nil
@@ -171,8 +283,8 @@ func (r *MultiRepo) SelectKeyValueByKeys(
 
 	// IN clause uses one param per key => chunk to stay <= 2100.
 	maxKeys := mssqlMaxParams - mssqlParamSafetyMarg
-
 	out := map[string]int64{}
+
 	for start := 0; start < len(keys); start += maxKeys {
 		end := start + maxKeys
 		if end > len(keys) {
@@ -231,6 +343,24 @@ func (r *MultiRepo) selectKeyValueByKeysBatch(
 	return out, rows.Err()
 }
 
+// InsertFactRows inserts fact rows. If dedupeColumns is provided, inserts must be idempotent.
+//
+// Postgres does this with INSERT ... ON CONFLICT (dedupeColumns...) DO NOTHING.
+//
+// For SQL Server we avoid MERGE and instead use the safer anti-join pattern:
+//
+//	INSERT INTO T(cols...) [WITH (TABLOCK)]
+//	SELECT S.cols...
+//	FROM (VALUES (...), (...)) AS S(cols...)
+//	LEFT JOIN T ON T.k1=S.k1 AND ...
+//	WHERE T.k1 IS NULL;
+//
+// Important: SQL Server does NOT remove duplicates inside S. If the batch contains multiple rows with
+// the same dedupe key and the target does not have that key yet, SQL Server will attempt multiple
+// inserts and hit a UNIQUE constraint.
+//
+// To match Postgres behavior (duplicates in the same statement are ignored), we dedupe within each
+// chunk in Go (stable: keeps the first occurrence).
 func (r *MultiRepo) InsertFactRows(
 	ctx context.Context,
 	table string,
@@ -245,7 +375,6 @@ func (r *MultiRepo) InsertFactRows(
 		return 0, fmt.Errorf("mssql: InsertFactRows columns empty for %s", table)
 	}
 
-	// Each row consumes len(columns) params.
 	perRow := len(columns)
 	maxParams := mssqlMaxParams - mssqlParamSafetyMarg
 	maxRows := maxParams / perRow
@@ -253,39 +382,77 @@ func (r *MultiRepo) InsertFactRows(
 		return 0, fmt.Errorf("mssql: too many columns (%d) to fit within param limit", perRow)
 	}
 
+	// Performance: execute all chunks in one transaction.
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("mssql: begin tx InsertFactRows: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	startAll := time.Now()
+	chunks := 0
+
 	var total int64
 	for start := 0; start < len(rows); start += maxRows {
 		end := start + maxRows
 		if end > len(rows) {
 			end = len(rows)
 		}
-		var n int64
-		var err error
+		chunk := rows[start:end]
+		chunks++
 
+		startChunk := time.Now()
+
+		var aff int64
 		if len(dedupeColumns) == 0 {
-			n, err = r.insertFactPlainBatch(ctx, table, columns, rows[start:end])
+			aff, err = r.insertFactPlainBatchTx(ctx, tx, table, columns, chunk)
 		} else {
-			n, err = r.insertFactMergeDoNothingBatch(ctx, table, columns, rows[start:end], dedupeColumns)
+			// Match Postgres behavior: duplicates inside the same "batch statement" should not error.
+			chunk, err = dedupeRowsByColumns(chunk, columns, dedupeColumns)
+			if err != nil {
+				return total, fmt.Errorf("mssql: dedupe fact rows for %s: %w", table, err)
+			}
+			if len(chunk) == 0 {
+				continue
+			}
+			aff, err = r.insertFactDoNothingLeftJoinTx(ctx, tx, table, columns, chunk, dedupeColumns)
 		}
 		if err != nil {
 			return total, err
 		}
-		total += n
+		total += aff
+
+		if r.dbg {
+			r.lg.Printf("stage=mssql_fact_insert table=%s chunk=%d rows_in=%d rows_aff=%d duration=%s",
+				table, chunks, len(chunk), aff, time.Since(startChunk).Truncate(time.Millisecond))
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return total, fmt.Errorf("mssql: commit InsertFactRows: %w", err)
+	}
+
+	if r.dbg {
+		r.lg.Printf("stage=mssql_fact_insert_done table=%s chunks=%d total_rows_in=%d total_aff=%d duration=%s",
+			table, chunks, len(rows), total, time.Since(startAll).Truncate(time.Millisecond))
 	}
 
 	return total, nil
 }
 
-func (r *MultiRepo) insertFactPlainBatch(
+func (r *MultiRepo) insertFactPlainBatchTx(
 	ctx context.Context,
+	tx *sql.Tx,
 	table string,
 	columns []string,
 	rows [][]any,
 ) (int64, error) {
-	// INSERT INTO t (c1,c2) VALUES (@p1,@p2),(@p3,@p4)...
 	var b strings.Builder
 	b.WriteString("INSERT INTO ")
 	b.WriteString(mssqlFQN(table))
+	if r.tablock {
+		b.WriteString(" WITH (TABLOCK)")
+	}
 	b.WriteString(" (")
 
 	for i, c := range columns {
@@ -314,7 +481,7 @@ func (r *MultiRepo) insertFactPlainBatch(
 		b.WriteString(")")
 	}
 
-	res, err := r.db.ExecContext(ctx, b.String(), args...)
+	res, err := tx.ExecContext(ctx, b.String(), args...)
 	if err != nil {
 		return 0, fmt.Errorf("mssql: insert into %s: %w", table, err)
 	}
@@ -322,21 +489,50 @@ func (r *MultiRepo) insertFactPlainBatch(
 	return aff, nil
 }
 
-func (r *MultiRepo) insertFactMergeDoNothingBatch(
+// insertFactDoNothingLeftJoinTx performs an idempotent insert using a LEFT JOIN anti-join:
+//
+//	INSERT INTO T(cols...) [WITH (TABLOCK)]
+//	SELECT S.cols...
+//	FROM (VALUES (...), (...)) AS S(cols...)
+//	LEFT JOIN T ON T.k1=S.k1 AND ...
+//	WHERE T.k1 IS NULL;
+//
+// This is typically faster than a correlated NOT EXISTS predicate on SQL Server for this pattern,
+// especially with a UNIQUE index on the dedupeColumns.
+func (r *MultiRepo) insertFactDoNothingLeftJoinTx(
 	ctx context.Context,
+	tx *sql.Tx,
 	table string,
 	columns []string,
 	rows [][]any,
 	dedupeColumns []string,
 ) (int64, error) {
-	// MERGE INTO T
-	// USING (VALUES (...), (...)) AS S(c1,c2,...)
-	// ON T.k1=S.k1 AND T.k2=S.k2
-	// WHEN NOT MATCHED THEN INSERT (c1,c2,...) VALUES (S.c1,S.c2,...);
 	var b strings.Builder
-	b.WriteString("MERGE INTO ")
+
+	b.WriteString("INSERT INTO ")
 	b.WriteString(mssqlFQN(table))
-	b.WriteString(" AS T USING (VALUES ")
+	if r.tablock {
+		b.WriteString(" WITH (TABLOCK)")
+	}
+	b.WriteString(" (")
+
+	for i, c := range columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(mssqlIdent(c))
+	}
+	b.WriteString(") SELECT ")
+
+	for i, c := range columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("S.")
+		b.WriteString(mssqlIdent(c))
+	}
+
+	b.WriteString(" FROM (VALUES ")
 
 	args := make([]any, 0, len(rows)*len(columns))
 	paramN := 1
@@ -363,7 +559,9 @@ func (r *MultiRepo) insertFactMergeDoNothingBatch(
 		}
 		b.WriteString(mssqlIdent(c))
 	}
-	b.WriteString(") ON ")
+	b.WriteString(") LEFT JOIN ")
+	b.WriteString(mssqlFQN(table))
+	b.WriteString(" AS T ON ")
 
 	for i, kc := range dedupeColumns {
 		if i > 0 {
@@ -375,30 +573,17 @@ func (r *MultiRepo) insertFactMergeDoNothingBatch(
 		b.WriteString(mssqlIdent(kc))
 	}
 
-	b.WriteString(" WHEN NOT MATCHED THEN INSERT (")
+	// For anti-join, we check NULL on the first dedupe key.
+	// This assumes dedupeColumns are NOT NULL or at least that the unique constraint
+	// semantics match the data model. If dedupe keys can be NULL, we should instead
+	// add a computed marker or use NOT EXISTS (but most fact unique keys should be NOT NULL).
+	b.WriteString(" WHERE T.")
+	b.WriteString(mssqlIdent(dedupeColumns[0]))
+	b.WriteString(" IS NULL;")
 
-	for i, c := range columns {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(mssqlIdent(c))
-	}
-
-	b.WriteString(") VALUES (")
-
-	for i, c := range columns {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString("S.")
-		b.WriteString(mssqlIdent(c))
-	}
-
-	b.WriteString(");")
-
-	res, err := r.db.ExecContext(ctx, b.String(), args...)
+	res, err := tx.ExecContext(ctx, b.String(), args...)
 	if err != nil {
-		return 0, fmt.Errorf("mssql: merge insert into %s: %w", table, err)
+		return 0, fmt.Errorf("mssql: insert-do-nothing into %s: %w", table, err)
 	}
 	aff, _ := res.RowsAffected()
 	return aff, nil
@@ -515,4 +700,98 @@ func mssqlRef(ref string) string {
 	tablePart := strings.TrimSpace(ref[:open])
 	colPart := strings.TrimSpace(ref[open+1 : close])
 	return fmt.Sprintf("%s(%s)", mssqlFQN(tablePart), mssqlIdent(colPart))
+}
+
+// dedupeAnyByNormalizeKey deduplicates values by storage.NormalizeKey, preserving the first occurrence.
+//
+// This is required to preserve Postgres-like idempotence when the input stream contains duplicates
+// within the same batch and the SQL Server statement does not dedupe them automatically.
+func dedupeAnyByNormalizeKey(keys []any) []any {
+	seen := make(map[string]struct{}, len(keys))
+	out := make([]any, 0, len(keys))
+	for _, k := range keys {
+		nk := storage.NormalizeKey(k)
+		if nk == "" {
+			continue
+		}
+		if _, ok := seen[nk]; ok {
+			continue
+		}
+		seen[nk] = struct{}{}
+		out = append(out, k)
+	}
+	return out
+}
+
+// dedupeRowsByColumns deduplicates fact rows on the provided dedupeColumns.
+// It preserves the first occurrence of each dedupe key (stable), which mirrors
+// Postgres INSERT ... ON CONFLICT DO NOTHING behavior within a single statement.
+//
+// Key idea:
+//   - Postgres tolerates duplicates inside one INSERT statement and effectively inserts one.
+//   - SQL Server "INSERT ... WHERE NOT EXISTS" does NOT remove duplicates inside the source S,
+//     so duplicates in S can still cause unique constraint violations when the target lacks the key.
+//
+// This function is intentionally backend-local because it compensates for SQL Server statement semantics.
+func dedupeRowsByColumns(rows [][]any, columns []string, dedupeColumns []string) ([][]any, error) {
+	if len(rows) == 0 || len(dedupeColumns) == 0 {
+		return rows, nil
+	}
+
+	indexByName := make(map[string]int, len(columns))
+	for i, c := range columns {
+		indexByName[c] = i
+	}
+
+	keyIdx := make([]int, 0, len(dedupeColumns))
+	for _, kc := range dedupeColumns {
+		i, ok := indexByName[kc]
+		if !ok {
+			return nil, fmt.Errorf("dedupe column %q not present in insert columns", kc)
+		}
+		keyIdx = append(keyIdx, i)
+	}
+
+	seen := make(map[string]struct{}, len(rows))
+	out := make([][]any, 0, len(rows))
+
+	// Unit separator is very unlikely to appear in normalized keys.
+	const sep = "\x1f"
+	var b strings.Builder
+
+	for _, row := range rows {
+		b.Reset()
+
+		for i, idx := range keyIdx {
+			if i > 0 {
+				b.WriteString(sep)
+			}
+			var v any
+			if idx >= 0 && idx < len(row) {
+				v = row[idx]
+			}
+			b.WriteString(storage.NormalizeKey(v))
+		}
+
+		k := b.String()
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, row)
+	}
+
+	return out, nil
+}
+
+func envBool(name string) bool {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+	}
+	return b
 }

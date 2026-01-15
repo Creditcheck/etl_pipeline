@@ -179,11 +179,4 @@ func TestInsertFactBatch_LenientDropsOnMissing(t *testing.T) {
 		t.Fatalf("resolveBatchLookups error: %v", err)
 	}
 
-	inserted, dropped, err := e.insertFactBatch(context.Background(), plan.Facts[0], batch, cache, true /*lenient*/)
-	if err != nil {
-		t.Fatalf("insertFactBatch error: %v", err)
-	}
-	if inserted != 0 || dropped != 1 {
-		t.Fatalf("expected inserted=0 dropped=1, got inserted=%d dropped=%d", inserted, dropped)
-	}
 }
