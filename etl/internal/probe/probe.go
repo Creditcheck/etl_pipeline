@@ -14,7 +14,6 @@ import (
 	"etl/internal/datasource/file"
 	"etl/internal/datasource/httpds"
 	"etl/internal/inspect"
-	jsonparser "etl/internal/parser/json"
 	xmlparser "etl/internal/parser/xml"
 	"etl/internal/schema"
 	"etl/pkg/records"
@@ -56,6 +55,19 @@ type Options struct {
 	// Job is the logical job name for metrics/config.
 	// Defaults to normalized Name when empty.
 	Job string
+
+	// Multitable toggles whether ProbeURLAny emits a multi-table config.
+	Multitable bool
+
+	// BreakoutFields is an optional list of column names to break out into dimension
+	// tables when Multitable is true.
+	//
+	// If empty, ProbeURLAny will auto-select fields based on sample uniqueness.
+	BreakoutFields []string
+
+	// Report, when true, causes ProbeURLAny to return a text report summarizing
+	// uniqueness per column (printed by the CLI to stderr).
+	Report bool
 }
 
 // Result returns the rendered output (either CSV text or JSON text) and
@@ -72,16 +84,6 @@ type Result struct {
 
 // HTTPPeekFn is the overridable seam used to fetch the first N bytes.
 type HTTPPeekFn func(ctx context.Context, url string, n int, insecure bool) ([]byte, error)
-
-// httpPeekFn is a small overridable seam that the probe package uses to
-// fetch the first N bytes from a URL. In production it is backed by the
-// httpds.Client, but tests can replace it to avoid real HTTP traffic.
-//var httpPeekFn HTTPPeekFn = func(ctx context.Context, url string, n int, insecure bool) ([]byte, error) {
-//	client := httpds.NewClient(httpds.Config{
-//		InsecureSkipVerify: insecure,
-//	})
-//	return client.FetchFirstBytes(ctx, url, n)
-//}
 
 // httpPeekFn is a small overridable seam that the probe package uses to
 // fetch the first N bytes from a URL. In production it is backed by the
@@ -138,181 +140,107 @@ func Probe(opt Options) (Result, error) {
 		delim = ','
 	}
 
-	ctx := context.Background()
-
-	// Fetch first N bytes using the shared HTTP datasource client.
-	data, err := httpPeekFn(ctx, opt.URL, opt.MaxBytes, opt.AllowInsecureTLS)
+	// Fetch sample bytes.
+	n := opt.MaxBytes
+	if n <= 0 {
+		n = 20000
+	}
+	b, err := httpPeekFn(context.Background(), opt.URL, n, opt.AllowInsecureTLS)
 	if err != nil {
-		return res, err
-	}
-	// Cut to last newline boundary to avoid partial CSV record at the end.
-	if i := bytes.LastIndexByte(data, '\n'); i > 0 {
-		data = data[:i+1]
+		return res, fmt.Errorf("peek: %w", err)
 	}
 
-	// Optionally write sampled CSV to disk.
-	if opt.SaveSample {
-		fname := normalizeFieldName(opt.Name) + ".csv"
-		if err := writeSampleCSV(fname, data); err != nil {
-			return Result{}, err
-		}
+	// Cut sample at last newline to avoid a half-line record at the end.
+	if i := bytes.LastIndexByte(b, '\n'); i > 0 {
+		b = b[:i+1]
 	}
 
-	// Parse sample (CSV-only).
-	headers, records, err := readCSVSample(data, delim)
+	// Read CSV sample.
+	headers, rows, err := readCSVSample(b, delim)
 	if err != nil {
-		return res, err
+		return res, fmt.Errorf("read csv: %w", err)
 	}
 	res.Headers = headers
 
-	// Infer types.
-	types := inferTypes(headers, records)
-
-	// DatePreference is currently a no-op; the scoring already prefers DMY.
-	switch opt.DatePreference {
-	case "eu":
-		// Existing scoring already favors DMY; no additional changes required.
-	case "us":
-		// MDY bias would require alternative dateLayoutPreference; left as-is.
-	default:
-		// "auto" → use current default in detectColumnLayouts.
+	// Normalize header names.
+	normalized := make([]string, 0, len(headers))
+	for _, h := range headers {
+		n := truncateFieldName(normalizeFieldName(h))
+		normalized = append(normalized, n)
 	}
+	res.Normalized = normalized
 
-	// Produce output.
-	if opt.OutputJSON {
-		cfg := buildJSONConfig(opt.Name, headers, records, types, delim)
-		body, err := printJSONConfig(cfg)
-		if err != nil {
+	// Type inference.
+	types := inferTypes(headers, rows)
+	colLayouts := detectColumnLayouts(rows, types)
+	coerceLayout := chooseMajorityLayout(colLayouts, types)
+
+	// Optional save sample.
+	if opt.SaveSample {
+		if err := writeSampleCSV(normalizeFieldName(opt.Name)+".csv", b); err != nil {
 			return res, err
 		}
-		res.Body = body
+	}
 
-		// Collect normalized names in the same order as headers.
-		norm := make([]string, len(headers))
-		for i, h := range headers {
-			norm[i] = normalizeFieldName(h)
-		}
-		res.Normalized = norm
+	// If OutputJSON is false: return a human-readable summary.
+	if !opt.OutputJSON {
+		res.Body = renderCSVSummary(headers, normalized, types, colLayouts, coerceLayout, rows)
 		return res, nil
 	}
 
-	// CSV-like text (header,normalized,type per line).
-	var buf bytes.Buffer
-	for i, h := range headers {
-		fmt.Fprintf(&buf, "%s,%s,%s\n", h, normalizeFieldName(h), types[i])
-	}
-	res.Body = buf.Bytes()
+	// JSON config output path (legacy jsonConfig shape).
+	cfg := newJSONConfig(normalizeFieldName(opt.Name))
+	cfg.Table = normalizeFieldName(opt.Name)
+	cfg.Columns = normalized
 
-	// Normalized names in CSV case, too.
-	norm := make([]string, len(headers))
-	for i, h := range headers {
-		norm[i] = normalizeFieldName(h)
+	// Compute keyColumns heuristic.
+	cfg.KeyColumns = inferKeyColumns(headers, normalized, types, rows)
+
+	cfg.Coerce.Layout = coerceLayout
+	cfg.Coerce.Types = make(map[string]string)
+	for i := range headers {
+		t := contractTypeFromInference(types[i])
+		if t != "text" {
+			cfg.Coerce.Types[normalized[i]] = t
+		}
 	}
-	res.Normalized = norm
+
+	// Build contract.
+	cfg.Contract.Name = normalizeFieldName(opt.Name)
+	cfg.Contract.Fields = make([]schema.Field, 0, len(headers))
+	for i, h := range headers {
+		ct := contractTypeFromInference(types[i])
+
+		f := schema.Field{
+			Name: normalized[i],
+			Type: ct,
+		}
+		if types[i] == "date" || types[i] == "timestamp" {
+			if lay := colLayouts[i]; lay != "" {
+				f.Layout = lay
+			}
+		}
+		if types[i] == "boolean" {
+			f.Truthy = []string{"1", "t", "true", "yes", "y"}
+			f.Falsy = []string{"0", "f", "false", "no", "n"}
+		}
+		cfg.Contract.Fields = append(cfg.Contract.Fields, f)
+
+		_ = h // keep for readability in loops
+	}
+
+	jb, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return res, err
+	}
+	res.Body = append(jb, '\n')
 	return res, nil
 }
 
-// DecodeDelimiter converts a user-supplied string into a single rune delimiter.
-func DecodeDelimiter(s string) rune {
-	if s == "" {
-		return ','
-	}
-	r, _ := utf8.DecodeRuneInString(s)
-	if r == utf8.RuneError {
-		return ','
-	}
-	return r
-}
-
-// OrderedMap preserves insertion order when marshaled as a JSON object.
-// This is used by the legacy JSON config generator (csvprobe-style).
-type OrderedMap struct {
-	Pairs []KV
-}
-
-// KV is a single key/value entry.
-type KV struct {
-	Key   string
-	Value string
-}
-
-// MarshalJSON emits the pairs as a JSON object in the original order.
-// Keys/values are individually json-escaped to stay safe for diacritics, etc.
-func (om OrderedMap) MarshalJSON() ([]byte, error) {
-	if len(om.Pairs) == 0 {
-		return []byte(`{}`), nil
-	}
-	var buf bytes.Buffer
-	buf.WriteByte('{')
-	for i, p := range om.Pairs {
-		if i > 0 {
-			buf.WriteByte(',')
-		}
-		kb, _ := json.Marshal(p.Key)
-		vb, _ := json.Marshal(p.Value)
-		buf.Write(kb)
-		buf.WriteByte(':')
-		buf.Write(vb)
-	}
-	buf.WriteByte('}')
-	return buf.Bytes(), nil
-}
-
-// jsonConfig models the emitted JSON structure for the legacy csvprobe-style
-// config (NOT the ETL config.Pipeline shape).
-//
-// The type itself lives here; buildJSONConfig/printJSONConfig live in
-// internal/probe/main.go and use this type as their return value.
-type jsonConfig struct {
-	Source struct {
-		Kind string `json:"kind"`
-		File struct {
-			Path string `json:"path"`
-		} `json:"file"`
-	} `json:"source"`
-
-	Runtime runtimeConfig `json:"runtime"`
-
-	Parser struct {
-		Kind    string `json:"kind"`
-		Options struct {
-			HasHeader      bool       `json:"has_header"`
-			Comma          string     `json:"comma"`
-			TrimSpace      bool       `json:"trim_space"`
-			ExpectedFields int        `json:"expected_fields"`
-			HeaderMap      OrderedMap `json:"header_map"`
-		} `json:"options"`
-	} `json:"parser"`
-
-	Transform []any `json:"transform"`
-
-	Storage struct {
-		Kind string `json:"kind"`
-		DB   struct {
-			DSN             string   `json:"dsn"`
-			Table           string   `json:"table"`
-			Columns         []string `json:"columns"`
-			KeyColumns      []string `json:"key_columns"`
-			AutoCreateTable bool     `json:"auto_create_table"`
-		} `json:"db"`
-	} `json:"storage"`
-}
-
-// runtimeConfig controls ingestion parallelism and buffering for the legacy
-// CSV config generator. The ETL runtime config is config.RuntimeConfig.
-type runtimeConfig struct {
-	ReaderWorkers    int `json:"reader_workers"`
-	TransformWorkers int `json:"transform_workers"`
-	LoaderWorkers    int `json:"loader_workers"`
-	BatchSize        int `json:"batch_size"`
-	ChannelBuffer    int `json:"channel_buffer"`
-}
-
 // -----------------------------------------------------------------------------
-// New unified ETL-config probe: ProbeURL (CSV + XML → config.Pipeline)
+// Unified probe → ETL pipeline config
 // -----------------------------------------------------------------------------
 
-// fileFormat represents a coarse file type inferred from a small sample.
 type fileFormat int
 
 const (
@@ -322,102 +250,145 @@ const (
 	formatJSON
 )
 
-// ProbeURL runs the sample+infer pipeline for the given URL and returns a
-// config.Pipeline suitable for cmd/etl. It auto-detects CSV vs XML based on
-// the sampled bytes.
+// sampleUniqueness captures bounded distinct-count stats for a sample.
+type sampleUniqueness struct {
+	TotalRows int
+	// PerColumnDistinct holds bounded distinct counts per column, keyed by normalized column name.
+	PerColumnDistinct map[string]int
+	// PerColumnCapped indicates that distinct counting was capped for a column.
+	PerColumnCapped map[string]bool
+	// ColumnOrder is stable order of normalized columns.
+	ColumnOrder []string
+}
+
+// ProbeURLAny runs the probe pipeline and returns either a config.Pipeline
+// (single-table) or a multi-table JSON object (as map[string]any).
 //
-// The resulting pipeline is intentionally conservative:
-//   - JSON: ??
-//   - CSV: coerce/validate chain with inferred types and a shared date layout.
-//   - XML: validate contract with type="text" by default, plus a starter XML
-//     parser config; coerce is omitted for now (strings remain as strings).
+// It ALSO returns an optional report string (empty unless Options.Report=true).
+//
+// Design notes:
+//   - The generated config always includes a "row_hash" column computed from
+//     all normalized fields (hash transform).
+//   - In multi-table mode, ProbeURLAny can optionally break selected fields into
+//     dimension tables; if fields aren't provided, it uses sample uniqueness.
+func ProbeURLAny(ctx context.Context, opt Options) (out any, report string, err error) {
+	p, sampleStats, err := probeURLWithStats(ctx, opt)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Always inject row_hash into single-table pipeline as well.
+	injectRowHashIntoSingle(&p)
+
+	if opt.Report {
+		report = formatUniquenessReport(sampleStats)
+	}
+
+	if !opt.Multitable {
+		return p, report, nil
+	}
+
+	mt := buildMultiTableFromSingle(p, sampleStats, opt.BreakoutFields)
+	return mt, report, nil
+}
+
+// ProbeURL runs the sample+infer pipeline for the given URL and returns a
+// config.Pipeline suitable for cmd/etl. It auto-detects CSV vs XML vs JSON
+// based on the sampled bytes.
 func ProbeURL(ctx context.Context, opt Options) (config.Pipeline, error) {
+	p, _, err := probeURLWithStats(ctx, opt)
+	if err != nil {
+		return config.Pipeline{}, err
+	}
+	// Preserve historical behavior: ProbeURL itself does NOT inject row_hash.
+	// New callers should use ProbeURLAny which always injects row_hash.
+	return p, nil
+}
+
+func probeURLWithStats(ctx context.Context, opt Options) (config.Pipeline, sampleUniqueness, error) {
 	if opt.MaxBytes <= 0 {
 		opt.MaxBytes = 20000
 	}
 	if opt.Backend == "" {
 		opt.Backend = "postgres"
 	}
-
-	// set a default job name
-	job := opt.Job
-	if job == "" {
-		if opt.Name != "" {
-			job = normalizeFieldName(opt.Name)
-		} else {
-			job = "etl_job"
-		}
+	if strings.TrimSpace(opt.Name) == "" {
+		opt.Name = "dataset_name"
+	}
+	if strings.TrimSpace(opt.Job) == "" {
+		opt.Job = normalizeFieldName(opt.Name)
 	}
 
-	sample, err := httpPeekFn(ctx, opt.URL, opt.MaxBytes, opt.AllowInsecureTLS)
+	// Fetch first bytes via httpPeekFn (supports file:// and http(s)://).
+	peekURL := opt.URL
+	if peekURL != "" && !strings.HasPrefix(peekURL, "http://") && !strings.HasPrefix(peekURL, "https://") && !strings.HasPrefix(peekURL, "file://") {
+		peekURL = "file://" + peekURL
+	}
+
+	sample, err := httpPeekFn(ctx, peekURL, opt.MaxBytes, opt.AllowInsecureTLS)
 	if err != nil {
-		return config.Pipeline{}, fmt.Errorf("fetch sample: %w", err)
+		return config.Pipeline{}, sampleUniqueness{}, err
 	}
 
-	ft := detectFormat(sample)
+	// Identify file type from sample.
+	ff := sniffFormat(sample)
+
+	// Optionally save sample to disk for inspection.
 	if opt.SaveSample {
-		if err := writeSampleFile(opt.Name, ft, sample); err != nil {
-			return config.Pipeline{}, fmt.Errorf("save sample: %w", err)
+		if err := saveSample(opt.Name, ff, sample); err != nil {
+			return config.Pipeline{}, sampleUniqueness{}, err
 		}
 	}
 
-	var p config.Pipeline
+	// Build pipeline based on format.
+	switch ff {
+	case formatCSV:
+		p, stats, err := probeCSVWithStats(sample, opt)
+		if err != nil {
+			return config.Pipeline{}, sampleUniqueness{}, err
+		}
+		p.Job = opt.Job
+		return p, stats, nil
 
-	switch ft {
 	case formatXML:
-		p, err = probeXML(sample, opt)
+		p, stats, err := probeXMLWithStats(sample, opt)
+		if err != nil {
+			return config.Pipeline{}, sampleUniqueness{}, err
+		}
+		p.Job = opt.Job
+		return p, stats, nil
+
 	case formatJSON:
-		p, err = probeJSON(sample, opt)
-	case formatCSV, formatUnknown:
-		// Unknown: default to CSV; worst case, user edits config manually.
-		p, err = probeCSV(sample, opt)
+		p, stats, err := probeJSONWithStats(sample, opt)
+		if err != nil {
+			return config.Pipeline{}, sampleUniqueness{}, err
+		}
+		p.Job = opt.Job
+		return p, stats, nil
+
 	default:
-		return config.Pipeline{}, fmt.Errorf("unhandled format %v", ft)
+		return config.Pipeline{}, sampleUniqueness{}, fmt.Errorf("unknown file format from sample")
 	}
-	if err != nil {
-		return config.Pipeline{}, err
-	}
-
-	// Ensure Job is set on the resulting pipeline.
-	if p.Job == "" {
-		p.Job = job
-	}
-
-	return p, nil
 }
 
-// detectFormat applies a very small heuristic on the sampled bytes to decide
-// whether the input looks like JSON, XML or CSV. It does not attempt to be perfect;
-// the result is only a hint for initial config generation.
-func detectFormat(sample []byte) fileFormat {
-	s := bytes.TrimSpace(sample)
-	if len(s) == 0 {
+func sniffFormat(sample []byte) fileFormat {
+	trim := bytes.TrimSpace(sample)
+	if len(trim) == 0 {
 		return formatUnknown
 	}
-
-	// JSON: first non-space char is { or [
-	if s[0] == '{' || s[0] == '[' {
+	if trim[0] == '<' {
+		return formatXML
+	}
+	if trim[0] == '{' || trim[0] == '[' {
 		return formatJSON
-	}
-
-	// XML detection
-	ls := bytes.ToLower(s)
-	if bytes.HasPrefix(ls, []byte("<?xml")) || s[0] == '<' {
-		return formatXML
-	}
-	// If there's an obvious XML tag early on, treat as XML.
-	if bytes.Contains(s[:min(len(s), 256)], []byte("<")) && bytes.Contains(s[:min(len(s), 256)], []byte(">")) {
-		return formatXML
 	}
 	return formatCSV
 }
 
-// writeSampleFile writes the raw sample bytes to a local file with an inferred
-// extension based on the detected format.
-func writeSampleFile(name string, ft fileFormat, data []byte) error {
+func saveSample(name string, ff fileFormat, sample []byte) error {
 	base := normalizeFieldName(name)
-	ext := ".bin"
-	switch ft {
+	ext := ".txt"
+	switch ff {
 	case formatCSV:
 		ext = ".csv"
 	case formatXML:
@@ -425,127 +396,707 @@ func writeSampleFile(name string, ft fileFormat, data []byte) error {
 	case formatJSON:
 		ext = ".json"
 	}
-	return writeSampleCSV(base+ext, data)
+	return writeSampleCSV(base+ext, sample)
 }
 
-// probeJSON builds a config.Pipeline for a JSON source.
-//
-// It is intentionally structural and does NOT hard-code field names:
-//   - It decodes JSON into records using internal/parser/json.
-//   - If there is a single top-level record containing one or more
-//     array-of-object fields, it picks the largest such array and treats
-//     its elements as the actual records (generic envelope handling).
-//   - It flattens nested objects into dotted paths (e.g., "user.id"),
-//     similar in spirit to how the XML config generator flattens structure.
-//   - It then reuses the CSV inference helpers to detect types/layouts and
-//     build coerce/validate transforms.
-func probeJSON(sample []byte, opt Options) (config.Pipeline, error) {
-	// Decode JSON records (object, array-of-objects, or JSONL/NDJSON via your
-	// jsonparser implementation).
-	recs, err := jsonparser.DecodeAll(bytes.NewReader(sample), jsonparser.Options{
-		AllowArrays: true,
+// -------------------- row_hash injection (single-table) --------------------
+
+func injectRowHashIntoSingle(p *config.Pipeline) {
+	if p == nil {
+		return
+	}
+
+	// Ensure storage columns include row_hash (for single-table).
+	if !containsString(p.Storage.DB.Columns, "row_hash") {
+		p.Storage.DB.Columns = append(p.Storage.DB.Columns, "row_hash")
+	}
+
+	// Ensure validate contract includes required row_hash.
+	contract, idx := findValidateContract(p.Transform)
+	if contract != nil {
+		if !contractHasField(*contract, "row_hash") {
+			contract.Fields = append(contract.Fields, schema.Field{
+				Name:     "row_hash",
+				Type:     "text",
+				Required: true,
+			})
+		} else {
+			// If present but not required, upgrade to required.
+			for i := range contract.Fields {
+				if contract.Fields[i].Name == "row_hash" {
+					contract.Fields[i].Required = true
+				}
+			}
+		}
+		// Write back into transform options (it’s stored as any).
+		p.Transform[idx].Options["contract"] = *contract
+	}
+
+	// Ensure hash transform exists and is before validate.
+	ensureHashTransform(p)
+}
+
+func ensureHashTransform(p *config.Pipeline) {
+	if p == nil {
+		return
+	}
+
+	cols := append([]string(nil), p.Storage.DB.Columns...)
+	sort.Strings(cols)
+
+	hashIdx := -1
+	validateIdx := -1
+	for i := range p.Transform {
+		switch p.Transform[i].Kind {
+		case "hash":
+			hashIdx = i
+		case "validate":
+			validateIdx = i
+		}
+	}
+
+	hashTransform := config.Transform{
+		Kind: "hash",
+		Options: config.Options{
+			"target_field":        "row_hash",
+			"fields":              cols,
+			"include_field_names": true,
+			"trim_space":          true,
+			"separator":           "\u001f",
+			"algorithm":           "sha256",
+			"encoding":            "hex",
+			"overwrite":           true,
+		},
+	}
+
+	if hashIdx >= 0 {
+		// Update existing hash transform to match our defaults.
+		p.Transform[hashIdx] = hashTransform
+	} else {
+		// Insert before validate when possible, otherwise append.
+		if validateIdx >= 0 {
+			out := make([]config.Transform, 0, len(p.Transform)+1)
+			out = append(out, p.Transform[:validateIdx]...)
+			out = append(out, hashTransform)
+			out = append(out, p.Transform[validateIdx:]...)
+			p.Transform = out
+		} else {
+			p.Transform = append(p.Transform, hashTransform)
+		}
+	}
+}
+
+func findValidateContract(ts []config.Transform) (*schema.Contract, int) {
+	for i := range ts {
+		if ts[i].Kind != "validate" {
+			continue
+		}
+		raw := ts[i].Options.Any("contract")
+		if raw == nil {
+			return nil, -1
+		}
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return nil, -1
+		}
+		var c schema.Contract
+		if err := json.Unmarshal(b, &c); err != nil {
+			return nil, -1
+		}
+		return &c, i
+	}
+	return nil, -1
+}
+
+func contractHasField(c schema.Contract, name string) bool {
+	for _, f := range c.Fields {
+		if f.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(ss []string, v string) bool {
+	for _, s := range ss {
+		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+// -------------------- uniqueness report + selection --------------------
+
+const distinctCapPerColumn = 10000
+
+func computeUniquenessFromCSVSample(rows [][]string, normalizedCols []string) sampleUniqueness {
+	stats := sampleUniqueness{
+		TotalRows:         0,
+		PerColumnDistinct: make(map[string]int, len(normalizedCols)),
+		PerColumnCapped:   make(map[string]bool, len(normalizedCols)),
+		ColumnOrder:       append([]string(nil), normalizedCols...),
+	}
+
+	if len(rows) == 0 || len(normalizedCols) == 0 {
+		return stats
+	}
+
+	sets := make([]map[string]struct{}, len(normalizedCols))
+	for i := range sets {
+		sets[i] = make(map[string]struct{})
+	}
+
+	for _, r := range rows {
+		if len(r) != len(normalizedCols) {
+			continue
+		}
+		stats.TotalRows++
+
+		for i := range normalizedCols {
+			if stats.PerColumnCapped[normalizedCols[i]] {
+				continue
+			}
+			v := strings.TrimSpace(r[i])
+			if v == "" {
+				continue
+			}
+			sets[i][v] = struct{}{}
+			if len(sets[i]) >= distinctCapPerColumn {
+				stats.PerColumnCapped[normalizedCols[i]] = true
+				sets[i] = nil
+			}
+		}
+	}
+
+	for i, col := range normalizedCols {
+		if stats.PerColumnCapped[col] {
+			stats.PerColumnDistinct[col] = distinctCapPerColumn
+			continue
+		}
+		stats.PerColumnDistinct[col] = len(sets[i])
+	}
+	return stats
+}
+
+func computeUniquenessFromJSONRecords(recs []records.Record, columns []string) sampleUniqueness {
+	stats := sampleUniqueness{
+		TotalRows:         0,
+		PerColumnDistinct: make(map[string]int, len(columns)),
+		PerColumnCapped:   make(map[string]bool, len(columns)),
+		ColumnOrder:       append([]string(nil), columns...),
+	}
+	if len(recs) == 0 || len(columns) == 0 {
+		return stats
+	}
+
+	sets := make(map[string]map[string]struct{}, len(columns))
+	for _, c := range columns {
+		sets[c] = make(map[string]struct{})
+	}
+
+	for _, r := range recs {
+		stats.TotalRows++
+
+		for _, c := range columns {
+			if stats.PerColumnCapped[c] {
+				continue
+			}
+			v, ok := r[c]
+			if !ok || v == nil {
+				continue
+			}
+			s := stringifyScalarForUniq(v)
+			if s == "" {
+				continue
+			}
+			sets[c][s] = struct{}{}
+			if len(sets[c]) >= distinctCapPerColumn {
+				stats.PerColumnCapped[c] = true
+				delete(sets, c)
+			}
+		}
+	}
+
+	for _, c := range columns {
+		if stats.PerColumnCapped[c] {
+			stats.PerColumnDistinct[c] = distinctCapPerColumn
+			continue
+		}
+		stats.PerColumnDistinct[c] = len(sets[c])
+	}
+	return stats
+}
+
+func stringifyScalarForUniq(v any) string {
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t)
+	case []byte:
+		return strings.TrimSpace(string(t))
+	case float64:
+		// encoding/json default number type
+		return strings.TrimSpace(fmt.Sprintf("%.0f", t))
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	default:
+		// Sample-bounded; acceptable fallback.
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+}
+
+func autoSelectBreakouts(stats sampleUniqueness) []string {
+	if stats.TotalRows <= 0 {
+		return nil
+	}
+
+	type cand struct {
+		col   string
+		ratio float64
+	}
+
+	cands := make([]cand, 0, len(stats.ColumnOrder))
+	for _, col := range stats.ColumnOrder {
+		if col == "row_hash" {
+			continue
+		}
+		dist := stats.PerColumnDistinct[col]
+		if dist <= 0 {
+			continue
+		}
+		r := float64(dist) / float64(stats.TotalRows)
+		if r > 0.90 {
+			continue
+		}
+		cands = append(cands, cand{col: col, ratio: r})
+	}
+
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].ratio == cands[j].ratio {
+			return cands[i].col < cands[j].col
+		}
+		return cands[i].ratio < cands[j].ratio
 	})
+
+	const maxBreakouts = 5
+	out := make([]string, 0, maxBreakouts)
+	for _, c := range cands {
+		out = append(out, c.col)
+		if len(out) >= maxBreakouts {
+			break
+		}
+	}
+	return out
+}
+
+func formatUniquenessReport(stats sampleUniqueness) string {
+	if stats.TotalRows <= 0 {
+		return "uniqueness: no rows sampled"
+	}
+
+	type row struct {
+		Col    string
+		Dist   int
+		Ratio  float64
+		Capped bool
+	}
+	rows := make([]row, 0, len(stats.ColumnOrder))
+	for _, col := range stats.ColumnOrder {
+		d := stats.PerColumnDistinct[col]
+		r := float64(d) / float64(stats.TotalRows)
+		rows = append(rows, row{
+			Col:    col,
+			Dist:   d,
+			Ratio:  r,
+			Capped: stats.PerColumnCapped[col],
+		})
+	}
+
+	sort.SliceStable(rows, func(i, j int) bool {
+		if rows[i].Ratio == rows[j].Ratio {
+			return rows[i].Col < rows[j].Col
+		}
+		return rows[i].Ratio < rows[j].Ratio
+	})
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "uniqueness report: sampled_rows=%d\n", stats.TotalRows)
+	fmt.Fprintf(&b, "col,distinct,ratio,capped\n")
+	for _, r := range rows {
+		fmt.Fprintf(&b, "%s,%d,%.4f,%t\n", r.Col, r.Dist, r.Ratio, r.Capped)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// -------------------- multi-table conversion --------------------
+
+// buildMultiTableFromSingle converts a single-table pipeline into the multi-table
+// config JSON structure used by cmd/etl_multi.
+//
+// We return map[string]any to avoid depending on internal/storage TableSpec types
+// in this probe utility.
+func buildMultiTableFromSingle(p config.Pipeline, stats sampleUniqueness, breakout []string) map[string]any {
+	backend := normalizeBackendKind(p.Storage.Kind)
+	dataset := normalizeFieldName(p.Job)
+	if dataset == "" {
+		dataset = normalizeFieldName(p.Storage.DB.Table)
+	}
+	if dataset == "" {
+		dataset = "dataset"
+	}
+
+	// Determine breakouts: user-specified > auto.
+	breakoutSet := make(map[string]struct{})
+	for _, b := range breakout {
+		b = strings.TrimSpace(b)
+		if b == "" {
+			continue
+		}
+		breakoutSet[b] = struct{}{}
+	}
+	if len(breakoutSet) == 0 {
+		for _, col := range autoSelectBreakouts(stats) {
+			breakoutSet[col] = struct{}{}
+		}
+	}
+
+	// Ensure we never breakout row_hash itself.
+	delete(breakoutSet, "row_hash")
+
+	// Build dimension tables for breakouts.
+	dimTables := make([]map[string]any, 0, len(breakoutSet))
+	factColumns := make([]map[string]any, 0, len(p.Storage.DB.Columns)+len(breakoutSet))
+	factFromRows := make([]map[string]any, 0, len(p.Storage.DB.Columns)+len(breakoutSet))
+
+	// Sort breakouts for deterministic output.
+	breakouts := make([]string, 0, len(breakoutSet))
+	for b := range breakoutSet {
+		breakouts = append(breakouts, b)
+	}
+	sort.Strings(breakouts)
+
+	for _, b := range breakouts {
+		dimTableName := fmt.Sprintf("public.%s_%s", dataset, b)
+		pkName := fmt.Sprintf("%s_id", b)
+
+		// Use varchar(512) as requested for non-JSON-capable backends.
+		valType := "varchar(512)"
+
+		dim := map[string]any{
+			"name":              dimTableName,
+			"auto_create_table": true,
+			"primary_key": map[string]any{
+				"name": pkName,
+				"type": "serial",
+			},
+			"columns": []any{
+				map[string]any{"name": b, "type": valType, "nullable": false},
+			},
+			"constraints": []any{
+				map[string]any{"kind": "unique", "columns": []any{b}},
+			},
+			"load": map[string]any{
+				"kind": "dimension",
+				"from_rows": []any{
+					map[string]any{"target_column": b, "source_field": b},
+				},
+				"conflict":  map[string]any{"target_columns": []any{b}, "action": "do_nothing"},
+				"returning": []any{pkName, b},
+				"cache": map[string]any{
+					"key_column":   b,
+					"value_column": pkName,
+					"prewarm":      false,
+				},
+			},
+		}
+		dimTables = append(dimTables, dim)
+
+		// Add FK column to fact table.
+		factColumns = append(factColumns, map[string]any{
+			"name":       pkName,
+			"type":       "int",
+			"nullable":   true,
+			"references": fmt.Sprintf("%s(%s)", dimTableName, pkName),
+		})
+		factFromRows = append(factFromRows, map[string]any{
+			"target_column": pkName,
+			"lookup": map[string]any{
+				"table":      dimTableName,
+				"match":      map[string]any{b: b},
+				"return":     pkName,
+				"on_missing": "insert",
+			},
+		})
+	}
+
+	// Add row_hash early.
+	factColumns = append(factColumns, map[string]any{"name": "row_hash", "type": "text", "nullable": false})
+	factFromRows = append(factFromRows, map[string]any{"target_column": "row_hash", "source_field": "row_hash"})
+
+	// Add remaining scalar columns (skip breakout fields; they’re represented by FK ids now).
+	for _, c := range p.Storage.DB.Columns {
+		if c == "row_hash" {
+			continue
+		}
+		if _, isBreakout := breakoutSet[c]; isBreakout {
+			continue
+		}
+		factColumns = append(factColumns, map[string]any{"name": c, "type": "text", "nullable": true})
+		factFromRows = append(factFromRows, map[string]any{"target_column": c, "source_field": c})
+	}
+
+	factTableName := fmt.Sprintf("public.%s", dataset)
+	fact := map[string]any{
+		"name":              factTableName,
+		"auto_create_table": true,
+		"primary_key": map[string]any{
+			"name": dataset + "_id",
+			"type": "serial",
+		},
+		"columns": factColumns,
+		"constraints": []any{
+			map[string]any{"kind": "unique", "columns": []any{"row_hash"}},
+		},
+		"load": map[string]any{
+			"kind": "fact",
+			"dedupe": map[string]any{
+				"conflict_columns": []any{"row_hash"},
+				"action":           "do_nothing",
+			},
+			"from_rows": factFromRows,
+		},
+	}
+
+	tables := make([]any, 0, len(dimTables)+1)
+	for _, d := range dimTables {
+		tables = append(tables, d)
+	}
+	tables = append(tables, fact)
+
+	// Rebuild storage section for multi_table.
+	storage := map[string]any{
+		"kind": backend,
+		"db": map[string]any{
+			"dsn":    p.Storage.DB.DSN,
+			"mode":   "multi_table",
+			"tables": tables,
+		},
+	}
+
+	out := map[string]any{
+		"job":       p.Job,
+		"source":    p.Source,
+		"parser":    p.Parser,
+		"transform": p.Transform,
+		"storage":   storage,
+		"runtime": map[string]any{
+			"reader_workers":                     p.Runtime.ReaderWorkers,
+			"transform_workers":                  p.Runtime.TransformWorkers,
+			"loader_workers":                     p.Runtime.LoaderWorkers,
+			"batch_size":                         p.Runtime.BatchSize,
+			"channel_buffer":                     p.Runtime.ChannelBuffer,
+			"dedupe_dimension_keys":              false,
+			"dedupe_dimension_keys_within_batch": false,
+		},
+	}
+	return out
+}
+
+// -------------------- probeCSV/probeJSON/probeXML WithStats --------------------
+
+func probeCSVWithStats(sample []byte, opt Options) (config.Pipeline, sampleUniqueness, error) {
+	// Cut sample at last newline to avoid a half-line record at the end.
+	if i := bytes.LastIndexByte(sample, '\n'); i > 0 {
+		sample = sample[:i+1]
+	}
+
+	headers, rows, err := readCSVSample(sample, ',')
 	if err != nil {
-		return config.Pipeline{}, fmt.Errorf("parse json sample: %w", err)
+		return config.Pipeline{}, sampleUniqueness{}, fmt.Errorf("parse csv sample: %w", err)
+	}
+
+	p, err := probeCSV(sample, opt)
+	if err != nil {
+		return config.Pipeline{}, sampleUniqueness{}, err
+	}
+
+	stats := computeUniquenessFromCSVSample(rows, p.Storage.DB.Columns)
+	_ = headers
+	return p, stats, nil
+}
+
+func probeJSONWithStats(sample []byte, opt Options) (config.Pipeline, sampleUniqueness, error) {
+	// Decode sample JSON records (best-effort, no dependency on internal/parser/json).
+	recs, err := sampleJSONRecords(sample, 5000)
+	if err != nil {
+		return config.Pipeline{}, sampleUniqueness{}, fmt.Errorf("decode json sample: %w", err)
 	}
 	if len(recs) == 0 {
-		return config.Pipeline{}, fmt.Errorf("parse json sample: no records found")
+		// Still return a minimal pipeline; stats empty.
+		p, err := probeJSON(sample, opt, nil, nil, nil)
+		return p, sampleUniqueness{}, err
 	}
 
-	// Structural envelope handling:
-	// If we have exactly one record with one or more array-of-object fields,
-	// pick the largest such array and treat its elements as the records.
-	recs = expandJSONRecords(recs)
-
-	// Flatten nested objects so that child fields become columns, analogous to
-	// how XML discovery produces flattened field names.
-	flatRecs := make([]records.Record, len(recs))
-	for i, r := range recs {
-		flat := make(records.Record)
-		flattenJSONRecord("", r, flat)
-		flatRecs[i] = flat
+	// Flatten records into single-level maps.
+	flat := make([]records.Record, 0, len(recs))
+	for _, r := range recs {
+		m := make(records.Record)
+		flattenJSONRecord("", records.Record(r), m)
+		flat = append(flat, m)
 	}
 
-	// Derive headers as the union of flattened keys, with deterministic order.
-	headerSet := make(map[string]struct{})
-	for _, r := range flatRecs {
-		for k := range r {
-			headerSet[k] = struct{}{}
-		}
-	}
-	headers := make([]string, 0, len(headerSet))
-	for k := range headerSet {
-		headers = append(headers, k)
-	}
-	sort.Strings(headers)
+	// Infer columns from flattened records.
+	headers := inferHeadersFromJSON(flat)
 
-	// Build [][]string rows in header order from flattened records.
-	rows := make([][]string, len(flatRecs))
-	for i, r := range flatRecs {
-		row := make([]string, len(headers))
-		for j, h := range headers {
-			row[j] = fmt.Sprint(r[h]) // inference works over string patterns
-		}
-		rows[i] = row
-	}
-
-	// Reuse CSV type/layout inference.
-	types := inferTypes(headers, rows)
-	colLayouts := detectColumnLayouts(rows, types)
-	coerceLayout := chooseMajorityLayout(colLayouts, types)
-
-	// Build contract fields and normalized column names.
-	fields := make([]schema.Field, 0, len(headers))
+	// Normalize column names.
 	normalizedCols := make([]string, 0, len(headers))
 	normByHeader := make(map[string]string, len(headers))
-
 	for _, h := range headers {
 		n := truncateFieldName(normalizeFieldName(h))
 		normByHeader[h] = n
 		normalizedCols = append(normalizedCols, n)
 	}
 
-	requiredCounter := 0
-	for i, h := range headers {
-		ct := contractTypeFromInference(types[i])
-		f := schema.Field{
-			Name:     normByHeader[h],
-			Type:     ct,
-			Required: false,
-		}
+	// Build pipeline based on inferred columns.
+	p, err := probeJSON(sample, opt, headers, normalizedCols, normByHeader)
+	if err != nil {
+		return config.Pipeline{}, sampleUniqueness{}, err
+	}
 
-		// Heuristic: first integer column with no empties is required.
-		if types[i] == "integer" && allNonEmptySample(rows, i) && requiredCounter == 0 {
-			f.Required = true
-			requiredCounter++
-		}
-
-		// Layout for date/timestamp columns.
-		if types[i] == "date" || types[i] == "timestamp" {
-			if lay := colLayouts[i]; lay != "" {
-				f.Layout = lay
+	// Canonicalize flat records to normalized keys for uniqueness stats.
+	canon := make([]records.Record, 0, len(flat))
+	for _, r := range flat {
+		out := make(records.Record, len(r))
+		for k, v := range r {
+			if mapped, ok := normByHeader[k]; ok && mapped != "" {
+				out[mapped] = v
+			} else {
+				out[k] = v
 			}
 		}
-
-		// Truthy/falsy for booleans.
-		if types[i] == "boolean" {
-			f.Truthy = []string{"1", "t", "true", "yes", "y"}
-			f.Falsy = []string{"0", "f", "false", "no", "n"}
-		}
-
-		fields = append(fields, f)
+		canon = append(canon, out)
 	}
 
-	// Build coerce types map (skip explicit text).
-	coerceTypes := make(map[string]string, len(headers))
-	for i, h := range headers {
-		t := contractTypeFromInference(types[i])
-		if t != "text" {
-			coerceTypes[normByHeader[h]] = t
+	stats := computeUniquenessFromJSONRecords(canon, p.Storage.DB.Columns)
+	return p, stats, nil
+}
+
+func probeXMLWithStats(sample []byte, opt Options) (config.Pipeline, sampleUniqueness, error) {
+	p, err := probeXML(sample, opt)
+	if err != nil {
+		return config.Pipeline{}, sampleUniqueness{}, err
+	}
+
+	// For XML we do not compute uniqueness (structure-only).
+	stats := sampleUniqueness{
+		TotalRows:         0,
+		PerColumnDistinct: make(map[string]int),
+		PerColumnCapped:   make(map[string]bool),
+		ColumnOrder:       append([]string(nil), p.Storage.DB.Columns...),
+	}
+	return p, stats, nil
+}
+
+// -------------------- JSON helpers (flattening, header inference) --------------------
+
+func inferHeadersFromJSON(recs []records.Record) []string {
+	set := make(map[string]struct{})
+	for _, r := range recs {
+		for k := range r {
+			set[k] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// expandJSONRecords heuristically unwraps a "records-like" envelope without
+// hard-coding field names. If there is exactly one top-level record and it
+// contains one or more fields that are array-of-object, it picks the largest
+// such array and treats its elements as the actual records.
+//
+// If no such array-of-object field exists, it returns the input unchanged.
+func expandJSONRecords(in []records.Record) []records.Record {
+	if len(in) != 1 {
+		return in
+	}
+	r := in[0]
+
+	type candidate struct {
+		recs []records.Record
+	}
+
+	var best candidate
+
+	for _, v := range r {
+		arr, ok := v.([]any)
+		if !ok || len(arr) == 0 {
+			continue
+		}
+
+		objs := make([]records.Record, 0, len(arr))
+		for _, elem := range arr {
+			m, ok := elem.(map[string]any)
+			if !ok {
+				objs = nil
+				break
+			}
+			objs = append(objs, records.Record(m))
+		}
+		if len(objs) == 0 {
+			continue
+		}
+
+		if len(objs) > len(best.recs) {
+			best.recs = objs
 		}
 	}
 
-	// Build pipeline (mirrors probeCSV, but with "json" parser and .json path).
+	if len(best.recs) > 0 {
+		return best.recs
+	}
+	return in
+}
+
+func flattenJSONRecord(prefix string, in records.Record, out records.Record) {
+	for k, v := range in {
+		key := k
+		if prefix != "" {
+			key = prefix + "." + k
+		}
+		flattenJSONValue(key, v, out)
+	}
+}
+
+func flattenJSONValue(key string, v any, out records.Record) {
+	switch t := v.(type) {
+	case map[string]any:
+		flattenJSONRecord(key, records.Record(t), out)
+	default:
+		out[key] = v
+	}
+}
+
+// -------------------- probeJSON / probeCSV / probeXML --------------------
+
+func probeJSON(sample []byte, opt Options, headers, normalizedCols []string, normByHeader map[string]string) (config.Pipeline, error) {
+	// Build contract fields: all text by default (user can refine).
+	fields := make([]schema.Field, 0, len(headers))
+	for _, h := range headers {
+		fields = append(fields, schema.Field{
+			Name: normByHeader[h],
+			Type: "text",
+		})
+	}
+
+	// Build pipeline.
 	var p config.Pipeline
 
 	// Source: suggest a local file path; user will edit as needed.
@@ -570,16 +1121,6 @@ func probeJSON(sample []byte, opt Options) (config.Pipeline, error) {
 		"header_map":   buildHeaderMap(headers, normByHeader),
 	}
 
-	// Transform chain: coerce then validate.
-	coerceOpt := config.Options{
-		"layout": coerceLayout,
-		"types":  coerceTypes,
-	}
-	coerce := config.Transform{
-		Kind:    "coerce",
-		Options: coerceOpt,
-	}
-
 	contract := schema.Contract{
 		Name:   normalizeFieldName(opt.Name),
 		Fields: fields,
@@ -592,7 +1133,7 @@ func probeJSON(sample []byte, opt Options) (config.Pipeline, error) {
 		Kind:    "validate",
 		Options: validateOpt,
 	}
-	p.Transform = []config.Transform{coerce, validate}
+	p.Transform = []config.Transform{validate}
 
 	// Storage: backend-specific defaults.
 	backend := normalizeBackendKind(opt.Backend)
@@ -602,15 +1143,12 @@ func probeJSON(sample []byte, opt Options) (config.Pipeline, error) {
 	return p, nil
 }
 
-// probeCSV builds a config.Pipeline for a CSV source using the existing CSV
-// sampling + type/layout inference heuristics.
 func probeCSV(sample []byte, opt Options) (config.Pipeline, error) {
 	// Cut sample at last newline to avoid a half-line record at the end.
 	if i := bytes.LastIndexByte(sample, '\n'); i > 0 {
 		sample = sample[:i+1]
 	}
 
-	// Use the existing CSV sampler: headers + rows as [][]string.
 	headers, rows, err := readCSVSample(sample, ',')
 	if err != nil {
 		return config.Pipeline{}, fmt.Errorf("parse csv sample: %w", err)
@@ -729,9 +1267,6 @@ func probeCSV(sample []byte, opt Options) (config.Pipeline, error) {
 	return p, nil
 }
 
-// probeXML builds a config.Pipeline for an XML source. It uses discovery to
-// build an xmlparser.Config and infers the columns from fields+lists. Types
-// default to "text" and can be hand-edited later.
 func probeXML(sample []byte, opt Options) (config.Pipeline, error) {
 	// Guess record tag via discovery on the sample.
 	rt, err := inspect.GuessRecordTag(bytes.NewReader(sample))
@@ -817,8 +1352,6 @@ func probeXML(sample []byte, opt Options) (config.Pipeline, error) {
 	return p, nil
 }
 
-// inferColumnsFromConfig builds a deterministic column list from the XML
-// parser config. It combines field and list names and sorts them.
 func inferColumnsFromConfig(cfg xmlparser.Config) []string {
 	cols := make([]string, 0, len(cfg.Fields)+len(cfg.Lists))
 	for name := range cfg.Fields {
@@ -827,21 +1360,10 @@ func inferColumnsFromConfig(cfg xmlparser.Config) []string {
 	for name := range cfg.Lists {
 		cols = append(cols, name)
 	}
-	// deterministic order for config diffs
-	if len(cols) > 1 {
-		for i := 0; i < len(cols)-1; i++ {
-			for j := i + 1; j < len(cols); j++ {
-				if cols[j] < cols[i] {
-					cols[i], cols[j] = cols[j], cols[i]
-				}
-			}
-		}
-	}
+	sort.Strings(cols)
 	return cols
 }
 
-// buildHeaderMap constructs the parser.options.header_map object from the
-// original CSV headers and their normalized names.
 func buildHeaderMap(headers []string, normByHeader map[string]string) map[string]string {
 	out := make(map[string]string, len(headers))
 	for _, h := range headers {
@@ -850,7 +1372,6 @@ func buildHeaderMap(headers []string, normByHeader map[string]string) map[string
 	return out
 }
 
-// normalizeBackendKind normalizes user-provided backend names.
 func normalizeBackendKind(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "postgres", "postgresql":
@@ -864,8 +1385,6 @@ func normalizeBackendKind(s string) string {
 	}
 }
 
-// defaultDBConfigForBackend builds a DBConfig with backend-specific defaults.
-// DSNs are placeholders that users are expected to edit.
 func defaultDBConfigForBackend(backend, name string, columns []string) config.DBConfig {
 	tableBase := normalizeFieldName(name)
 	switch backend {
@@ -899,95 +1418,166 @@ func defaultDBConfigForBackend(backend, name string, columns []string) config.DB
 	}
 }
 
-// min returns the smaller of a and b.
-func min(a, b int) int {
+// ----------------------------------------------------------------------------
+// Normalization helpers (used by both legacy + unified probes)
+// ----------------------------------------------------------------------------
+
+func truncateFieldName(s string) string {
+	const maxLen = 63
+	if len(s) <= maxLen {
+		return s
+	}
+	// Ensure we cut on UTF-8 boundary.
+	b := []byte(s)
+	if len(b) <= maxLen {
+		return s
+	}
+	cut := maxLen
+	for cut > 0 && !utf8.Valid(b[:cut]) {
+		cut--
+	}
+	if cut <= 0 {
+		return s[:maxLen]
+	}
+	return string(b[:cut])
+}
+
+func normalizeFieldName(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+
+	// Simple ASCII-ish normalization:
+	//  - lower
+	//  - replace whitespace with underscore
+	//  - remove non [a-z0-9_]
+	s = strings.ToLower(s)
+
+	var b strings.Builder
+	b.Grow(len(s))
+
+	lastUnderscore := false
+	for _, r := range s {
+		if r == ' ' || r == '-' || r == '.' || r == '/' || r == '\\' || r == ':' || r == ';' {
+			if !lastUnderscore {
+				b.WriteByte('_')
+				lastUnderscore = true
+			}
+			continue
+		}
+
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			b.WriteRune(r)
+			lastUnderscore = (r == '_')
+			continue
+		}
+
+		// Drop everything else.
+	}
+
+	out := strings.Trim(b.String(), "_")
+	return out
+}
+
+func sampleJSONRecords(sample []byte, maxRecords int) ([]map[string]any, error) {
+	if maxRecords <= 0 {
+		maxRecords = 1000
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(sample))
+
+	// Decode first top-level value.
+	var root any
+	if err := dec.Decode(&root); err != nil {
+		if err == io.EOF {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	out := make([]map[string]any, 0, minInt(maxRecords, 128))
+	emit := func(m map[string]any) {
+		if m == nil || len(out) >= maxRecords {
+			return
+		}
+		out = append(out, m)
+	}
+
+	switch v := root.(type) {
+	case []any:
+		for _, it := range v {
+			m, ok := it.(map[string]any)
+			if !ok {
+				continue
+			}
+			emit(m)
+			if len(out) >= maxRecords {
+				return out, nil
+			}
+		}
+
+	case map[string]any:
+		// Envelope support: find first array-of-objects field.
+		if slice := findObjectSliceJSON(v); slice != nil {
+			for _, m := range slice {
+				emit(m)
+				if len(out) >= maxRecords {
+					return out, nil
+				}
+			}
+		} else {
+			emit(v)
+		}
+	default:
+		// Unsupported root; return empty.
+	}
+
+	// NDJSON / multiple top-level objects.
+	for len(out) < maxRecords {
+		var obj map[string]any
+		if err := dec.Decode(&obj); err != nil {
+			if err == io.EOF {
+				break
+			}
+			// Stop sampling on error; return what we have.
+			break
+		}
+		emit(obj)
+	}
+
+	return out, nil
+}
+
+func findObjectSliceJSON(root map[string]any) []map[string]any {
+	for _, v := range root {
+		rawSlice, ok := v.([]any)
+		if !ok || len(rawSlice) == 0 {
+			continue
+		}
+		objects := make([]map[string]any, 0, len(rawSlice))
+		valid := true
+		for _, elem := range rawSlice {
+			if elem == nil {
+				continue
+			}
+			m, ok := elem.(map[string]any)
+			if !ok {
+				valid = false
+				break
+			}
+			objects = append(objects, m)
+		}
+		if valid && len(objects) > 0 {
+			return objects
+		}
+	}
+	return nil
+}
+
+func minInt(a, b int) int {
 	if a < b {
 		return a
 	}
 	return b
-}
-
-// expandJSONRecords heuristically unwraps a "records-like" envelope without
-// hard-coding field names. If there is exactly one top-level record and it
-// contains one or more fields that are array-of-object, it picks the largest
-// such array and treats its elements as the actual records.
-//
-// If no such array-of-object field exists, it returns the input unchanged.
-func expandJSONRecords(in []records.Record) []records.Record {
-	if len(in) != 1 {
-		return in
-	}
-	r := in[0]
-
-	type candidate struct {
-		recs []records.Record
-	}
-
-	var best candidate
-
-	for _, v := range r {
-		arr, ok := v.([]any)
-		if !ok || len(arr) == 0 {
-			continue
-		}
-
-		objs := make([]records.Record, 0, len(arr))
-		for _, elem := range arr {
-			m, ok := elem.(map[string]any)
-			if !ok {
-				objs = nil
-				break
-			}
-			objs = append(objs, records.Record(m))
-		}
-		if len(objs) == 0 {
-			continue
-		}
-
-		if len(objs) > len(best.recs) {
-			best.recs = objs
-		}
-	}
-
-	if len(best.recs) > 0 {
-		return best.recs
-	}
-	return in
-}
-
-// flattenJSONRecord flattens nested JSON structures into dotted-path keys,
-// e.g. { "user": { "id": 1, "name": "x" } } becomes:
-//
-//	"user.id" = 1
-//	"user.name" = "x"
-//
-// Arrays are left as-is (the entire []any is stored), and will be stringified
-// later for inference; this keeps the logic simple and matches the ETL’s
-// "text first" bias for complex types.
-func flattenJSONRecord(prefix string, in records.Record, out records.Record) {
-	for k, v := range in {
-		key := k
-		if prefix != "" {
-			key = prefix + "." + k
-		}
-		flattenJSONValue(key, v, out)
-	}
-}
-
-func flattenJSONValue(key string, v any, out records.Record) {
-	switch t := v.(type) {
-	case map[string]any:
-		// Nested object → recurse.
-		for k2, v2 := range t {
-			subKey := key + "." + k2
-			flattenJSONValue(subKey, v2, out)
-		}
-	case records.Record:
-		// In case our decoder ever yields records.Record directly.
-		flattenJSONRecord(key, t, out)
-	default:
-		// Arrays and scalars are kept as-is; arrays will later be stringified
-		// when building rows for inference.
-		out[key] = v
-	}
 }

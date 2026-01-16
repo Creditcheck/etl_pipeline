@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -326,6 +325,7 @@ func (e *Engine2Pass) processFactBatch(
 		return nil
 	}
 
+	// Time the lookup resolution separately, to make bottlenecks obvious.
 	lookupStart := time.Now()
 	if err := e.resolveBatchLookups(ctx, plan, batch, cache); err != nil {
 		return err
@@ -336,20 +336,39 @@ func (e *Engine2Pass) processFactBatch(
 
 	for _, fact := range plan.Facts {
 		start := time.Now()
-		inserted, dropped, err := e.insertFactBatch(ctx, fact, batch, cache, lenient)
+		inserted, ds, err := e.insertFactBatch(ctx, fact, batch, cache, lenient, debug)
 		dur := time.Since(start).Truncate(time.Millisecond)
 
 		if err != nil {
 			return err
 		}
 
+		droppedTotal := ds.TotalDropped()
 		if debug {
 			logf(
-				"stage=pass2_insert_fact table=%s batch_rows=%d inserted=%d dropped=%d duration=%s",
-				fact.Table.Name, len(batch), inserted, dropped, dur,
+				"stage=pass2_insert_fact table=%s batch_rows=%d inserted=%d dropped_total=%d dropped_lookup_miss=%d dropped_empty_key=%d dropped_conflict=%d duration=%s",
+				fact.Table.Name,
+				len(batch),
+				inserted,
+				droppedTotal,
+				ds.LookupMiss,
+				ds.EmptyKey,
+				ds.Conflict,
+				dur,
 			)
-		} else if lenient && dropped > 0 {
-			logf("stage=fact_batch table=%s inserted=%d dropped=%d", fact.Table.Name, inserted, dropped)
+			for _, s := range ds.Samples {
+				logf("stage=fact_drop_sample table=%s %s", fact.Table.Name, s)
+			}
+		} else if lenient && droppedTotal > 0 {
+			logf(
+				"stage=fact_batch table=%s inserted=%d dropped_total=%d dropped_lookup_miss=%d dropped_empty_key=%d dropped_conflict=%d",
+				fact.Table.Name,
+				inserted,
+				droppedTotal,
+				ds.LookupMiss,
+				ds.EmptyKey,
+				ds.Conflict,
+			)
 		}
 	}
 
@@ -436,13 +455,15 @@ func (e *Engine2Pass) insertFactBatch(
 	batch []*transformer.Row,
 	cache map[string]map[string]int64,
 	lenient bool,
-) (inserted int, dropped int, _ error) {
+	debug bool,
+) (inserted int, ds dropStats, _ error) {
 	cols := fact.TargetColumns
 
 	outRows := make([][]any, 0, len(batch))
 	for _, r := range batch {
 		rowOut := make([]any, 0, len(fact.Columns))
 		drop := false
+		dropSample := ""
 
 		for _, c := range fact.Columns {
 			if c.Lookup != nil {
@@ -450,15 +471,15 @@ func (e *Engine2Pass) insertFactBatch(
 				matchIdx := c.Lookup.MatchFieldIndex
 				key := normalizeKey(r.V[matchIdx])
 				if key == "" {
-					if c.Nullable {
-						rowOut = append(rowOut, nil)
-						continue
-					}
 					if lenient {
+						ds.EmptyKey++
 						drop = true
+						if debug && dropSample == "" {
+							dropSample = fmt.Sprintf("reason=empty_lookup_key lookup_table=%s", dimTable)
+						}
 						break
 					}
-					return inserted, dropped, fmt.Errorf("fact %s: empty lookup key table=%s", fact.Table.Name, dimTable)
+					return inserted, ds, fmt.Errorf("fact %s: empty lookup key table=%s", fact.Table.Name, dimTable)
 				}
 
 				var (
@@ -470,10 +491,14 @@ func (e *Engine2Pass) insertFactBatch(
 				}
 				if !ok {
 					if lenient {
+						ds.LookupMiss++
 						drop = true
+						if debug && dropSample == "" {
+							dropSample = fmt.Sprintf("reason=lookup_miss lookup_table=%s key=%q", dimTable, key)
+						}
 						break
 					}
-					return inserted, dropped, fmt.Errorf("fact %s: lookup miss table=%s key=%q", fact.Table.Name, dimTable, key)
+					return inserted, ds, fmt.Errorf("fact %s: lookup miss table=%s key=%q", fact.Table.Name, dimTable, key)
 				}
 				rowOut = append(rowOut, id)
 				continue
@@ -487,21 +512,65 @@ func (e *Engine2Pass) insertFactBatch(
 		}
 
 		if drop {
-			dropped++
+			if debug && dropSample != "" {
+				ds.AddSample(dropSample)
+			}
 			continue
 		}
 		outRows = append(outRows, rowOut)
 	}
 
 	if len(outRows) == 0 {
-		return 0, dropped, nil
+		return 0, ds, nil
 	}
 
 	affected, err := e.Repo.InsertFactRows(ctx, fact.Table.Name, cols, outRows, fact.DedupeColumns)
 	if err != nil {
-		return 0, dropped, err
+		return 0, ds, err
 	}
-	return int(affected), dropped, nil
+	inserted = int(affected)
+
+	// If a dedupe/conflict target is configured, some rows may be skipped by the
+	// database (e.g. ON CONFLICT DO NOTHING). We cannot observe the exact reason
+	// without backend-specific features, but we can reliably compute the delta.
+	if len(fact.DedupeColumns) > 0 {
+		conflict := len(outRows) - inserted
+		if conflict < 0 {
+			conflict = 0
+		}
+		ds.Conflict += conflict
+	}
+
+	return inserted, ds, nil
+}
+
+// dropStats tracks why rows were dropped before insertion (lenient mode) and why
+// inserts resulted in fewer affected rows than attempted (conflict dedupe).
+//
+// IMPORTANT: "Conflict" is inferred as (attempted - affected) when dedupe columns
+// are configured. This is backend-agnostic and works across Postgres/MSSQL/SQLite.
+type dropStats struct {
+	LookupMiss int
+	EmptyKey   int
+	Conflict   int
+
+	// Samples contains a small number of representative drop reasons (debug only).
+	Samples []string
+}
+
+func (d dropStats) TotalDropped() int {
+	return d.LookupMiss + d.EmptyKey + d.Conflict
+}
+
+func (d *dropStats) AddSample(s string) {
+	const maxSamples = 5
+	if d == nil {
+		return
+	}
+	if len(d.Samples) >= maxSamples {
+		return
+	}
+	d.Samples = append(d.Samples, s)
 }
 
 // dedupeTypedKeys performs bounded dedupe for a slice of typed values.
@@ -559,7 +628,6 @@ type indexedFact struct {
 type indexedFactColumn struct {
 	TargetColumn     string
 	SourceFieldIndex int
-	Nullable         bool
 	Lookup           *indexedLookup
 }
 
@@ -610,21 +678,11 @@ func buildIndexedPlan(cfg Pipeline, columns []string) (indexedPlan, error) {
 		case "fact":
 			f := indexedFact{Table: t}
 
-			nullableByColumn := make(map[string]bool, len(t.Columns))
-			for _, c := range t.Columns {
-				nullable := false
-				if c.Nullable != nil {
-					nullable = *c.Nullable
-				}
-				nullableByColumn[c.Name] = nullable
-			}
-
 			for _, fr := range t.Load.FromRows {
 				f.TargetColumns = append(f.TargetColumns, fr.TargetColumn)
 				col := indexedFactColumn{
 					TargetColumn:     fr.TargetColumn,
 					SourceFieldIndex: -1,
-					Nullable:         nullableByColumn[fr.TargetColumn],
 				}
 
 				if fr.Lookup != nil {
@@ -683,64 +741,20 @@ func isLenient(ts []config.Transform) bool {
 	return false
 }
 
-// normalizeKey produces a stable string form used for in-memory caches.
-//
-// Hot-path rules:
-//   - Avoid fmt.Sprint for common primitive types (it allocates heavily).
-//   - Preserve current trim semantics for strings/[]byte.
-//   - Treat nil/empty as "".
 func normalizeKey(v any) string {
 	switch t := v.(type) {
 	case nil:
 		return ""
-
 	case string:
 		if builtin.HasEdgeSpace(t) {
 			return strings.TrimSpace(t)
 		}
 		return t
-
 	case []byte:
-		// Convert once.
-		s := string(t)
-		if builtin.HasEdgeSpace(s) {
-			return strings.TrimSpace(s)
+		if builtin.HasEdgeSpace(string(t)) {
+			return strings.TrimSpace(string(t))
 		}
-		return s
-
-	case bool:
-		if t {
-			return "true"
-		}
-		return "false"
-
-	case int:
-		return strconv.Itoa(t)
-	case int8:
-		return strconv.FormatInt(int64(t), 10)
-	case int16:
-		return strconv.FormatInt(int64(t), 10)
-	case int32:
-		return strconv.FormatInt(int64(t), 10)
-	case int64:
-		return strconv.FormatInt(t, 10)
-
-	case uint:
-		return strconv.FormatUint(uint64(t), 10)
-	case uint8:
-		return strconv.FormatUint(uint64(t), 10)
-	case uint16:
-		return strconv.FormatUint(uint64(t), 10)
-	case uint32:
-		return strconv.FormatUint(uint64(t), 10)
-	case uint64:
-		return strconv.FormatUint(t, 10)
-
-	case float32:
-		return strconv.FormatFloat(float64(t), 'g', -1, 32)
-	case float64:
-		return strconv.FormatFloat(t, 'g', -1, 64)
-
+		return string(t)
 	default:
 		val := fmt.Sprint(v)
 		if builtin.HasEdgeSpace(val) {
@@ -760,8 +774,6 @@ func typedBindValue(v any) any {
 		}
 		return t
 	case []byte:
-		// bytes.TrimSpace returns a sub-slice; for most parser implementations this is fine.
-		// If you see retention of huge buffers here, we can add a "copy on trim" option.
 		return bytes.TrimSpace(t)
 	default:
 		return v

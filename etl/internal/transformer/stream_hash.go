@@ -4,8 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // HashSpec configures the streaming hash transform.
@@ -20,6 +24,7 @@ import (
 // Notes:
 //   - Purely streaming and backend-agnostic.
 //   - Hashes typed values (after coercion) for stability.
+//   - Supports JSON arrays/objects (e.g. []any, map[string]any) deterministically.
 type HashSpec struct {
 	// TargetField is the destination column name (must exist in the active column set).
 	TargetField string
@@ -136,10 +141,8 @@ func HashLoopRows(
 			appendCanonicalValue(&b, r.V[idx], spec.TrimSpace, &scratch)
 		}
 
-		// Hash canonical string.
+		// Hash canonical string (sha256).
 		sum := sha256.Sum256([]byte(b.String()))
-
-		// Encoding: hex (stable and portable).
 		r.V[targetIdx] = hex.EncodeToString(sum[:])
 
 		// Forward downstream (ownership transfers).
@@ -161,7 +164,8 @@ func indexOf(cols []string, name string) int {
 
 // appendCanonicalValue writes a stable representation of v into b.
 // It avoids fmt.Sprint for common types to reduce allocations.
-// Supported types are those typically produced by the streaming coerce path.
+// Supported types include those produced by the streaming coerce path AND
+// JSON parser types (arrays/objects).
 func appendCanonicalValue(b *strings.Builder, v any, trimSpace bool, scratch *[64]byte) {
 	switch t := v.(type) {
 	case nil:
@@ -169,24 +173,17 @@ func appendCanonicalValue(b *strings.Builder, v any, trimSpace bool, scratch *[6
 		b.WriteString("null")
 
 	case string:
-		if trimSpace {
+		if trimSpace && hasEdgeSpace(t) {
 			t = strings.TrimSpace(t)
 		}
 		b.WriteString(t)
 
 	case []byte:
 		s := string(t)
-		if trimSpace {
+		if trimSpace && hasEdgeSpace(s) {
 			s = strings.TrimSpace(s)
 		}
 		b.WriteString(s)
-
-	case int:
-		b.Write(strconvAppendInt(scratch[:0], int64(t)))
-	case int64:
-		b.Write(strconvAppendInt(scratch[:0], t))
-	case uint64:
-		b.Write(strconvAppendUint(scratch[:0], t))
 
 	case bool:
 		if t {
@@ -195,10 +192,95 @@ func appendCanonicalValue(b *strings.Builder, v any, trimSpace bool, scratch *[6
 			b.WriteString("false")
 		}
 
+	case int:
+		b.Write(strconvAppendInt(scratch[:0], int64(t)))
+	case int8:
+		b.Write(strconvAppendInt(scratch[:0], int64(t)))
+	case int16:
+		b.Write(strconvAppendInt(scratch[:0], int64(t)))
+	case int32:
+		b.Write(strconvAppendInt(scratch[:0], int64(t)))
+	case int64:
+		b.Write(strconvAppendInt(scratch[:0], t))
+
+	case uint:
+		b.Write(strconvAppendUint(scratch[:0], uint64(t)))
+	case uint8:
+		b.Write(strconvAppendUint(scratch[:0], uint64(t)))
+	case uint16:
+		b.Write(strconvAppendUint(scratch[:0], uint64(t)))
+	case uint32:
+		b.Write(strconvAppendUint(scratch[:0], uint64(t)))
+	case uint64:
+		b.Write(strconvAppendUint(scratch[:0], t))
+
+	case float32:
+		b.WriteString(strconv.FormatFloat(float64(t), 'g', -1, 32))
+	case float64:
+		b.WriteString(strconv.FormatFloat(t, 'g', -1, 64))
+
+	case time.Time:
+		tt := t
+		if !tt.IsZero() {
+			tt = tt.UTC()
+		}
+		b.WriteString(tt.Format(time.RFC3339Nano))
+
+	// JSON array cases: make the canonical form deterministic.
+	case []string:
+		// JSON encoding is stable for slices.
+		enc, err := json.Marshal(t)
+		if err != nil {
+			// Extremely unlikely; fallback.
+			b.WriteString(fmt.Sprint(t))
+			return
+		}
+		b.Write(enc)
+
+	case []any:
+		enc, err := json.Marshal(t)
+		if err != nil {
+			b.WriteString(fmt.Sprint(t))
+			return
+		}
+		b.Write(enc)
+
+	// JSON object case: enforce stable key order before encoding.
+	case map[string]any:
+		appendCanonicalMap(b, t, trimSpace, scratch)
+
 	default:
 		// Fallback for uncommon types.
 		b.WriteString(fmt.Sprint(t))
 	}
+}
+
+func appendCanonicalMap(b *strings.Builder, m map[string]any, trimSpace bool, scratch *[64]byte) {
+	if m == nil {
+		b.WriteString("null")
+		return
+	}
+
+	// Stable key order.
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	b.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		// Key is always string.
+		b.WriteString(strconv.Quote(k))
+		b.WriteByte(':')
+
+		// Value: reuse canonical rules. For nested maps/slices, this stays deterministic.
+		appendCanonicalValue(b, m[k], trimSpace, scratch)
+	}
+	b.WriteByte('}')
 }
 
 func strconvAppendInt(dst []byte, v int64) []byte {
@@ -236,4 +318,13 @@ func strconvAppendUint(dst []byte, v uint64) []byte {
 		v /= 10
 	}
 	return append(dst, buf[i:]...)
+}
+
+func hasEdgeSpace(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	// This is the common fast-path check used elsewhere in the repo: avoid
+	// TrimSpace when we can.
+	return s[0] <= ' ' || s[len(s)-1] <= ' '
 }

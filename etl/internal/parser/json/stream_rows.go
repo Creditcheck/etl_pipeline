@@ -1,22 +1,3 @@
-// Package jsonparser provides JSON parsing helpers and a streaming adapter used
-// by the ETL pipeline. This file adds a streaming adapter that converts JSON
-// records into *transformer.Row values suitable for the generic ETL pipeline
-// in cmd/etl.
-//
-// High-level flow (mirrors the XML streaming adapter conceptually):
-//
-//  1. Decode JSON from an io.Reader using encoding/json.Decoder so we can
-//     handle large inputs and JSONL/NDJSON-style streams.
-//  2. Support the same envelope shape used by probeJSON:
-//     - root array of objects: [ {...}, {...} ]
-//     - root object with one or more array-of-object fields: { "records": [...] }
-//     - single object: { ... } (treated as one record)
-//  3. For each logical record (map[string]any):
-//     - Apply parser.options.header_map (original → normalized) to build a
-//     canonical map keyed by normalized names, exactly like the CSV path.
-//     - Build a *transformer.Row whose V slice is ordered according to the
-//     ETL storage columns slice.
-//  4. Stream rows into the 'out' channel for downstream transform/validate/load.
 package json
 
 import (
@@ -24,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	"etl/internal/config"
 	"etl/internal/transformer"
@@ -32,23 +14,15 @@ import (
 // StreamJSONRows parses JSON from r according to parserOpts and streams records
 // as *transformer.Row into 'out'.
 //
-// Contract:
+// Streaming behavior:
+//   - If the root is a JSON array, it streams each object element one-by-one.
+//   - If the root is a JSON object and contains an array-of-objects field, it streams
+//     the first such array field one-by-one (envelope pattern).
+//   - If the root is a single object with no array-of-objects fields, it emits one record.
 //
-//   - columns is the ordered list of destination columns. For each emitted
-//     record, we construct a []any where row[i] corresponds to columns[i].
-//     The transformer/loader stages rely on this alignment.
-//
-//   - parserOpts may contain a "header_map" object mapping original JSON keys
-//     to normalized column names. This mirrors the CSV path, where probeJSON
-//     generates a header_map in parser.options. We accept both map[string]any
-//     (when coming from JSON) and map[string]string (when constructed in Go).
-//
-//   - The function is intentionally single-threaded from the ETL perspective:
-//     it does not spawn its own worker pool. Concurrency is controlled at the
-//     ETL layer via runtime.reader_workers.
-//
-//   - onParseErr is used to report fatal parse errors; per-record parse errors
-//     are not distinguished in this initial implementation.
+// parserOpts:
+//   - header_map: map original key -> normalized key
+//   - array_join_separator: used to flatten []string / []any(string) into a scalar string
 func StreamJSONRows(
 	ctx context.Context,
 	r io.Reader,
@@ -58,35 +32,22 @@ func StreamJSONRows(
 	onParseErr func(line int, err error),
 ) error {
 	dec := json.NewDecoder(r)
+	dec.UseNumber() // avoids float64 allocations; downstream coerce can handle number parsing.
 
-	// Extract header_map from parser options, accepting both map[string]any and
-	// map[string]string. We intentionally do NOT use Options.StringMap here,
-	// because probeJSON builds a map[string]string directly in Go.
 	headerMap := readHeaderMap(parserOpts)
+	reverseHeaderMap := reverseHeaderMap(headerMap)
+
+	sep := strings.TrimSpace(parserOpts.String("array_join_separator", ","))
+	if sep == "" {
+		sep = ","
+	}
 
 	line := 0
 
-	// emitObject takes a single JSON object (map[string]any), applies header_map
-	// to canonicalize keys to normalized column names, and sends a *Row to 'out'.
 	emitObject := func(obj map[string]any) error {
 		line++
 
-		// Apply header_map if present: build a canonical-key object so that
-		// downstream lookup by normalized column names works for original keys
-		// like "Identifikační číslo" → "identifikacni_cislo".
-		canon := obj
-		if len(headerMap) > 0 {
-			canon = make(map[string]any, len(obj))
-			for k, v := range obj {
-				if mapped, ok := headerMap[k]; ok && mapped != "" {
-					canon[mapped] = v
-				} else {
-					canon[k] = v
-				}
-			}
-		}
-
-		values := recordToRowJSON(canon, columns)
+		values := recordToRowJSONStreaming(obj, columns, reverseHeaderMap, sep)
 		row := &transformer.Row{
 			Line: line,
 			V:    values,
@@ -100,82 +61,348 @@ func StreamJSONRows(
 		}
 	}
 
-	// Decode first top-level value to determine shape: object, array, etc.
-	var root any
-	if err := dec.Decode(&root); err != nil {
+	// Peek the first token so we can stream arrays/envelopes without buffering.
+	tok, err := dec.Token()
+	if err != nil {
 		if err == io.EOF {
-			return nil // empty input
+			return nil
 		}
 		if onParseErr != nil {
 			onParseErr(0, err)
 		}
-		return fmt.Errorf("json: decode root: %w", err)
+		return fmt.Errorf("json: read first token: %w", err)
 	}
 
-	switch v := root.(type) {
-	case []any:
-		// Top-level array of objects: [ {...}, {...}, ... ]
-		for _, elem := range v {
-			obj, ok := elem.(map[string]any)
-			if !ok {
-				err := fmt.Errorf("json: array element not an object (got %T)", elem)
-				if onParseErr != nil {
-					onParseErr(line+1, err)
-				}
+	switch d := tok.(type) {
+	case json.Delim:
+		switch d {
+		case '[':
+			// Root array: stream each object.
+			if err := streamArrayOfObjects(ctx, dec, emitObject, onParseErr, &line); err != nil {
 				return err
 			}
-			if err := emitObject(obj); err != nil {
-				return err
+			// Consume closing ']'
+			if end, err := dec.Token(); err != nil {
+				return fmt.Errorf("json: read array end:: %w", err)
+			} else if end != json.Delim(']') {
+				return fmt.Errorf("json: expected array end ']', got %v", end)
 			}
-		}
+			// Optional trailing JSONL objects after the array.
+			return streamTrailingObjects(ctx, dec, emitObject, onParseErr, &line)
 
-	case map[string]any:
-		// Top-level object: either a single record or an envelope containing
-		// the actual records in one of its array-of-object fields.
-		if slice := findObjectSlice(v); slice != nil {
-			for _, obj := range slice {
-				if err := emitObject(obj); err != nil {
+		case '{':
+			// Root object: either envelope (contains array-of-objects) or single record.
+			streamed, singleObj, err := streamEnvelopeOrSingle(ctx, dec, emitObject, onParseErr, &line)
+			if err != nil {
+				return err
+			}
+			// Consume closing '}'
+			if end, err := dec.Token(); err != nil {
+				return fmt.Errorf("json: read object end: %w", err)
+			} else if end != json.Delim('}') {
+				return fmt.Errorf("json: expected object end '}', got %v", end)
+			}
+
+			if !streamed && singleObj != nil {
+				// We parsed a single object record; emit it.
+				if err := emitObject(singleObj); err != nil {
 					return err
 				}
 			}
-		} else {
-			// Treat as a single record.
-			if err := emitObject(v); err != nil {
-				return err
-			}
+
+			// Optional trailing JSONL objects after the root object.
+			return streamTrailingObjects(ctx, dec, emitObject, onParseErr, &line)
+
+		default:
+			return fmt.Errorf("json: unsupported root delimiter %q", d)
 		}
 
 	default:
-		err := fmt.Errorf("json: unsupported root type %T (want object or array)", v)
-		if onParseErr != nil {
-			onParseErr(0, err)
-		}
-		return err
+		return fmt.Errorf("json: unsupported root token %T (want object or array)", tok)
 	}
+}
 
-	// Optional: handle additional top-level values (JSONL/NDJSON style).
+func streamTrailingObjects(
+	ctx context.Context,
+	dec *json.Decoder,
+	emit func(map[string]any) error,
+	onParseErr func(line int, err error),
+	line *int,
+) error {
 	for {
 		var obj map[string]any
 		if err := dec.Decode(&obj); err != nil {
 			if err == io.EOF {
-				break
+				return nil
 			}
 			if onParseErr != nil {
-				onParseErr(line+1, err)
+				onParseErr(*line+1, err)
 			}
-			return fmt.Errorf("json: decode subsequent value: %w", err)
+			return fmt.Errorf("json: decode trailing object: %w", err)
 		}
-		if err := emitObject(obj); err != nil {
+		if err := emit(obj); err != nil {
 			return err
 		}
 	}
+}
 
+// streamArrayOfObjects streams elements of the current array (after '[' has been consumed).
+// It expects each element to be an object (map[string]any). nil elements are skipped.
+func streamArrayOfObjects(
+	ctx context.Context,
+	dec *json.Decoder,
+	emit func(map[string]any) error,
+	onParseErr func(line int, err error),
+	line *int,
+) error {
+	for dec.More() {
+		// Decode one element at a time (streaming).
+		var raw any
+		if err := dec.Decode(&raw); err != nil {
+			if onParseErr != nil {
+				onParseErr(*line+1, err)
+			}
+			return fmt.Errorf("json: decode array element: %w", err)
+		}
+		if raw == nil {
+			continue
+		}
+		obj, ok := raw.(map[string]any)
+		if !ok {
+			err := fmt.Errorf("json: array element not an object (got %T)", raw)
+			if onParseErr != nil {
+				onParseErr(*line+1, err)
+			}
+			return err
+		}
+		if err := emit(obj); err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
 	return nil
 }
 
-// readHeaderMap extracts a header_map from parser options, accepting both
-// map[string]any (typical when coming from JSON) and map[string]string (when
-// constructed in Go code, e.g. by probeJSON).
+// streamEnvelopeOrSingle walks a root object (after '{' has been consumed).
+//
+// If it finds the first field whose value is an array-of-objects, it streams that array
+// and skips the rest of the object fields (envelope behavior).
+//
+// If it finds no array-of-objects, it builds a single object map and returns it so the caller
+// can emit one record.
+func streamEnvelopeOrSingle(
+	ctx context.Context,
+	dec *json.Decoder,
+	emit func(map[string]any) error,
+	onParseErr func(line int, err error),
+	line *int,
+) (streamed bool, single map[string]any, _ error) {
+	single = make(map[string]any)
+
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			if onParseErr != nil {
+				onParseErr(*line+1, err)
+			}
+			return false, nil, fmt.Errorf("json: read object key: %w", err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return false, nil, fmt.Errorf("json: object key not a string (got %T)", keyTok)
+		}
+
+		// Read first token of the value so we can stream arrays without buffering.
+		valTok, err := dec.Token()
+		if err != nil {
+			if onParseErr != nil {
+				onParseErr(*line+1, err)
+			}
+			return false, nil, fmt.Errorf("json: read object value token: %w", err)
+		}
+
+		// If value is an array, try to stream as array-of-objects (envelope).
+		if delim, ok := valTok.(json.Delim); ok && delim == '[' {
+			// We only treat it as records if its elements are objects; stream one-by-one.
+			// If a non-object element appears, we error out (matches old behavior).
+			if err := streamArrayOfObjects(ctx, dec, emit, onParseErr, line); err != nil {
+				return false, nil, err
+			}
+			// Consume closing ']'
+			endTok, err := dec.Token()
+			if err != nil {
+				return false, nil, fmt.Errorf("json: read envelope array end: %w", err)
+			}
+			if endTok != json.Delim(']') {
+				return false, nil, fmt.Errorf("json: expected ']' after envelope array, got %v", endTok)
+			}
+
+			// Skip remaining fields of the root object without decoding them into Go values.
+			for dec.More() {
+				// key
+				if _, err := dec.Token(); err != nil {
+					return true, nil, fmt.Errorf("json: skip envelope key: %w", err)
+				}
+				// value
+				if err := skipNextValue(dec); err != nil {
+					return true, nil, err
+				}
+			}
+
+			return true, nil, nil
+		}
+
+		// Non-array value:
+		// - If scalar, valTok already is the scalar.
+		// - If object, we need to read and materialize it (rare for single-record case).
+		// - If array (already handled), object, etc: consume remaining tokens for that value.
+		val, err := materializeValueFromFirstToken(dec, valTok)
+		if err != nil {
+			if onParseErr != nil {
+				onParseErr(*line+1, err)
+			}
+			return false, nil, err
+		}
+		single[key] = val
+	}
+
+	return false, single, nil
+}
+
+// skipNextValue skips the next JSON value from the decoder, without materializing it.
+func skipNextValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("json: skip value token: %w", err)
+	}
+	return skipValueFromFirstToken(dec, tok)
+}
+
+func skipValueFromFirstToken(dec *json.Decoder, tok any) error {
+	d, ok := tok.(json.Delim)
+	if !ok {
+		// scalar token; nothing else to consume
+		return nil
+	}
+
+	switch d {
+	case '{':
+		for dec.More() {
+			// key
+			if _, err := dec.Token(); err != nil {
+				return fmt.Errorf("json: skip object key: %w", err)
+			}
+			// value
+			if err := skipNextValue(dec); err != nil {
+				return err
+			}
+		}
+		// consume '}'
+		end, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("json: skip object end: %w", err)
+		}
+		if end != json.Delim('}') {
+			return fmt.Errorf("json: expected '}', got %v", end)
+		}
+		return nil
+
+	case '[':
+		for dec.More() {
+			if err := skipNextValue(dec); err != nil {
+				return err
+			}
+		}
+		// consume ']'
+		end, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("json: skip array end: %w", err)
+		}
+		if end != json.Delim(']') {
+			return fmt.Errorf("json: expected ']', got %v", end)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("json: unexpected delimiter %q", d)
+	}
+}
+
+// materializeValueFromFirstToken builds a Go value for the current JSON value,
+// given the first token has already been read.
+//
+// This is only used for the "single root object record" case, which should be small.
+func materializeValueFromFirstToken(dec *json.Decoder, tok any) (any, error) {
+	if d, ok := tok.(json.Delim); ok {
+		switch d {
+		case '{':
+			m := make(map[string]any)
+			for dec.More() {
+				kt, err := dec.Token()
+				if err != nil {
+					return nil, fmt.Errorf("json: read nested object key: %w", err)
+				}
+				k, ok := kt.(string)
+				if !ok {
+					return nil, fmt.Errorf("json: nested object key not string (got %T)", kt)
+				}
+				vt, err := dec.Token()
+				if err != nil {
+					return nil, fmt.Errorf("json: read nested object value token: %w", err)
+				}
+				v, err := materializeValueFromFirstToken(dec, vt)
+				if err != nil {
+					return nil, err
+				}
+				m[k] = v
+			}
+			end, err := dec.Token()
+			if err != nil {
+				return nil, fmt.Errorf("json: read nested object end: %w", err)
+			}
+			if end != json.Delim('}') {
+				return nil, fmt.Errorf("json: expected '}', got %v", end)
+			}
+			return m, nil
+
+		case '[':
+			// Materialize small arrays in the single-record case.
+			var arr []any
+			for dec.More() {
+				vt, err := dec.Token()
+				if err != nil {
+					return nil, fmt.Errorf("json: read nested array value token: %w", err)
+				}
+				v, err := materializeValueFromFirstToken(dec, vt)
+				if err != nil {
+					return nil, err
+				}
+				arr = append(arr, v)
+			}
+			end, err := dec.Token()
+			if err != nil {
+				return nil, fmt.Errorf("json: read nested array end: %w", err)
+			}
+			if end != json.Delim(']') {
+				return nil, fmt.Errorf("json: expected ']', got %v", end)
+			}
+			return arr, nil
+
+		default:
+			return nil, fmt.Errorf("json: unexpected delimiter %q", d)
+		}
+	}
+
+	// scalar token
+	return tok, nil
+}
+
+// readHeaderMap extracts header_map from parser options.
 func readHeaderMap(opts config.Options) map[string]string {
 	res := make(map[string]string)
 
@@ -196,61 +423,77 @@ func readHeaderMap(opts config.Options) map[string]string {
 			}
 		}
 	default:
-		// Unsupported type; leave res empty.
+		// unsupported; leave empty
 	}
 
 	return res
 }
 
-// findObjectSlice searches the top-level object for a value that is an
-// array-of-object and returns the first such slice it finds.
-//
-// This mirrors the "envelope" behavior described in probeJSON: if you have a
-// structure like:
-//
-//	{
-//	  "records": [ { ... }, { ... } ],
-//	  "meta":    { ... }
-//	}
-//
-// then findObjectSlice will return the []map[string]any corresponding to the
-// "records" array.
-func findObjectSlice(root map[string]any) []map[string]any {
-	for _, v := range root {
-		rawSlice, ok := v.([]any)
-		if !ok || len(rawSlice) == 0 {
+// reverseHeaderMap builds normalized->original for lookup without per-record map copies.
+func reverseHeaderMap(h map[string]string) map[string]string {
+	out := make(map[string]string, len(h))
+	for orig, norm := range h {
+		if orig == "" || norm == "" {
 			continue
 		}
-		objects := make([]map[string]any, 0, len(rawSlice))
-		valid := true
-		for _, elem := range rawSlice {
-			if elem == nil {
-				continue
-			}
-			m, ok := elem.(map[string]any)
-			if !ok {
-				valid = false
-				break
-			}
-			objects = append(objects, m)
-		}
-		if valid && len(objects) > 0 {
-			return objects
-		}
+		out[norm] = orig
 	}
-	return nil
+	return out
 }
 
-// recordToRowJSON maps a JSON object (with canonical keys) into a []any aligned
-// with the given columns slice. Missing keys become nil.
-//
-// This helper is intentionally small and deterministic; it is used by the ETL
-// pipeline so that JSON and CSV/XML share the same "columns → row values"
-// contract.
-func recordToRowJSON(obj map[string]any, columns []string) []any {
+// recordToRowJSONStreaming maps a JSON object into a []any aligned with columns.
+// It uses reverseHeaderMap to look up original keys without copying the record map.
+// It also flattens array-of-strings into a joined string.
+func recordToRowJSONStreaming(obj map[string]any, columns []string, rev map[string]string, sep string) []any {
 	row := make([]any, len(columns))
 	for i, col := range columns {
-		row[i] = obj[col] // nil if missing
+		v, ok := obj[col]
+		if !ok {
+			if orig, ok2 := rev[col]; ok2 {
+				v = obj[orig]
+			} else {
+				v = nil
+			}
+		}
+		row[i] = normalizeScalarJSONValue(v, sep)
 	}
 	return row
+}
+
+// normalizeScalarJSONValue flattens array-of-strings to a joined string.
+// Everything else passes through untouched.
+func normalizeScalarJSONValue(v any, sep string) any {
+	switch t := v.(type) {
+	case nil:
+		return nil
+
+	case []string:
+		if len(t) == 0 {
+			return ""
+		}
+		return strings.Join(t, sep)
+
+	case []any:
+		if len(t) == 0 {
+			return ""
+		}
+		ss := make([]string, 0, len(t))
+		for _, it := range t {
+			if it == nil {
+				continue
+			}
+			s, ok := it.(string)
+			if !ok {
+				return v // mixed types; keep original
+			}
+			ss = append(ss, s)
+		}
+		if len(ss) == 0 {
+			return ""
+		}
+		return strings.Join(ss, sep)
+
+	default:
+		return v
+	}
 }
