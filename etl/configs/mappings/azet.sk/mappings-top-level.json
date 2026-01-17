@@ -1,0 +1,17 @@
+{
+  "record_selector": "div.categories div.row",
+  "mappings": [
+    {
+      "selector": "div.mainCategory > h2 a",
+      "extract": "attr",
+      "attr": "href",
+      "json_path": "href"
+    },
+    {
+      "selector": "div.mainCategory > h2 a",
+      "extract": "text",
+      "json_path": "category"
+    }
+  ]
+}
+
