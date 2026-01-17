@@ -250,17 +250,6 @@ const (
 	formatJSON
 )
 
-// sampleUniqueness captures bounded distinct-count stats for a sample.
-type sampleUniqueness struct {
-	TotalRows int
-	// PerColumnDistinct holds bounded distinct counts per column, keyed by normalized column name.
-	PerColumnDistinct map[string]int
-	// PerColumnCapped indicates that distinct counting was capped for a column.
-	PerColumnCapped map[string]bool
-	// ColumnOrder is stable order of normalized columns.
-	ColumnOrder []string
-}
-
 // ProbeURLAny runs the probe pipeline and returns either a config.Pipeline
 // (single-table) or a multi-table JSON object (as map[string]any).
 //
@@ -579,55 +568,6 @@ func computeUniquenessFromCSVSample(rows [][]string, normalizedCols []string) sa
 	return stats
 }
 
-func computeUniquenessFromJSONRecords(recs []records.Record, columns []string) sampleUniqueness {
-	stats := sampleUniqueness{
-		TotalRows:         0,
-		PerColumnDistinct: make(map[string]int, len(columns)),
-		PerColumnCapped:   make(map[string]bool, len(columns)),
-		ColumnOrder:       append([]string(nil), columns...),
-	}
-	if len(recs) == 0 || len(columns) == 0 {
-		return stats
-	}
-
-	sets := make(map[string]map[string]struct{}, len(columns))
-	for _, c := range columns {
-		sets[c] = make(map[string]struct{})
-	}
-
-	for _, r := range recs {
-		stats.TotalRows++
-
-		for _, c := range columns {
-			if stats.PerColumnCapped[c] {
-				continue
-			}
-			v, ok := r[c]
-			if !ok || v == nil {
-				continue
-			}
-			s := stringifyScalarForUniq(v)
-			if s == "" {
-				continue
-			}
-			sets[c][s] = struct{}{}
-			if len(sets[c]) >= distinctCapPerColumn {
-				stats.PerColumnCapped[c] = true
-				delete(sets, c)
-			}
-		}
-	}
-
-	for _, c := range columns {
-		if stats.PerColumnCapped[c] {
-			stats.PerColumnDistinct[c] = distinctCapPerColumn
-			continue
-		}
-		stats.PerColumnDistinct[c] = len(sets[c])
-	}
-	return stats
-}
-
 func stringifyScalarForUniq(v any) string {
 	switch t := v.(type) {
 	case string:
@@ -648,8 +588,106 @@ func stringifyScalarForUniq(v any) string {
 	}
 }
 
+// sampleUniqueness captures bounded distinct-count stats for a sample.
+//
+// IMPORTANT: "row counts" for uniqueness are *per column*, not global.
+// A column should only count a row toward its denominator when the column
+// has a meaningful (non-nil / non-empty) value in that row.
+type sampleUniqueness struct {
+	// TotalRows is the number of sampled records processed overall.
+	// This is informational only; it MUST NOT be used as the denominator
+	// for per-column uniqueness ratios.
+	TotalRows int
+
+	// PerColumnTotal counts, per column, how many sampled rows had a
+	// meaningful value for that column (non-nil / non-empty after stringification).
+	PerColumnTotal map[string]int
+
+	// PerColumnDistinct holds bounded distinct counts per column, keyed by normalized column name.
+	PerColumnDistinct map[string]int
+
+	// PerColumnCapped indicates that distinct counting was capped for a column.
+	PerColumnCapped map[string]bool
+
+	// ColumnOrder is stable order of normalized columns.
+	ColumnOrder []string
+}
+
+func computeUniquenessFromJSONRecords(recs []records.Record, columns []string) sampleUniqueness {
+	stats := sampleUniqueness{
+		// TotalRows is informational (records seen), not a ratio denominator.
+		TotalRows: 0,
+
+		// PerColumnTotal is the correct denominator source for uniqueness ratios.
+		PerColumnTotal: make(map[string]int, len(columns)),
+
+		PerColumnDistinct: make(map[string]int, len(columns)),
+		PerColumnCapped:   make(map[string]bool, len(columns)),
+		ColumnOrder:       append([]string(nil), columns...),
+	}
+	if len(recs) == 0 || len(columns) == 0 {
+		return stats
+	}
+
+	// sets holds distinct values per column until the cap is reached.
+	// Once capped, we stop tracking the set for that column.
+	sets := make(map[string]map[string]struct{}, len(columns))
+	for _, c := range columns {
+		sets[c] = make(map[string]struct{})
+	}
+
+	for _, r := range recs {
+		// Track how many records we examined (informational only).
+		stats.TotalRows++
+
+		for _, c := range columns {
+			// If we've already capped this column, skip any further tracking.
+			if stats.PerColumnCapped[c] {
+				continue
+			}
+
+			// Only count rows where this field is present and meaningful.
+			v, ok := r[c]
+			if !ok || v == nil {
+				continue
+			}
+
+			// Convert to a canonical scalar string representation and treat
+			// empty results as "missing" for uniqueness purposes.
+			s := stringifyScalarForUniq(v)
+			if s == "" {
+				continue
+			}
+
+			// Increment the per-column denominator:
+			// this row has a value for column c.
+			stats.PerColumnTotal[c]++
+
+			// Add to distinct set (bounded).
+			sets[c][s] = struct{}{}
+			if len(sets[c]) >= distinctCapPerColumn {
+				// Mark capped and drop the set to bound memory.
+				stats.PerColumnCapped[c] = true
+				delete(sets, c)
+			}
+		}
+	}
+
+	// Finalize distinct counts per column, respecting caps.
+	for _, c := range columns {
+		if stats.PerColumnCapped[c] {
+			stats.PerColumnDistinct[c] = distinctCapPerColumn
+			continue
+		}
+		stats.PerColumnDistinct[c] = len(sets[c])
+	}
+
+	return stats
+}
+
 func autoSelectBreakouts(stats sampleUniqueness) []string {
-	if stats.TotalRows <= 0 {
+	// We need per-column denominators to compute meaningful ratios.
+	if len(stats.PerColumnTotal) == 0 {
 		return nil
 	}
 
@@ -663,11 +701,19 @@ func autoSelectBreakouts(stats sampleUniqueness) []string {
 		if col == "row_hash" {
 			continue
 		}
+
 		dist := stats.PerColumnDistinct[col]
 		if dist <= 0 {
 			continue
 		}
-		r := float64(dist) / float64(stats.TotalRows)
+
+		// Use the per-column denominator: only rows where col had a value.
+		den := stats.PerColumnTotal[col]
+		if den <= 0 {
+			continue
+		}
+
+		r := float64(dist) / float64(den)
 		if r > 0.90 {
 			continue
 		}
@@ -693,6 +739,7 @@ func autoSelectBreakouts(stats sampleUniqueness) []string {
 }
 
 func formatUniquenessReport(stats sampleUniqueness) string {
+	// If we didn't sample anything meaningful, report that explicitly.
 	if stats.TotalRows <= 0 {
 		return "uniqueness: no rows sampled"
 	}
@@ -702,16 +749,27 @@ func formatUniquenessReport(stats sampleUniqueness) string {
 		Dist   int
 		Ratio  float64
 		Capped bool
+		Den    int
 	}
+
 	rows := make([]row, 0, len(stats.ColumnOrder))
 	for _, col := range stats.ColumnOrder {
 		d := stats.PerColumnDistinct[col]
-		r := float64(d) / float64(stats.TotalRows)
+
+		// Use per-column denominator (rows where col has a value).
+		den := stats.PerColumnTotal[col]
+		if den <= 0 {
+			// No values observed for this column; omit from report.
+			continue
+		}
+
+		r := float64(d) / float64(den)
 		rows = append(rows, row{
 			Col:    col,
 			Dist:   d,
 			Ratio:  r,
 			Capped: stats.PerColumnCapped[col],
+			Den:    den,
 		})
 	}
 
@@ -723,11 +781,24 @@ func formatUniquenessReport(stats sampleUniqueness) string {
 	})
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "uniqueness report: sampled_rows=%d\n", stats.TotalRows)
-	fmt.Fprintf(&b, "col,distinct,ratio,capped\n")
+
+	// TotalRows is informational; ratio denominators are per-column totals.
+	fmt.Fprintf(&b, "uniqueness report:\tsampled_rows=%d\n", stats.TotalRows)
+	fmt.Fprintf(&b, "%-15s\t%-7s\t%-7s\tratio\tcapped\n", "col", "unique", "rows")
+
+	//	fmt.Fprintf(&b, "%-15s\t%-7s\tratio\tcapped\n", "col", "unique")
 	for _, r := range rows {
-		fmt.Fprintf(&b, "%s,%d,%.4f,%t\n", r.Col, r.Dist, r.Ratio, r.Capped)
+		fmt.Fprintf(
+			&b,
+			"%-15s\t%-7d\t%d\t%.1f%%\t%t\n",
+			r.Col,
+			r.Dist,
+			r.Den,
+			r.Ratio*100,
+			r.Capped,
+		)
 	}
+
 	return strings.TrimRight(b.String(), "\n")
 }
 

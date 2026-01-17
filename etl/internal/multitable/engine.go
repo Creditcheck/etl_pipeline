@@ -23,6 +23,18 @@ type Logger interface {
 	Printf(format string, v ...any)
 }
 
+// StreamFn is a seam for providing validated row streams.
+//
+// When to use:
+//   - Unit tests: inject a deterministic stream without file I/O or parsers.
+//   - Alternate runtimes: route streams from other sources.
+//
+// Errors:
+//   - Implementations should return a non-nil error for fatal setup failures.
+//   - Row-level parse/validation errors should be reflected by stream.Wait()
+//     semantics (consistent with StreamValidatedRows).
+type StreamFn func(ctx context.Context, cfg Pipeline, columns []string) (*ValidatedStream, error)
+
 // Engine2Pass implements Option 2 (two-pass streaming):
 //   - Pass 1: stream validated rows and ensure dimension keys exist (batching, no global dedupe).
 //   - Pass 2: stream again, resolve IDs per batch, insert facts per batch.
@@ -31,6 +43,10 @@ type Logger interface {
 type Engine2Pass struct {
 	Repo   storage.MultiRepository
 	Logger Logger
+
+	// Stream is an optional seam to make Engine2Pass unit-testable.
+	// When nil, StreamValidatedRows is used.
+	Stream StreamFn
 }
 
 // Run executes the two-pass streaming plan.
@@ -78,6 +94,21 @@ func (e *Engine2Pass) logger() func(format string, v ...any) {
 	return e.Logger.Printf
 }
 
+// stream returns the validated row stream implementation.
+//
+// When to use:
+//   - Production: uses StreamValidatedRows (file->parse->transform->validate).
+//   - Tests: inject Engine2Pass.Stream to provide deterministic rows.
+//
+// Errors:
+//   - Returns any fatal initialization error from the stream provider.
+func (e *Engine2Pass) stream(ctx context.Context, cfg Pipeline, columns []string) (*ValidatedStream, error) {
+	if e.Stream != nil {
+		return e.Stream(ctx, cfg, columns)
+	}
+	return StreamValidatedRows(ctx, cfg, columns)
+}
+
 func durMS(start time.Time) time.Duration { return time.Since(start).Truncate(time.Millisecond) }
 
 // ensureDimensionsStreaming streams validated rows and calls EnsureDimensionKeys in batches.
@@ -103,7 +134,7 @@ func (e *Engine2Pass) ensureDimensionsStreaming(
 	// Optional within-batch dedupe (bounded).
 	dedupeWithinBatch := cfg.Runtime.DedupeDimensionKeysWithinBatch
 
-	stream, err := StreamValidatedRows(ctx, cfg, columns)
+	stream, err := e.stream(ctx, cfg, columns)
 	if err != nil {
 		return err
 	}
@@ -113,6 +144,8 @@ func (e *Engine2Pass) ensureDimensionsStreaming(
 		if len(keys) == 0 {
 			return nil
 		}
+
+		// Detach keys from pending slice before any dedupe rewrite.
 		pending[dim.Table.Name] = pending[dim.Table.Name][:0]
 		if cap(pending[dim.Table.Name]) > batchSize*4 {
 			// Drop oversized backing array to reduce retained heap.
@@ -203,7 +236,26 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 
 	debug := cfg.Runtime.DebugTimings
 
-	stream, err := StreamValidatedRows(ctx, cfg, columns)
+	// Cancellation model:
+	// - Any worker error cancels derived context with a cause.
+	// - Producer stops early and frees owned rows promptly.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	errCh := make(chan error, 1)
+	setErr := func(err error) {
+		if err == nil {
+			return
+		}
+		select {
+		case errCh <- err:
+			cancel(err)
+		default:
+			// First error wins.
+		}
+	}
+
+	stream, err := e.stream(ctx, cfg, columns)
 	if err != nil {
 		return err
 	}
@@ -211,18 +263,6 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 	// Producer: batches of pooled rows. Ownership transfers to the consumer worker,
 	// which must Free() each row exactly once.
 	batchCh := make(chan []*transformer.Row, loaderWorkers*2)
-
-	// Worker errors: first error cancels the operation.
-	var (
-		errOnce sync.Once
-		runErr  error
-	)
-	setErr := func(err error) {
-		if err == nil {
-			return
-		}
-		errOnce.Do(func() { runErr = err })
-	}
 
 	// Worker pool: per-worker cache to avoid locks.
 	var wg sync.WaitGroup
@@ -235,17 +275,19 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 			cache := make(map[string]map[string]int64, len(plan.Dimensions))
 
 			for batch := range batchCh {
-				if runErr != nil {
-					// Drain + free quickly if we already failed.
+				// If canceled, drain and free quickly.
+				select {
+				case <-ctx.Done():
 					for _, r := range batch {
 						r.Free()
 					}
 					continue
+				default:
 				}
 
 				start := time.Now()
 				err := e.processFactBatch(ctx, plan, batch, cache, lenient, debug, logf)
-				dur := time.Since(start)
+				dur := time.Since(start).Truncate(time.Millisecond)
 
 				// Always free owned rows.
 				for _, r := range batch {
@@ -255,10 +297,12 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 				if err != nil {
 					setErr(err)
 					if debug {
-						logf("stage=pass2_batch worker=%d status=error duration=%s err=%v", workerID, dur.Truncate(time.Millisecond), err)
+						logf("stage=pass2_batch worker=%d status=error duration=%s err=%v", workerID, dur, err)
 					}
-				} else if debug {
-					logf("stage=pass2_batch worker=%d status=ok duration=%s rows=%d", workerID, dur.Truncate(time.Millisecond), len(batch))
+					continue
+				}
+				if debug {
+					logf("stage=pass2_batch worker=%d status=ok duration=%s rows=%d", workerID, dur, len(batch))
 				}
 			}
 		}(w)
@@ -278,17 +322,20 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 		select {
 		case batchCh <- out:
 		case <-ctx.Done():
+			// Producer still owns out when send fails; free it.
 			for _, r := range out {
 				r.Free()
 			}
-			setErr(ctx.Err())
 		}
 	}
 
 	for r := range stream.Rows {
-		if runErr != nil {
+		select {
+		case <-ctx.Done():
+			// Context canceled: producer must free incoming rows.
 			r.Free()
 			continue
+		default:
 		}
 
 		seenRows++
@@ -302,11 +349,21 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 	close(batchCh)
 	wg.Wait()
 
+	// Prefer terminal stream error unless worker error already captured.
 	if err := stream.Wait(); err != nil {
+		// If we were canceled due to a worker error, surface that first.
+		select {
+		case werr := <-errCh:
+			return werr
+		default:
+		}
 		return err
 	}
-	if runErr != nil {
-		return runErr
+
+	select {
+	case werr := <-errCh:
+		return werr
+	default:
 	}
 
 	logf("stage=pass2_rows seen_rows=%d loader_workers=%d", seenRows, loaderWorkers)
@@ -364,7 +421,7 @@ func (e *Engine2Pass) resolveBatchLookups(
 	cache map[string]map[string]int64,
 ) error {
 	// needed[dimTable][normalizedKey] = typedValue
-	needed := make(map[string]map[string]any)
+	needed := make(map[string]map[string]any, len(plan.Dimensions))
 
 	for _, fact := range plan.Facts {
 		for _, col := range fact.Columns {
@@ -437,21 +494,25 @@ func (e *Engine2Pass) insertFactBatch(
 	cache map[string]map[string]int64,
 	lenient bool,
 ) (inserted int, dropped int, _ error) {
-	cols := fact.TargetColumns
+	if len(batch) == 0 {
+		return 0, 0, nil
+	}
 
+	cols := fact.TargetColumns
 	outRows := make([][]any, 0, len(batch))
+
 	for _, r := range batch {
-		rowOut := make([]any, 0, len(fact.Columns))
+		rowOut := make([]any, len(fact.Columns))
 		drop := false
 
-		for _, c := range fact.Columns {
+		for i, c := range fact.Columns {
 			if c.Lookup != nil {
 				dimTable := c.Lookup.Table
 				matchIdx := c.Lookup.MatchFieldIndex
 				key := normalizeKey(r.V[matchIdx])
 				if key == "" {
 					if c.Nullable {
-						rowOut = append(rowOut, nil)
+						rowOut[i] = nil
 						continue
 					}
 					if lenient {
@@ -461,11 +522,9 @@ func (e *Engine2Pass) insertFactBatch(
 					return inserted, dropped, fmt.Errorf("fact %s: empty lookup key table=%s", fact.Table.Name, dimTable)
 				}
 
-				var (
-					id int64
-					ok bool
-				)
-				if cm := cache[dimTable]; cm != nil {
+				cm := cache[dimTable]
+				id, ok := int64(0), false
+				if cm != nil {
 					id, ok = cm[key]
 				}
 				if !ok {
@@ -475,15 +534,16 @@ func (e *Engine2Pass) insertFactBatch(
 					}
 					return inserted, dropped, fmt.Errorf("fact %s: lookup miss table=%s key=%q", fact.Table.Name, dimTable, key)
 				}
-				rowOut = append(rowOut, id)
+
+				rowOut[i] = id
 				continue
 			}
 
 			if c.SourceFieldIndex >= 0 {
-				rowOut = append(rowOut, r.V[c.SourceFieldIndex])
+				rowOut[i] = r.V[c.SourceFieldIndex]
 				continue
 			}
-			rowOut = append(rowOut, nil)
+			rowOut[i] = nil
 		}
 
 		if drop {
@@ -568,94 +628,29 @@ type indexedLookup struct {
 	MatchFieldIndex int
 }
 
+// buildIndexedPlan compiles a runtime plan for streaming execution.
+//
+// It converts column names into integer indices so the engine can read values from
+// []*transformer.Row without per-row map allocations.
+//
+// Errors:
+//   - Returns an error for unknown table load kinds.
+//   - Does not validate storage schema correctness beyond what is needed to build indices.
 func buildIndexedPlan(cfg Pipeline, columns []string) (indexedPlan, error) {
-	colIndex := make(map[string]int, len(columns))
-	for i, c := range columns {
-		colIndex[c] = i
-	}
+	colIndex := indexColumns(columns)
 
 	var plan indexedPlan
 
 	for _, t := range cfg.Storage.DB.Tables {
 		switch t.Load.Kind {
 		case "dimension":
-			src := ""
-			targetKeyCol := ""
-			if len(t.Load.FromRows) > 0 {
-				src = t.Load.FromRows[0].SourceField
-				targetKeyCol = t.Load.FromRows[0].TargetColumn
-			}
-
-			srcIdx := -1
-			if src != "" {
-				if i, ok := colIndex[src]; ok {
-					srcIdx = i
-				}
-			}
-
-			keyCol := targetKeyCol
-			valCol := ""
-			if t.Load.Cache != nil {
-				keyCol = t.Load.Cache.KeyColumn
-				valCol = t.Load.Cache.ValueColumn
-			}
-
-			plan.Dimensions = append(plan.Dimensions, indexedDimension{
-				Table:       t,
-				SourceIndex: srcIdx,
-				KeyColumn:   keyCol,
-				ValueColumn: valCol,
-			})
+			plan.Dimensions = append(plan.Dimensions, compileDimension(t, colIndex))
 
 		case "fact":
-			f := indexedFact{Table: t}
-
-			nullableByColumn := make(map[string]bool, len(t.Columns))
-			for _, c := range t.Columns {
-				nullable := false
-				if c.Nullable != nil {
-					nullable = *c.Nullable
-				}
-				nullableByColumn[c.Name] = nullable
+			f, err := compileFact(t, colIndex)
+			if err != nil {
+				return plan, err
 			}
-
-			for _, fr := range t.Load.FromRows {
-				f.TargetColumns = append(f.TargetColumns, fr.TargetColumn)
-				col := indexedFactColumn{
-					TargetColumn:     fr.TargetColumn,
-					SourceFieldIndex: -1,
-					Nullable:         nullableByColumn[fr.TargetColumn],
-				}
-
-				if fr.Lookup != nil {
-					matchField := ""
-					for _, v := range fr.Lookup.Match {
-						matchField = v
-						break
-					}
-					matchIdx := -1
-					if matchField != "" {
-						if i, ok := colIndex[matchField]; ok {
-							matchIdx = i
-						}
-					}
-					col.Lookup = &indexedLookup{
-						Table:           fr.Lookup.Table,
-						MatchFieldIndex: matchIdx,
-					}
-				} else if fr.SourceField != "" {
-					if i, ok := colIndex[fr.SourceField]; ok {
-						col.SourceFieldIndex = i
-					}
-				}
-
-				f.Columns = append(f.Columns, col)
-			}
-
-			if t.Load.Dedupe != nil && len(t.Load.Dedupe.ConflictColumns) > 0 {
-				f.DedupeColumns = append(f.DedupeColumns, t.Load.Dedupe.ConflictColumns...)
-			}
-
 			plan.Facts = append(plan.Facts, f)
 
 		default:
@@ -667,6 +662,120 @@ func buildIndexedPlan(cfg Pipeline, columns []string) (indexedPlan, error) {
 	sort.SliceStable(plan.Facts, func(i, j int) bool { return plan.Facts[i].Table.Name < plan.Facts[j].Table.Name })
 
 	return plan, nil
+}
+
+func indexColumns(columns []string) map[string]int {
+	m := make(map[string]int, len(columns))
+	for i, c := range columns {
+		m[c] = i
+	}
+	return m
+}
+
+func compileDimension(t storage.TableSpec, colIndex map[string]int) indexedDimension {
+	srcField := ""
+	targetKeyCol := ""
+	if len(t.Load.FromRows) > 0 {
+		srcField = t.Load.FromRows[0].SourceField
+		targetKeyCol = t.Load.FromRows[0].TargetColumn
+	}
+
+	srcIdx := -1
+	if srcField != "" {
+		if i, ok := colIndex[srcField]; ok {
+			srcIdx = i
+		}
+	}
+
+	keyCol := targetKeyCol
+	valCol := ""
+	if t.Load.Cache != nil {
+		keyCol = t.Load.Cache.KeyColumn
+		valCol = t.Load.Cache.ValueColumn
+	}
+
+	return indexedDimension{
+		Table:       t,
+		SourceIndex: srcIdx,
+		KeyColumn:   keyCol,
+		ValueColumn: valCol,
+	}
+}
+
+func compileFact(t storage.TableSpec, colIndex map[string]int) (indexedFact, error) {
+	f := indexedFact{Table: t}
+
+	nullableByColumn := mapNullableByColumn(t.Columns)
+
+	for _, fr := range t.Load.FromRows {
+		f.TargetColumns = append(f.TargetColumns, fr.TargetColumn)
+
+		col := indexedFactColumn{
+			TargetColumn:     fr.TargetColumn,
+			SourceFieldIndex: -1,
+			Nullable:         nullableByColumn[fr.TargetColumn],
+		}
+
+		if fr.Lookup != nil {
+			matchField := pickLookupMatchField(fr.Lookup.Match)
+			matchIdx := -1
+			if matchField != "" {
+				if i, ok := colIndex[matchField]; ok {
+					matchIdx = i
+				}
+			}
+			col.Lookup = &indexedLookup{
+				Table:           fr.Lookup.Table,
+				MatchFieldIndex: matchIdx,
+			}
+		} else if fr.SourceField != "" {
+			if i, ok := colIndex[fr.SourceField]; ok {
+				col.SourceFieldIndex = i
+			}
+		}
+
+		f.Columns = append(f.Columns, col)
+	}
+
+	if t.Load.Dedupe != nil && len(t.Load.Dedupe.ConflictColumns) > 0 {
+		f.DedupeColumns = append(f.DedupeColumns, t.Load.Dedupe.ConflictColumns...)
+	}
+
+	return f, nil
+}
+
+func mapNullableByColumn(cols []storage.ColumnSpec) map[string]bool {
+	out := make(map[string]bool, len(cols))
+	for _, c := range cols {
+		nullable := false
+		if c.Nullable != nil {
+			nullable = *c.Nullable
+		}
+		out[c.Name] = nullable
+	}
+	return out
+}
+
+// pickLookupMatchField chooses a stable match field from a lookup match map.
+//
+// The storage schema represents lookup match as a map (db key column -> source field). :contentReference[oaicite:3]{index=3}
+// Map iteration order is random, so selecting an arbitrary value would make plan
+// compilation nondeterministic and brittle for tests.
+//
+// Behavior:
+//   - If match is empty, returns "".
+//   - Otherwise returns the source field corresponding to the lexicographically
+//     smallest db key column.
+func pickLookupMatchField(match map[string]string) string {
+	if len(match) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(match))
+	for k := range match {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return match[keys[0]]
 }
 
 // isLenient returns true if any validate transform has policy "lenient".

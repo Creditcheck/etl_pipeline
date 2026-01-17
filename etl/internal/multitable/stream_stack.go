@@ -3,7 +3,7 @@ package multitable
 import (
 	"context"
 	"fmt"
-	"log"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -13,7 +13,6 @@ import (
 	"etl/internal/config"
 	csvparser "etl/internal/parser/csv"
 	jsonparser "etl/internal/parser/json"
-	"etl/internal/schema"
 	"etl/internal/transformer"
 )
 
@@ -36,6 +35,27 @@ type ValidatedStream struct {
 	ParseErrorCount func() uint64
 }
 
+// Dependency seams for unit testing.
+//
+// These variables are intentionally package-private so tests in this package can
+// patch them without adding third-party mocking frameworks.
+var (
+	openSource = func(path string) (io.ReadCloser, error) { return os.Open(path) }
+
+	// Signatures match the actual parser adapters used by the project.
+	//   - CSV consumes an io.ReadCloser and closes it.
+	//   - JSON consumes an io.Reader.
+	streamCSVRows  = csvparser.StreamCSVRows
+	streamJSONRows = jsonparser.StreamJSONRows
+
+	buildCoerceSpec    = transformer.BuildCoerceSpecFromTypes
+	validateSpecSanity = transformer.ValidateSpecSanity
+
+	transformLoop = transformer.TransformLoopRows
+	hashLoop      = transformer.HashLoopRows
+	validateLoop  = transformer.ValidateLoopRows
+)
+
 // StreamValidatedRows streams file -> parse -> coerce -> (optional hash) -> validate into pooled rows.
 //
 // This function is allocation-conscious and does not buffer the whole file.
@@ -47,28 +67,14 @@ type ValidatedStream struct {
 //
 // NOTE: The output rows must be freed by the consumer.
 func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*ValidatedStream, error) {
-	if cfg.Source.Kind != "file" || cfg.Source.File == nil || cfg.Source.File.Path == "" {
-		return nil, fmt.Errorf("source.kind=file and source.file.path are required")
+	if err := validateStreamConfig(cfg); err != nil {
+		return nil, err
 	}
 
-	switch cfg.Parser.Kind {
-	case "csv", "json":
-		// ok
-	default:
-		return nil, fmt.Errorf("parser.kind must be csv or json (got %q)", cfg.Parser.Kind)
-	}
+	rt := normalizeRuntime(cfg.Runtime)
 
-	rt := cfg.Runtime
-	if rt.ChannelBuffer <= 0 {
-		rt.ChannelBuffer = 256
-	}
-	if rt.ReaderWorkers <= 0 {
-		rt.ReaderWorkers = 1
-	}
-	if rt.TransformWorkers <= 0 {
-		rt.TransformWorkers = 1
-	}
-
+	// Channel wiring is part of the public contract: downstream code expects
+	// a single output channel that closes when the pipeline completes.
 	rawRowCh := make(chan *transformer.Row, rt.ChannelBuffer)
 	coercedRowCh := make(chan *transformer.Row, rt.ChannelBuffer)
 
@@ -88,135 +94,38 @@ func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*
 	// Parse errors are non-fatal. We count them and continue.
 	var parseErrCount atomic.Uint64
 
-	// Terminal error capture for truly fatal issues (I/O, misconfig, ctx, etc.).
-	var once sync.Once
+	// Terminal errors are fatal to the pipeline (I/O, context, misconfiguration).
+	// We capture the first terminal error deterministically.
+	var terminalErrOnce sync.Once
 	var terminalErr error
 	setTerminalErr := func(err error) {
 		if err == nil {
 			return
 		}
-		once.Do(func() { terminalErr = err })
+		terminalErrOnce.Do(func() { terminalErr = err })
 	}
 
-	// 1) Start parser: stream -> rawRowCh.
-	src, err := os.Open(cfg.Source.File.Path)
-	if err != nil {
-		return nil, fmt.Errorf("open source: %w", err)
-	}
-
-	var wgParse sync.WaitGroup
-	wgParse.Add(1)
-	go func() {
-		defer wgParse.Done()
-		defer close(rawRowCh)
-		defer src.Close()
-
-		// Non-fatal parse errors (record-level). Count and continue.
-		onParseErr := func(_ int, err error) {
-			if err == nil {
-				return
-			}
-			parseErrCount.Add(1)
-			// Intentionally do NOT set terminalErr.
-		}
-
-		switch cfg.Parser.Kind {
-		case "csv":
-			if err := csvparser.StreamCSVRows(ctx, src, columns, cfg.Parser.Options, rawRowCh, onParseErr); err != nil {
-				setTerminalErr(err)
-			}
-		case "json":
-			if err := jsonparser.StreamJSONRows(ctx, src, columns, cfg.Parser.Options, rawRowCh, onParseErr); err != nil {
-				setTerminalErr(err)
-			}
-		default:
-			setTerminalErr(fmt.Errorf("unsupported parser.kind=%q", cfg.Parser.Kind))
-		}
-	}()
-
-	// 2) Coerce stage: build spec from pipeline and run TransformLoopRows workers.
-	coerceSpec := transformer.BuildCoerceSpecFromTypes(
-		coerceTypesFromPipeline(cfg.Transform),
-		coerceLayoutFromPipeline(cfg.Transform),
-		nil,
-		nil,
-	)
-	if err := transformer.ValidateSpecSanity(columns, coerceSpec); err != nil {
-		return nil, fmt.Errorf("coerce spec sanity: %w", err)
-	}
-
-	var wgCoerce sync.WaitGroup
-	wgCoerce.Add(rt.TransformWorkers)
-	for i := 0; i < rt.TransformWorkers; i++ {
-		go func() {
-			defer wgCoerce.Done()
-			transformer.TransformLoopRows(
-				ctx,
-				columns,
-				rawRowCh,
-				coercedRowCh,
-				coerceSpec,
-				func(_ int, _ string) {
-					// TransformLoopRows owns rejected rows and frees them.
-				},
-			)
-		}()
-	}
-	go func() {
-		wgCoerce.Wait()
-		close(coercedRowCh)
-	}()
-
-	// 3) Optional hash stage: coercedRowCh -> hashOutCh.
-	var wgHash sync.WaitGroup
-	if hasHash {
-		wgHash.Add(1)
-		go func() {
-			defer wgHash.Done()
-			defer close(hashOutCh)
-
-			transformer.HashLoopRows(
-				ctx,
-				columns,
-				coercedRowCh,
-				hashOutCh,
-				hashSpec,
-				func(_ int, _ string) {
-					// HashLoopRows owns rejected rows and frees them.
-				},
-			)
-		}()
-	}
-
-	// 4) Validate stage: compile required fields + type map from contract.
-	requiredFields, typeMap, err := validateInputsFromPipeline(cfg.Transform)
+	// Stage 1: parse -> rawRowCh.
+	wgParse, err := startParseStage(ctx, cfg, columns, rawRowCh, &parseErrCount, setTerminalErr)
 	if err != nil {
 		return nil, err
 	}
 
-	var wgValidate sync.WaitGroup
-	wgValidate.Add(1)
-	go func() {
-		defer wgValidate.Done()
-		defer close(validCh)
+	// Stage 2: coerce -> coercedRowCh.
+	wgCoerce, err := startCoerceStage(ctx, cfg, columns, rawRowCh, coercedRowCh, rt)
+	if err != nil {
+		return nil, err
+	}
 
-		// If there is no contract, requiredFields/typeMap are nil and the validator
-		// behaves like a passthrough (implementation-dependent). This matches existing
-		// behavior in the repo.
-		transformer.ValidateLoopRows(
-			ctx,
-			columns,
-			requiredFields,
-			typeMap,
-			hashOutCh,
-			validCh,
-			func(_ int, _ string) {
-				// ValidateLoopRows owns rejected rows and frees them.
-			},
-		)
-	}()
+	// Stage 3: optional hash -> hashOutCh.
+	wgHash := startHashStage(ctx, cfg, columns, coercedRowCh, hashOutCh, hasHash, hashSpec)
 
-	// Wait blocks until all stages complete, then returns any terminal error.
+	// Stage 4: validate -> validCh.
+	wgValidate, err := startValidateStage(ctx, cfg, columns, hashOutCh, validCh)
+	if err != nil {
+		return nil, err
+	}
+
 	wait := func() error {
 		wgParse.Wait()
 		wgCoerce.Wait()
@@ -226,6 +135,8 @@ func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*
 		if terminalErr != nil {
 			return terminalErr
 		}
+		// Context cancellation is often used as a control mechanism in tests and
+		// in downstream orchestration. We treat context.Canceled as non-fatal.
 		if err := ctx.Err(); err != nil && err != context.Canceled {
 			return err
 		}
@@ -239,6 +150,233 @@ func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*
 			return parseErrCount.Load()
 		},
 	}, nil
+}
+
+// validateStreamConfig validates the subset of Pipeline required for streaming.
+//
+// When to use:
+//   - StreamValidatedRows should call this before starting any goroutines.
+//   - Unit tests can use it directly to validate error messages deterministically.
+//
+// Errors:
+//   - Returns a non-nil error when source is not a file or file path is empty.
+//   - Returns a non-nil error when parser.kind is not "csv" or "json".
+func validateStreamConfig(cfg Pipeline) error {
+	if cfg.Source.Kind != "file" || cfg.Source.File == nil || cfg.Source.File.Path == "" {
+		return fmt.Errorf("source.kind=file and source.file.path are required")
+	}
+	switch cfg.Parser.Kind {
+	case "csv", "json":
+		return nil
+	default:
+		return fmt.Errorf("parser.kind must be csv or json (got %q)", cfg.Parser.Kind)
+	}
+}
+
+// normalizeRuntime applies defaults for runtime settings used by StreamValidatedRows.
+//
+// When to use:
+//   - StreamValidatedRows uses this to ensure consistent buffering and worker counts.
+//
+// Edge cases:
+//   - Non-positive values are replaced by defaults.
+//   - The returned RuntimeConfig is a copy and does not mutate the input.
+func normalizeRuntime(rt RuntimeConfig) RuntimeConfig {
+	out := rt
+	if out.ChannelBuffer <= 0 {
+		out.ChannelBuffer = 256
+	}
+	if out.ReaderWorkers <= 0 {
+		out.ReaderWorkers = 1
+	}
+	if out.TransformWorkers <= 0 {
+		out.TransformWorkers = 1
+	}
+	return out
+}
+
+// startParseStage starts the parser goroutine and closes rawRowCh when complete.
+//
+// Ownership:
+//   - startParseStage owns the lifetime of rawRowCh (it closes it exactly once).
+//   - The parser owns rejected rows and frees them per the parser/transformer contract.
+//
+// Errors:
+//   - Returns an error if the source file cannot be opened.
+//   - Parser runtime errors are reported via setTerminalErr and surfaced by Wait().
+func startParseStage(
+	ctx context.Context,
+	cfg Pipeline,
+	columns []string,
+	rawRowCh chan<- *transformer.Row,
+	parseErrCount *atomic.Uint64,
+	setTerminalErr func(error),
+) (*sync.WaitGroup, error) {
+	src, err := openSource(cfg.Source.File.Path)
+	if err != nil {
+		return nil, fmt.Errorf("open source: %w", err)
+	}
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(rawRowCh)
+		defer src.Close()
+
+		onParseErr := func(_ int, err error) {
+			if err == nil {
+				return
+			}
+			parseErrCount.Add(1)
+		}
+
+		switch cfg.Parser.Kind {
+		case "csv":
+			if err := streamCSVRows(ctx, src, columns, cfg.Parser.Options, rawRowCh, onParseErr); err != nil {
+				setTerminalErr(err)
+			}
+		case "json":
+			if err := streamJSONRows(ctx, src, columns, cfg.Parser.Options, rawRowCh, onParseErr); err != nil {
+				setTerminalErr(err)
+			}
+		default:
+			// validateStreamConfig should have caught this; keep defensive.
+			setTerminalErr(fmt.Errorf("unsupported parser.kind=%q", cfg.Parser.Kind))
+		}
+	}()
+
+	return wg, nil
+}
+
+// startCoerceStage starts TransformLoopRows workers and closes coercedRowCh when complete.
+//
+// Errors:
+//   - Returns an error when the generated coerce spec is incompatible with columns.
+func startCoerceStage(
+	ctx context.Context,
+	cfg Pipeline,
+	columns []string,
+	in <-chan *transformer.Row,
+	out chan<- *transformer.Row,
+	rt RuntimeConfig,
+) (*sync.WaitGroup, error) {
+	coerceSpec := buildCoerceSpec(
+		coerceTypesFromPipeline(cfg.Transform),
+		coerceLayoutFromPipeline(cfg.Transform),
+		nil,
+		nil,
+	)
+	if err := validateSpecSanity(columns, coerceSpec); err != nil {
+		return nil, fmt.Errorf("coerce spec sanity: %w", err)
+	}
+
+	wg := &sync.WaitGroup{}
+	wg.Add(rt.TransformWorkers)
+
+	for i := 0; i < rt.TransformWorkers; i++ {
+		go func() {
+			defer wg.Done()
+			transformLoop(
+				ctx,
+				columns,
+				in,
+				out,
+				coerceSpec,
+				func(_ int, _ string) {
+					// TransformLoopRows owns rejected rows and frees them.
+				},
+			)
+		}()
+	}
+
+	// Close output after all coerce workers complete.
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return wg, nil
+}
+
+// startHashStage starts an optional hash stage and returns its WaitGroup.
+//
+// When to use:
+//   - StreamValidatedRows uses this to conditionally enable hashing.
+//
+// Edge cases:
+//   - When enabled is false, returns a zero-value WaitGroup that is safe to Wait() on.
+//   - When enabled is true, hashOutCh is closed by this stage.
+func startHashStage(
+	ctx context.Context,
+	cfg Pipeline,
+	columns []string,
+	in <-chan *transformer.Row,
+	hashOutCh chan<- *transformer.Row,
+	enabled bool,
+	spec transformer.HashSpec,
+) *sync.WaitGroup {
+	wg := &sync.WaitGroup{}
+	if !enabled {
+		return wg
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(hashOutCh)
+
+		hashLoop(
+			ctx,
+			columns,
+			in,
+			hashOutCh,
+			spec,
+			func(_ int, _ string) {
+				// HashLoopRows owns rejected rows and frees them.
+			},
+		)
+	}()
+
+	return wg
+}
+
+// startValidateStage starts the validate stage and closes validCh when complete.
+//
+// Errors:
+//   - Returns any error produced while building validation inputs from transforms.
+func startValidateStage(
+	ctx context.Context,
+	cfg Pipeline,
+	columns []string,
+	in <-chan *transformer.Row,
+	validCh chan<- *transformer.Row,
+) (*sync.WaitGroup, error) {
+	requiredFields, typeMap, err := validateInputsFromPipeline(cfg.Transform)
+	if err != nil {
+		return nil, err
+	}
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(validCh)
+
+		validateLoop(
+			ctx,
+			columns,
+			requiredFields,
+			typeMap,
+			in,
+			validCh,
+			func(_ int, _ string) {
+				// ValidateLoopRows owns rejected rows and frees them.
+			},
+		)
+	}()
+
+	return wg, nil
 }
 
 // coerceTypesFromPipeline extracts coerce.types from pipeline transforms.
@@ -269,6 +407,55 @@ func coerceLayoutFromPipeline(ts []config.Transform) string {
 	return ""
 }
 
+// validateInputsFromPipeline returns the inputs expected by transformer.ValidateLoopRows:
+//   - requiredFields: the set of required fields from the contract
+//   - typeMap: field -> kind (e.g. "bigint","text","date") used by the validator
+func validateInputsFromPipeline(ts []config.Transform) ([]string, map[string]string, error) {
+	c, err := contractFromTransforms(ts) // defined in runner.go (same package)
+	if err != nil || c == nil {
+		return nil, nil, err
+	}
+
+	required := make([]string, 0, len(c.Fields))
+	types := make(map[string]string, len(c.Fields))
+
+	for _, f := range c.Fields {
+		if f.Name == "" {
+			continue
+		}
+
+		typ := strings.ToLower(strings.TrimSpace(f.Type))
+		switch typ {
+		case "":
+			typ = "text"
+		case "string":
+			typ = "text"
+		case "bitint":
+			// Common typo we’ve already seen in configs; treat as bigint.
+			typ = "bigint"
+		}
+		types[f.Name] = typ
+
+		if f.Required {
+			required = append(required, f.Name)
+		}
+	}
+
+	sort.Strings(required)
+	return required, types, nil
+}
+
+// hashSpecFromPipeline extracts a hash spec from pipeline transforms.
+//
+// Behavior:
+//   - Uses the first transform with kind "hash".
+//   - Requires options.target_field and a non-empty options.fields.
+//   - Supports options.fields as either []string or []any (decoded from JSON).
+//
+// Errors:
+//   - Returns an error when required options are missing.
+//   - Returns an error when algorithm or encoding is unsupported by the streaming
+//     implementation (sha256 + hex only).
 func hashSpecFromPipeline(ts []config.Transform) (bool, transformer.HashSpec, error) {
 	var spec transformer.HashSpec
 
@@ -320,48 +507,3 @@ func hashSpecFromPipeline(ts []config.Transform) (bool, transformer.HashSpec, er
 
 	return false, transformer.HashSpec{}, nil
 }
-
-// validateInputsFromPipeline returns the inputs expected by transformer.ValidateLoopRows:
-//   - requiredFields: the set of required fields from the contract
-//   - typeMap: field -> kind (e.g. "bigint","text","date") used by the validator
-func validateInputsFromPipeline(ts []config.Transform) ([]string, map[string]string, error) {
-	c, err := contractFromTransforms(ts) // defined in runner.go (same package)
-	if err != nil || c == nil {
-		return nil, nil, err
-	}
-
-	required := make([]string, 0, len(c.Fields))
-	types := make(map[string]string, len(c.Fields))
-
-	for _, f := range c.Fields {
-		if f.Name == "" {
-			continue
-		}
-
-		typ := strings.ToLower(strings.TrimSpace(f.Type))
-		switch typ {
-		case "":
-			typ = "text"
-		case "string":
-			typ = "text"
-		case "bitint":
-			// Common typo we’ve already seen in configs; treat as bigint.
-			typ = "bigint"
-		}
-		types[f.Name] = typ
-
-		if f.Required {
-			required = append(required, f.Name)
-		}
-	}
-
-	sort.Strings(required)
-	return required, types, nil
-}
-
-// contractFromTransforms is intentionally NOT defined here.
-// It already exists in internal/multitable/runner.go and returns *schema.Contract.
-var _ *schema.Contract
-
-// Silence unused import in case schema is only referenced via the var above.
-var _ = log.New

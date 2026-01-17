@@ -15,8 +15,9 @@ type TableCopyer struct {
 	newRepo func(ctx context.Context, cfg storage.Config) (storage.Repository, error)
 	baseCfg storage.Config
 
-	mu    sync.Mutex
-	repos map[string]storage.Repository
+	mu     sync.Mutex
+	repos  map[string]storage.Repository
+	closed bool
 }
 
 func NewTableCopyer(
@@ -45,20 +46,37 @@ func (t *TableCopyer) CopyFromTable(ctx context.Context, table string, columns [
 	return repo.CopyFrom(ctx, columns, rows)
 }
 
+// Close releases all cached repositories and prevents future repository creation.
+//
+// Concurrency:
+//   - Close is safe to call multiple times.
+//   - If Close races with CopyFromTable, Close "wins": any repository created
+//     after Close begins will be immediately closed and rejected.
 func (t *TableCopyer) Close() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	t.closed = true
 
-	for _, r := range t.repos {
+	repos := t.repos
+	t.repos = map[string]storage.Repository{}
+	t.mu.Unlock()
+
+	for _, r := range repos {
 		r.Close()
 	}
-	t.repos = map[string]storage.Repository{}
 }
 
 func (t *TableCopyer) getRepo(ctx context.Context, table string, columns []string) (storage.Repository, error) {
 	key := repoKey(table, columns)
 
 	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil, fmt.Errorf("copy: TableCopyer is closed")
+	}
 	if r, ok := t.repos[key]; ok {
 		t.mu.Unlock()
 		return r, nil
@@ -75,15 +93,19 @@ func (t *TableCopyer) getRepo(ctx context.Context, table string, columns []strin
 	}
 
 	t.mu.Lock()
-	// double-check to avoid leaking if raced
+	defer t.mu.Unlock()
+
+	if t.closed {
+		r.Close()
+		return nil, fmt.Errorf("copy: TableCopyer is closed")
+	}
+
+	// Double-check to avoid leaking if raced.
 	if existing, ok := t.repos[key]; ok {
-		t.mu.Unlock()
 		r.Close()
 		return existing, nil
 	}
 	t.repos[key] = r
-	t.mu.Unlock()
-
 	return r, nil
 }
 
