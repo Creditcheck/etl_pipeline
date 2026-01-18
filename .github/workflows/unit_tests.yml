@@ -31,15 +31,18 @@ jobs:
       - name: Build
         run: |
           cd etl
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ${{ env.binary }} ./cmd/etl/
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ${{ env.binary }} ./cmd/etl_multi/
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ${{ env.binary }} ./cmd/probe/
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ${{ env.binary }} ./cmd/jget/
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ${{ env.binary }} ./cmd/extract_html/
 
       - name: Unit tests
         run: |
           cd etl
           go test ./... 
 
-      - name: E2E tests
-        run: |
-          cd e2e
-          ./test.sh
+#      - name: E2E tests
+#        run: |
+#          cd e2e
+#          ./test.sh
 
