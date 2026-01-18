@@ -1,0 +1,11 @@
+{
+  "mappings": [
+    {
+      "selector": "div.firstRow div.row span.recordCount",
+	  "match": ".*?([0-9]\\s?[0-9]+).*",
+      "extract": "text",
+      "json_path": "count"
+    }
+  ]
+}
+

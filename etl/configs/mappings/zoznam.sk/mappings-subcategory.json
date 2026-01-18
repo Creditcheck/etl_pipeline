@@ -1,0 +1,32 @@
+{
+  "record_selector": "div.catalog-list div.row",
+  "mappings": [
+    {
+      "selector": "div.catalog-list-content h2 a.link_title",
+      "extract": "attr",
+      "attr": "href",
+      "json_path": "href"
+    },
+    {
+      "selector": "div.catalog-list-content h2 a.link_title",
+      "extract": "text",
+      "json_path": "name"
+    },
+    {
+      "selector": "div.catalog-list-content p.desc",
+      "extract": "text",
+      "json_path": "description"
+    },
+    {
+      "selector": "div.catalog-list-content a.catalog-list-link",
+      "extract": "text",
+      "json_path": "website"
+    },
+    {
+      "selector": "div.catalog-list-content > address a",
+      "extract": "text",
+      "json_path": "address"
+    }
+  ]
+}
+

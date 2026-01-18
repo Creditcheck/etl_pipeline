@@ -1,0 +1,61 @@
+{
+  "mappings": [
+ 	{
+	  "selector": "div.catalog-sections ul li a",
+	  "extract": "text",
+	  "json_path": "breadcrumbs",
+	  "all": true
+	},
+    {
+      "selector": "h1",
+      "extract": "text",
+      "json_path": "companyName"
+    },
+    {
+      "selector": "div.row p",
+      "extract": "text",
+      "json_path": "description"
+    },
+
+
+    {
+	  "selector": "div.row:has(span.label:contains(\"Adresa:\")) > div.col-sm-9",
+      "extract": "text",
+      "json_path": "address"
+    },
+
+    {
+	  "selector": "div.row:has(span.label:contains(\"E-mail:\")) > div.col-sm-9",
+      "extract": "text",
+      "json_path": "email",
+      "all": true
+    },
+    {
+	  "selector": "div.row:has(span.label:contains(\"Web:\")) > div.col-sm-9",
+      "extract": "text",
+      "json_path": "website",
+      "all": true
+    },
+
+    {
+	  "selector": "div.row:has(span.label:contains(\"Telefón:\")) > div.col-sm-9",
+      "extract": "text",
+      "json_path": "phone",
+      "all": true
+    },
+
+    {
+	  "selector": "div.row:has(span.label:contains(\"Fax:\")) > div.col-sm-9",
+      "extract": "text",
+      "json_path": "fax",
+      "all": true
+    },
+    {
+	  "selector": "div.row:has(span.label:contains(\"IČO:\")) > div.col-sm-9",
+      "match": ".*?([0-9]+).*",
+      "extract": "text",
+      "json_path": "ico"
+    }
+
+  ]
+}

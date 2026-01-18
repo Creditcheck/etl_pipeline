@@ -1,0 +1,32 @@
+{
+  "record_selector": "div#records div.record",
+  "mappings": [
+    {
+      "selector": "div.recordContainer div.recordHead h2.name a",
+      "extract": "attr",
+      "attr": "href",
+      "json_path": "href"
+    },
+    {
+      "selector": "div.recordContainer div.recordHead h2.name a",
+      "extract": "text",
+      "json_path": "name"
+    },
+    {
+      "selector": "div.recordContainer div.recordData div.description",
+      "extract": "text",
+      "json_path": "description"
+    },
+    {
+      "selector": "div.recordContainer div.recordData > div.links > a:not(.address)",
+      "extract": "text",
+      "json_path": "website"
+    },
+    {
+      "selector": "div.recordContainer div.recordData div.links a.address",
+      "extract": "text",
+      "json_path": "address"
+    }
+  ]
+}
+

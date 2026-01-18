@@ -1,145 +1,290 @@
-// Package json implements a JSON parser that turns JSON objects into
-// records.Record maps.
+// Package jsonparser provides JSON parsing helpers and a streaming adapter used
+// by the ETL pipeline. This file adds a streaming adapter that converts JSON
+// records into *transformer.Row values suitable for the generic ETL pipeline
+// in cmd/etl.
 //
-// It is deliberately simple and conservative:
+// High-level flow (mirrors the XML streaming adapter conceptually):
 //
-//   - Supports newline-delimited JSON objects:
-//     {"id":1,"name":"a"}
-//     {"id":2,"name":"b"}
-//   - Also supports multiple JSON objects in a stream (same as NDJSON).
-//   - Rejects non-object top-level values (arrays, primitives) for now.
-//
-// This matches a very common ETL pattern: NDJSON logs / exports.
+//  1. Decode JSON from an io.Reader using encoding/json.Decoder so we can
+//     handle large inputs and JSONL/NDJSON-style streams.
+//  2. Support the same envelope shape used by probeJSON:
+//     - root array of objects: [ {...}, {...} ]
+//     - root object with one or more array-of-object fields: { "records": [...] }
+//     - single object: { ... } (treated as one record)
+//  3. For each logical record (map[string]any):
+//     - Apply parser.options.header_map (original → normalized) to build a
+//     canonical map keyed by normalized names, exactly like the CSV path.
+//     - Build a *transformer.Row whose V slice is ordered according to the
+//     ETL storage columns slice.
+//  4. Stream rows into the 'out' channel for downstream transform/validate/load.
 package json
 
-import (
-	"encoding/json"
-	"fmt"
-	"io"
-
-	"etl/internal/config"
-	"etl/pkg/records"
-)
-
-// Options mirrors the parser.Options usage pattern in csv/xml packages.
-// For now it only supports a single knob:
+//// StreamJSONRows parses JSON from r according to parserOpts and streams records
+//// as *transformer.Row into 'out'.
+////
+//// Contract:
+////
+////   - columns is the ordered list of destination columns. For each emitted
+////     record, we construct a []any where row[i] corresponds to columns[i].
+////     The transformer/loader stages rely on this alignment.
+////
+////   - parserOpts may contain a "header_map" object mapping original JSON keys
+////     to normalized column names. This mirrors the CSV path, where probeJSON
+////     generates a header_map in parser.options. We accept both map[string]any
+////     (when coming from JSON) and map[string]string (when constructed in Go).
+////
+////   - parserOpts may contain "array_join_separator" (string). If a record field
+////     value is an array of strings (e.g. "categories": ["a","b"]), we flatten
+////     it into a single string joined by this separator. This keeps the pipeline
+////     backend-agnostic for DBs without JSON support (e.g. older SQL Server).
+////
+////   - The function is intentionally single-threaded from the ETL perspective:
+////     it does not spawn its own worker pool. Concurrency is controlled at the
+////     ETL layer via runtime.reader_workers.
+////
+////   - onParseErr is used to report fatal parse errors; per-record parse errors
+////     are not distinguished in this initial implementation.
+//func StreamJSONRows(
+//	ctx context.Context,
+//	r io.Reader,
+//	columns []string,
+//	parserOpts config.Options,
+//	out chan<- *transformer.Row,
+//	onParseErr func(line int, err error),
+//) error {
+//	dec := json.NewDecoder(r)
 //
-//   - "allow_arrays" (bool): when true, a top-level JSON array of objects
-//     is accepted by DecodeAll.
-type Options struct {
-	AllowArrays bool
-}
-
-// FromConfigOptions constructs JSON Options from a generic config.Options
-// map (the same one used by csv/xml parsers).
-func FromConfigOptions(o config.Options) Options {
-	return Options{
-		AllowArrays: o.Bool("allow_arrays", false),
-	}
-}
-
-// Decoder wraps encoding/json.Decoder to provide a simple record-oriented
-// API suitable for use in stream-based ETL pipelines.
-type Decoder struct {
-	dec *json.Decoder
-	opt Options
-}
-
-// NewDecoder constructs a Decoder from an io.Reader and JSON Options.
-func NewDecoder(r io.Reader, opt Options) *Decoder {
-	d := json.NewDecoder(r)
-	// UseNumber so callers can decide how to map numeric values.
-	d.UseNumber()
-	return &Decoder{
-		dec: d,
-		opt: opt,
-	}
-}
-
-// Next reads the next JSON object and converts it into a records.Record.
+//	// Extract header_map from parser options, accepting both map[string]any and
+//	// map[string]string. We intentionally do NOT use Options.StringMap here,
+//	// because probeJSON builds a map[string]string directly in Go.
+//	headerMap := readHeaderMap(parserOpts)
 //
-// It expects each top-level item in the stream to be a JSON object, e.g.:
+//	// Flatten array-of-strings fields into a scalar string.
+//	sep := parserOpts.String("array_join_separator", ",")
+//	sep = strings.TrimSpace(sep)
+//	if sep == "" {
+//		sep = ","
+//	}
 //
-//	{"id":1,"name":"a"}
-//	{"id":2,"name":"b"}
+//	line := 0
 //
-// If the input contains a non-object top-level value, it returns an error.
-// EOF is returned when the stream is exhausted.
-func (d *Decoder) Next() (records.Record, error) {
-	for {
-		var raw any
-		if err := d.dec.Decode(&raw); err != nil {
-			if err == io.EOF {
-				return nil, io.EOF
-			}
-			return nil, fmt.Errorf("json parser: decode: %w", err)
-		}
-
-		switch m := raw.(type) {
-		case map[string]any:
-			return records.Record(m), nil
-		default:
-			// Skip non-object values to be robust to junk lines,
-			// but fail if that's all we see.
-			// We could choose to be stricter; for now, best-effort.
-			continue
-		}
-	}
-}
-
-// DecodeAll is a helper for non-streaming use (e.g. tests, small inputs).
-// It reads all objects from r and returns them as a slice of records.Record.
+//	// emitObject takes a single JSON object (map[string]any), applies header_map
+//	// to canonicalize keys to normalized column names, and sends a *Row to 'out'.
+//	emitObject := func(obj map[string]any) error {
+//		line++
 //
-// If opt.AllowArrays is true and r contains a single top-level JSON array
-// of objects, it is expanded into records.
-func DecodeAll(r io.Reader, opt Options) ([]records.Record, error) {
-	d := json.NewDecoder(r)
-	d.UseNumber()
+//		// Apply header_map if present: build a canonical-key object so that
+//		// downstream lookup by normalized column names works for original keys.
+//		canon := obj
+//		if len(headerMap) > 0 {
+//			canon = make(map[string]any, len(obj))
+//			for k, v := range obj {
+//				if mapped, ok := headerMap[k]; ok && mapped != "" {
+//					canon[mapped] = v
+//				} else {
+//					canon[k] = v
+//				}
+//			}
+//		}
+//
+//		values := recordToRowJSON(canon, columns, sep)
+//		row := &transformer.Row{
+//			Line: line,
+//			V:    values,
+//		}
+//
+//		select {
+//		case out <- row:
+//			return nil
+//		case <-ctx.Done():
+//			return ctx.Err()
+//		}
+//	}
+//
+//	// Decode first top-level value to determine shape: object, array, etc.
+//	var root any
+//	if err := dec.Decode(&root); err != nil {
+//		if err == io.EOF {
+//			return nil // empty input
+//		}
+//		if onParseErr != nil {
+//			onParseErr(0, err)
+//		}
+//		return fmt.Errorf("json: decode root: %w", err)
+//	}
+//
+//	switch v := root.(type) {
+//	case []any:
+//		// Top-level array of objects: [ {...}, {...}, ... ]
+//		for _, elem := range v {
+//			obj, ok := elem.(map[string]any)
+//			if !ok {
+//				err := fmt.Errorf("json: array element not an object (got %T)", elem)
+//				if onParseErr != nil {
+//					onParseErr(line+1, err)
+//				}
+//				return err
+//			}
+//			if err := emitObject(obj); err != nil {
+//				return err
+//			}
+//		}
+//
+//	case map[string]any:
+//		// Top-level object: either a single record or an envelope containing
+//		// the actual records in one of its array-of-object fields.
+//		if slice := findObjectSlice(v); slice != nil {
+//			for _, obj := range slice {
+//				if err := emitObject(obj); err != nil {
+//					return err
+//				}
+//			}
+//		} else {
+//			// Treat as a single record.
+//			if err := emitObject(v); err != nil {
+//				return err
+//			}
+//		}
+//
+//	default:
+//		err := fmt.Errorf("json: unsupported root type %T (want object or array)", v)
+//		if onParseErr != nil {
+//			onParseErr(0, err)
+//		}
+//		return err
+//	}
+//
+//	// Optional: handle additional top-level values (JSONL/NDJSON style).
+//	for {
+//		var obj map[string]any
+//		if err := dec.Decode(&obj); err != nil {
+//			if err == io.EOF {
+//				break
+//			}
+//			if onParseErr != nil {
+//				onParseErr(line+1, err)
+//			}
+//			return fmt.Errorf("json: decode subsequent value: %w", err)
+//		}
+//		if err := emitObject(obj); err != nil {
+//			return err
+//		}
+//	}
+//
+//	return nil
+//}
 
-	var out []records.Record
+//// readHeaderMap extracts a header_map from parser options, accepting both
+//// map[string]any (typical when coming from JSON) and map[string]string (when
+//// constructed in Go code, e.g. by probeJSON).
+//func readHeaderMap(opts config.Options) map[string]string {
+//	res := make(map[string]string)
+//
+//	raw := opts.Any("header_map")
+//	if raw == nil {
+//		return res
+//	}
+//
+//	switch m := raw.(type) {
+//	case map[string]string:
+//		for k, v := range m {
+//			res[k] = v
+//		}
+//	case map[string]any:
+//		for k, v := range m {
+//			if s, ok := v.(string); ok {
+//				res[k] = s
+//			}
+//		}
+//	default:
+//		// Unsupported type; leave res empty.
+//	}
+//
+//	return res
+//}
 
-	// First try: decode into a generic value once.
-	var root any
-	if err := d.Decode(&root); err != nil {
-		if err == io.EOF {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("json parser: decode root: %w", err)
-	}
+//// findObjectSlice searches the top-level object for a value that is an
+//// array-of-object and returns the first such slice it finds.
+//func findObjectSlice(root map[string]any) []map[string]any {
+//	for _, v := range root {
+//		rawSlice, ok := v.([]any)
+//		if !ok || len(rawSlice) == 0 {
+//			continue
+//		}
+//		objects := make([]map[string]any, 0, len(rawSlice))
+//		valid := true
+//		for _, elem := range rawSlice {
+//			if elem == nil {
+//				continue
+//			}
+//			m, ok := elem.(map[string]any)
+//			if !ok {
+//				valid = false
+//				break
+//			}
+//			objects = append(objects, m)
+//		}
+//		if valid && len(objects) > 0 {
+//			return objects
+//		}
+//	}
+//	return nil
+//}
 
-	switch v := root.(type) {
-	case map[string]any:
-		out = append(out, records.Record(v))
+//// recordToRowJSON maps a JSON object (with canonical keys) into a []any aligned
+//// with the given columns slice. Missing keys become nil.
+////
+//// Additionally, it flattens array-of-strings values into a scalar string joined
+//// by sep. This allows storing list-like JSON fields in backends without JSON
+//// column types.
+//func recordToRowJSON(obj map[string]any, columns []string, sep string) []any {
+//	row := make([]any, len(columns))
+//	for i, col := range columns {
+//		row[i] = normalizeScalarJSONValue(obj[col], sep) // nil if missing
+//	}
+//	return row
+//}
 
-	case []any:
-		if !opt.AllowArrays {
-			return nil, fmt.Errorf("json parser: top-level array encountered but allow_arrays=false")
-		}
-		for i, elem := range v {
-			obj, ok := elem.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("json parser: element %d in array is not an object", i)
-			}
-			out = append(out, records.Record(obj))
-		}
-
-	default:
-		return nil, fmt.Errorf("json parser: unsupported top-level JSON type %T", v)
-	}
-
-	// If there is trailing content (e.g., NDJSON after root), consume it using
-	// the streaming Next API.
-	dec := NewDecoder(d.Buffered(), opt) // remaining buffered bytes, if any
-	for {
-		rec, err := dec.Next()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
-		out = append(out, rec)
-	}
-
-	return out, nil
-}
+//// normalizeScalarJSONValue converts common JSON shapes into scalar values usable
+//// by the generic ETL pipeline.
+////
+//// Today we intentionally only flatten "array of strings" to a joined string.
+//// If the array contains non-strings, we leave it as-is (so a later transform
+//// could handle it, or validation can drop it).
+//func normalizeScalarJSONValue(v any, sep string) any {
+//	switch t := v.(type) {
+//	case nil:
+//		return nil
+//
+//	case []string:
+//		if len(t) == 0 {
+//			return ""
+//		}
+//		return strings.Join(t, sep)
+//
+//	case []any:
+//		// Flatten only if every non-nil element is a string.
+//		if len(t) == 0 {
+//			return ""
+//		}
+//		ss := make([]string, 0, len(t))
+//		for _, it := range t {
+//			if it == nil {
+//				continue
+//			}
+//			s, ok := it.(string)
+//			if !ok {
+//				// Mixed array types; keep original value.
+//				return v
+//			}
+//			ss = append(ss, s)
+//		}
+//		if len(ss) == 0 {
+//			return ""
+//		}
+//		return strings.Join(ss, sep)
+//
+//	default:
+//		return v
+//	}
+//}

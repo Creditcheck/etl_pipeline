@@ -1,0 +1,69 @@
+We’re working on a Go ETL system with streaming parsers + transformers and multiple storage backends (Postgres/MSSQL/SQLite etc) written using google's best practices and golang coding standards (all code is well-commented, includes unit tests, godoc comments, etc). Historically the system had a fast single-table pipeline (cmd/etl) that uses a streaming architecture with pooled rows, bounded channels, and batch loading. A new multi-table pipeline runner (cmd/etl_multi) was added, but the initial implementation buffered all rows in memory, causing very high RAM usage (e.g., 2.8GB for ~2.6M CSV rows).
+
+We reworked /internal/multitable to reuse the project’s performant streaming components (internal/parser/csv streaming + internal/transformer/stream_transform + internal/transformer/stream_validate + row pooling). The multi-table engine now uses a two-pass streaming design:
+
+* Pass 1: stream validated rows and ensure dimension keys exist (idempotent inserts) without building full in-memory record slices.
+* Pass 2: stream validated rows again, resolve dimension IDs per batch via SelectKeyValueByKeys, and insert fact rows per batch via InsertFactRows.
+
+A previous pass1 design collected unique dimension keys in a huge global map (2.6M entries for vehicles), which was removed because PCV is near-unique and global dedupe provides little benefit while consuming memory. Dedupe is now conceptually “off” and should be controllable via config flags; only optional within-batch dedupe might exist.
+
+The project uses config-driven transforms:
+
+* coerce transform supports types: bigint -> int64, text/string -> string, date parsing, bool, etc.
+* validate transform supports a contract schema with required fields and a policy ("lenient" should drop invalid rows without failing the run).
+
+Key runtime improvements:
+
+* dimension prewarm was fixed: targeted prewarm by needed keys only; no more SELECT * scans.
+* Postgres parameter limit error (65535 params) was addressed by chunking inserts.
+* A bug where bigint coercion produced strings was fixed by updating the streaming coerce path (internal/transformer/stream_transform.go compilePlan) to parse bigint/int as int64.
+
+Current performance:
+
+* Streaming multi-table run processes ~2.6M rows with low memory compared to the original design, but memory still grows significantly during pass1 dimension ensures due to heavy transient allocations and Go heap behavior. Simple backend-agnostic RAM wins were discussed: avoid fmt.Sprint conversions for non-string keys, avoid []byte->string copies when possible, and cap slice capacity to prevent retained large arrays.
+
+Goal: continue improving memory + throughput while staying backend-agnostic (no Postgres-specific staging/COPY code). Any optimizations must work across multiple DBs via the storage.MultiRepository interface. Provide patches as full files (not diffs), follow Google Go style, include tests and benchmarks where relevant.
+
+---
+
+## Files that should be supplied to ChatGPT
+
+### Must-have (core execution path)
+
+1. `cmd/etl_multi/main.go`
+2. `internal/multitable/config.go`
+3. `internal/multitable/runner.go`
+4. `internal/multitable/stream_stack.go`
+5. `internal/multitable/engine.go`
+
+### Storage abstraction and implementation
+
+6. `internal/storage/multi_repository.go` (contains `storage.MultiRepository` interface)
+7. `internal/storage/postgres/multi_repo.go`
+8. `internal/storage/postgres/multi_register.go`
+9. (Any equivalent multi_repo / multi_register for other backends you care about, e.g.)
+
+   * `internal/storage/sqlite/multi_repo.go`
+   * `internal/storage/mssql/multi_repo.go`
+
+### Transformer streaming stack (because multitable reuses it)
+
+10. `internal/transformer/stream_transform.go`
+11. `internal/transformer/stream_validate.go`
+12. `internal/transformer/rowpool.go` (if row lifetime/memory is discussed)
+13. `internal/transformer/transformer.go`
+
+### Parser
+
+14. `internal/parser/csv/stream_rows.go`
+15. `internal/parser/csv/csv_parser.go` (or whatever defines options used by `StreamCSVRows`)
+
+### Optional but useful (for contract/validation behavior)
+
+16. `internal/schema/contract.go`
+17. `internal/transformer/builtin/validate.go`
+18. `internal/transformer/builtin/coerce.go` (less critical now that streaming coerce is used)
+
+### Pipeline config example (very helpful for reasoning)
+
+19. `configs/pipelines/multi-postgres.json` (or a reduced example showing dimensions + facts + lookups)

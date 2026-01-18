@@ -18,7 +18,10 @@
 // application logic to a specific metrics system such as Prometheus or Datadog.
 package metrics
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
 
 // Labels are string key/value pairs attached to a metric.
 type Labels map[string]string
@@ -101,4 +104,46 @@ func RecordBatches(job string, delta int64) {
 	backend.IncCounter("etl_batches_total", float64(delta), Labels{
 		"job": job,
 	})
+}
+
+// RecordHTTP records request-level telemetry for HTTP-driven ingestion.
+//
+// When to use:
+//   - Any crawler, downloader, or HTTP-based extractor where you want:
+//   - request/response latency distributions
+//   - bytes distributions
+//   - counters by HTTP status
+//
+// Labels:
+//   - job: the logical pipeline/job name
+//   - status: HTTP status code as a string ("200", "429", "0" for network errors)
+//
+// Edge cases:
+//   - status <= 0 should be used for network/transport errors.
+//   - Negative durations/bytes are ignored.
+//
+// Errors:
+//   - err is used only to record a separate error counter.
+//     Callers should still log the actual error for debugging.
+func RecordHTTP(job string, status int, err error, requestDur, responseDur time.Duration, bytes int64) {
+	lbls := Labels{
+		"job":    job,
+		"status": strconv.Itoa(status),
+	}
+
+	backend.IncCounter("etl_http_requests_total", 1, lbls)
+
+	if err != nil {
+		backend.IncCounter("etl_http_errors_total", 1, lbls)
+	}
+
+	if requestDur >= 0 {
+		backend.ObserveHistogram("etl_http_request_duration_seconds", requestDur.Seconds(), lbls)
+	}
+	if responseDur >= 0 {
+		backend.ObserveHistogram("etl_http_response_duration_seconds", responseDur.Seconds(), lbls)
+	}
+	if bytes >= 0 {
+		backend.ObserveHistogram("etl_http_download_bytes", float64(bytes), lbls)
+	}
 }

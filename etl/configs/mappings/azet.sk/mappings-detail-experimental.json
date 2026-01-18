@@ -1,0 +1,129 @@
+{
+  "mappings": [
+    {
+      "selector": "#breadcrumb .inside2 a span",
+      "extract": "text",
+      "json_path": "breadcrumbs",
+      "all": true
+    },
+    {
+      "selector": "span.socialLinks > span.facebookWhite a",
+      "extract": "attr",
+      "attr": "href",
+      "json_path": "facebook_url"
+    },
+    {
+      "selector": "span.socialLinks > span.instagramWhite a",
+      "extract": "attr",
+      "attr": "href",
+      "json_path": "instagram_url"
+    },
+    {
+      "selector": "span.socialLinks > span.twitterWhite a",
+      "extract": "attr",
+      "attr": "href",
+      "json_path": "twitter_url"
+    },
+    {
+      "selector": "span.socialLinks > span.linkedinWhite a",
+      "extract": "attr",
+      "attr": "href",
+      "json_path": "linkedin_url"
+    },
+    {
+      "selector": "a.ratingCount",
+      "match": ".*?([0-9]+).*",
+      "extract": "text",
+      "json_path": "rating_count"
+    },
+    {
+      "selector": "img[itemprop=\"image\"]",
+      "extract": "attr",
+      "attr": "src",
+      "json_path": "logo_src"
+    },
+    {
+      "selector": "div [itemprop=\"aggregateRating\"] span",
+      "match": ".*?level([0-9]+).*",
+      "extract": "attr",
+      "attr": "class",
+      "json_path": "rating_class"
+    },
+    {
+      "selector": "#fakturacne-udaje-firmy h2.only-mobile span.no_mobile",
+      "extract": "text",
+      "json_path": "companyName"
+    },
+    {
+      "selector": "#fakturacne-udaje-firmy .invoiceValue:has(b:contains(\"Názov\")) span.value",
+      "extract": "text",
+      "json_path": "name"
+    },
+    {
+      "selector": "#fakturacne-udaje-firmy .invoiceValue:has(b:contains(\"Sídlo\")) span.value",
+      "extract": "text",
+      "json_path": "sidlo"
+    },
+    {
+      "selector": "#fakturacne-udaje-firmy .invoiceValue:has(b:contains(\"IČO\")) span.value",
+      "extract": "text",
+      "json_path": "ico"
+    },
+    {
+      "selector": "#fakturacne-udaje-firmy .invoiceValue:has(b:contains(\"DIČ\")) span.value",
+      "extract": "text",
+      "json_path": "dic"
+    },
+    {
+      "selector": "#fakturacne-udaje-firmy .invoiceValue:has(b:contains(\"IČ DPH\")) span.value",
+      "extract": "text",
+      "json_path": "ic_dph"
+    },
+    {
+      "selector": "#kontakty-firmy .contactRow > .contactValueCell:nth-of-type(1) a.mainLink",
+      "extract": "text",
+      "json_path": "website",
+      "all": true
+    },
+
+    {
+      "selector": "span.contactIconCell:has(span.phone) + div.contactValueCell .mainContact",
+      "extract": "text",
+      "json_path": "phone",
+      "all": true
+    },
+
+    {
+      "selector": "span.contactIconCell:has(span.mobile) + div.contactValueCell .mainContact",
+      "extract": "text",
+      "json_path": "mobile",
+      "all": true
+    },
+    {
+      "selector": "div.contactValueCell div.span12.mainContact script",
+      "extract": "js_email",
+      "json_path": "email",
+      "all": true
+    },
+    {
+      "selector": "p.description",
+      "extract": "text",
+      "json_path": "description"
+    },
+    {
+      "selector": "#firmInfo [itemprop=\"streetAddress\"]",
+      "extract": "text",
+      "json_path": "streetAddress"
+    },
+    {
+      "selector": "#firmInfo [itemprop=\"postalCode\"]",
+      "extract": "text",
+      "json_path": "postalCode"
+    },
+    {
+      "selector": "#firmInfo [itemprop=\"addressLocality\"]",
+      "extract": "text",
+      "json_path": "addressLocality"
+    }
+  ]
+}

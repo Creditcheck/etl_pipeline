@@ -157,7 +157,7 @@ func validateParser(p Parser) []Issue {
 		// XML config is validated in parser/xml; nothing obvious to check here.
 
 	case "json":
-		// XML config is validated in parser/json. not implemented
+		// JSON config is validated in parser/json. not implemented
 	}
 
 	return issues
@@ -182,6 +182,7 @@ func validateTransforms(ts []Transform) []Issue {
 		"dedup":     {},
 		"require":   {},
 		"validate":  {},
+		"hash":      {},
 	}
 
 	for i, t := range ts {
