@@ -31,6 +31,7 @@ package datadog
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -55,11 +56,37 @@ type Options struct {
 	// FlushEvery controls how often we submit buffered metrics to Datadog.
 	// If <= 0, defaults to 60 seconds.
 	FlushEvery time.Duration
+
+	// The following fields are unexported test seams.
+	//
+	// They are intentionally kept private to preserve the public API surface.
+	// Production code will never set them; unit tests can set them to avoid:
+	//   - real network submission
+	//   - nondeterministic clocks/tickers
+	//
+	// NOTE: Being unexported means this change is backwards-compatible for all
+	// external callers, but enables deterministic unit tests in this package.
+	now       func() time.Time
+	newTicker func(d time.Duration) *time.Ticker
+	submitter metricsSubmitter
+}
+
+// metricsSubmitter is the minimal interface needed to submit metrics.
+//
+// Why this exists:
+//   - The Datadog SDK exposes a concrete *datadogV2.MetricsApi, which makes unit
+//     testing difficult (we cannot stub it without doing real HTTP).
+//   - Backend depends on this interface instead of the concrete type, enabling
+//     deterministic tests with a fake submitter.
+//
+// This interface is intentionally tiny and private to keep refactors low-risk.
+type metricsSubmitter interface {
+	SubmitMetrics(ctx context.Context, body datadogV2.MetricPayload, params ...datadogV2.SubmitMetricsOptionalParameters) (datadogV2.IntakePayloadAccepted, *http.Response, error)
 }
 
 // Backend implements metrics.Backend for Datadog.
 type Backend struct {
-	api *datadogV2.MetricsApi
+	api metricsSubmitter
 	ctx context.Context
 
 	flushEvery time.Duration
@@ -67,6 +94,12 @@ type Backend struct {
 	doneCh     chan struct{}
 
 	baseTags []string
+
+	// now is injected for deterministic tests. Production uses time.Now.
+	now func() time.Time
+
+	// newTicker is injected for deterministic tests. Production uses time.NewTicker.
+	newTicker func(d time.Duration) *time.Ticker
 
 	mu sync.Mutex
 
@@ -96,7 +129,9 @@ func resolveEnvTag() string {
 func (b *Backend) loop() {
 	defer close(b.doneCh)
 
-	t := time.NewTicker(b.flushEvery)
+	// newTicker is a seam to allow tests to run with very small tick durations
+	// while still keeping the production behavior identical.
+	t := b.newTicker(b.flushEvery)
 	defer t.Stop()
 
 	for {
@@ -110,6 +145,12 @@ func (b *Backend) loop() {
 }
 
 // Close stops the background flush loop and performs one final Flush().
+//
+// Errors:
+//   - Returns any error from the final Flush() submission.
+//   - If Close is called multiple times, the behavior is undefined (it will panic
+//     because stopCh is closed twice). This mirrors typical Go "Close once"
+//     semantics and is acceptable for process-lifetime backends.
 func (b *Backend) Close() error {
 	close(b.stopCh)
 	<-b.doneCh
@@ -117,6 +158,21 @@ func (b *Backend) Close() error {
 }
 
 // NewBackend constructs a Datadog backend using the official client.
+//
+// When to use:
+//   - Configure this backend when you want Datadog metrics for ETL runs.
+//   - Suitable for both long-running pipelines (periodic flush) and short-lived
+//     commands (final flush on Close).
+//
+// Edge cases:
+//   - If opts.FlushEvery <= 0, defaults to 60s.
+//   - If opts.JobName is empty, defaults to "etl".
+//   - Environment tag selection uses ENV then DD_ENV, otherwise env:unknown.
+//
+// Errors:
+//   - Returns an error only if internal initialization fails.
+//   - Datadog client construction itself is not expected to fail under normal
+//     conditions; network errors occur during Flush().
 func NewBackend(parent context.Context, opts Options) (*Backend, error) {
 	job := opts.JobName
 	if job == "" {
@@ -133,19 +189,42 @@ func NewBackend(parent context.Context, opts Options) (*Backend, error) {
 	baseTags = append(baseTags, envTag, "job:"+job)
 	baseTags = append(baseTags, opts.Tags...)
 
+	// Clock / ticker seams.
+	nowFn := opts.now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	newTicker := opts.newTicker
+	if newTicker == nil {
+		newTicker = time.NewTicker
+	}
+
+	// Submitter seam.
+	submitter := opts.submitter
+	if submitter == nil {
+		ctx := dd.NewDefaultContext(parent)
+		cfg := dd.NewConfiguration()
+		client := dd.NewAPIClient(cfg)
+		api := datadogV2.NewMetricsApi(client)
+
+		// Wrap the concrete API in our tiny interface.
+		submitter = api
+		_ = ctx // ctx stored below
+	}
+
 	ctx := dd.NewDefaultContext(parent)
-	cfg := dd.NewConfiguration()
-	client := dd.NewAPIClient(cfg)
-	api := datadogV2.NewMetricsApi(client)
 
 	b := &Backend{
-		api:        api,
+		api:        submitter,
 		ctx:        ctx,
 		flushEvery: flushEvery,
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 
 		baseTags: baseTags,
+
+		now:       nowFn,
+		newTicker: newTicker,
 
 		stepCounts:      make(map[string]float64),
 		recordCounts:    make(map[string]float64),
@@ -249,21 +328,51 @@ func (b *Backend) ObserveHistogram(name string, value float64, labels metrics.La
 	}
 }
 
-// Flush submits buffered metrics to Datadog and resets local buffers.
-func (b *Backend) Flush() error {
+// snapshot is the immutable set of buffered metric state used to build a flush payload.
+//
+// Why this exists:
+//   - Flush() must reset buffers under a lock, but must submit out-of-lock.
+//   - snapshot allows a clean separation between (1) collect+reset and
+//     (2) payload building+submission.
+//
+// This structure is intentionally simple (maps and slices) to avoid adding
+// conversion overhead to the hot path.
+type snapshot struct {
+	stepCounts      map[string]float64
+	recordCounts    map[string]float64
+	batchCount      float64
+	durationSamples map[string][]float64
+
+	httpReqCounts map[string]float64
+	httpErrCounts map[string]float64
+	httpReqDur    map[string][]float64
+	httpRespDur   map[string][]float64
+	httpDownloadB map[string][]float64
+}
+
+// snapshotAndReset grabs current buffered metrics and resets internal buffers.
+//
+// Concurrency:
+//   - Must be called with no lock held.
+//   - Takes the lock internally and returns detached maps/slices.
+func (b *Backend) snapshotAndReset() snapshot {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 
-	stepCounts := b.stepCounts
-	recordCounts := b.recordCounts
-	batchCount := b.batchCount
-	durationSamples := b.durationSamples
+	s := snapshot{
+		stepCounts:      b.stepCounts,
+		recordCounts:    b.recordCounts,
+		batchCount:      b.batchCount,
+		durationSamples: b.durationSamples,
 
-	httpReqCounts := b.httpReqCounts
-	httpErrCounts := b.httpErrCounts
-	httpReqDur := b.httpReqDur
-	httpRespDur := b.httpRespDur
-	httpDownloadB := b.httpDownloadB
+		httpReqCounts: b.httpReqCounts,
+		httpErrCounts: b.httpErrCounts,
+		httpReqDur:    b.httpReqDur,
+		httpRespDur:   b.httpRespDur,
+		httpDownloadB: b.httpDownloadB,
+	}
 
+	// Reset buffers for the next collection window.
 	b.stepCounts = make(map[string]float64)
 	b.recordCounts = make(map[string]float64)
 	b.batchCount = 0
@@ -275,28 +384,62 @@ func (b *Backend) Flush() error {
 	b.httpRespDur = make(map[string][]float64)
 	b.httpDownloadB = make(map[string][]float64)
 
-	b.mu.Unlock()
+	return s
+}
 
-	if len(stepCounts) == 0 &&
-		len(recordCounts) == 0 &&
-		batchCount == 0 &&
-		len(durationSamples) == 0 &&
-		len(httpReqCounts) == 0 &&
-		len(httpErrCounts) == 0 &&
-		len(httpReqDur) == 0 &&
-		len(httpRespDur) == 0 &&
-		len(httpDownloadB) == 0 {
+// isEmpty returns true if the snapshot contains no data to submit.
+func (s snapshot) isEmpty() bool {
+	return len(s.stepCounts) == 0 &&
+		len(s.recordCounts) == 0 &&
+		s.batchCount == 0 &&
+		len(s.durationSamples) == 0 &&
+		len(s.httpReqCounts) == 0 &&
+		len(s.httpErrCounts) == 0 &&
+		len(s.httpReqDur) == 0 &&
+		len(s.httpRespDur) == 0 &&
+		len(s.httpDownloadB) == 0
+}
+
+// Flush submits buffered metrics to Datadog and resets local buffers.
+//
+// Errors:
+//   - Returns any error from Datadog submission.
+//   - Returns nil if there is nothing to submit.
+//
+// Edge cases:
+//   - Flush is safe to call concurrently with IncCounter/ObserveHistogram.
+//   - Flush resets buffers even if submission fails (by design, to keep the ETL
+//     fast and avoid blocking future writes). If you need "at least once" delivery,
+//     that is a different architecture.
+func (b *Backend) Flush() error {
+	snap := b.snapshotAndReset()
+	if snap.isEmpty() {
 		return nil
 	}
 
-	now := time.Now().Unix()
+	nowUnix := b.now().Unix()
 
+	series := b.buildSeries(snap, nowUnix)
+	payload := datadogV2.MetricPayload{Series: series}
+
+	_, _, err := b.api.SubmitMetrics(b.ctx, payload, *datadogV2.NewSubmitMetricsOptionalParameters())
+	return err
+}
+
+// buildSeries constructs Datadog series for a snapshot at a fixed timestamp.
+//
+// Why this exists:
+//   - It is pure (no locks, no network, no clocks), making it easy to unit test.
+//   - It centralizes naming/tagging behavior, which is an operational contract.
+//
+// The returned series slice is suitable for SubmitMetrics.
+func (b *Backend) buildSeries(s snapshot, nowUnix int64) []datadogV2.MetricSeries {
 	addCount := func(metric string, value float64, tags []string) datadogV2.MetricSeries {
 		return datadogV2.MetricSeries{
 			Metric: metric,
 			Type:   datadogV2.METRICINTAKETYPE_COUNT.Ptr(),
 			Points: []datadogV2.MetricPoint{
-				{Timestamp: dd.PtrInt64(now), Value: dd.PtrFloat64(value)},
+				{Timestamp: dd.PtrInt64(nowUnix), Value: dd.PtrFloat64(value)},
 			},
 			Tags: tags,
 		}
@@ -307,16 +450,16 @@ func (b *Backend) Flush() error {
 			Metric: metric,
 			Type:   datadogV2.METRICINTAKETYPE_GAUGE.Ptr(),
 			Points: []datadogV2.MetricPoint{
-				{Timestamp: dd.PtrInt64(now), Value: dd.PtrFloat64(value)},
+				{Timestamp: dd.PtrInt64(nowUnix), Value: dd.PtrFloat64(value)},
 			},
 			Tags: tags,
 		}
 	}
 
-	series := make([]datadogV2.MetricSeries, 0, len(stepCounts)+len(recordCounts)+64)
+	series := make([]datadogV2.MetricSeries, 0, len(s.stepCounts)+len(s.recordCounts)+64)
 
 	// Step counters.
-	for k, v := range stepCounts {
+	for k, v := range s.stepCounts {
 		if v == 0 {
 			continue
 		}
@@ -326,7 +469,7 @@ func (b *Backend) Flush() error {
 	}
 
 	// Record counters.
-	for kind, v := range recordCounts {
+	for kind, v := range s.recordCounts {
 		if v == 0 {
 			continue
 		}
@@ -335,24 +478,24 @@ func (b *Backend) Flush() error {
 	}
 
 	// Batch counter.
-	if batchCount != 0 {
-		series = append(series, addCount("etl.batches.total", batchCount, b.baseTags))
+	if s.batchCount != 0 {
+		series = append(series, addCount("etl.batches.total", s.batchCount, b.baseTags))
 	}
 
 	// Step duration percentiles.
-	for k, samples := range durationSamples {
-		addPercentiles(&series, b.baseTags, "etl.step.duration_seconds", "step_status", k, samples)
+	for k, samples := range s.durationSamples {
+		addPercentiles(&series, b.baseTags, "etl.step.duration_seconds", "step_status", k, samples, nowUnix)
 	}
 
 	// HTTP counts.
-	for status, v := range httpReqCounts {
+	for status, v := range s.httpReqCounts {
 		if v == 0 {
 			continue
 		}
 		tags := withTags(b.baseTags, "status:"+status)
 		series = append(series, addCount("etl.http.requests.total", v, tags))
 	}
-	for status, v := range httpErrCounts {
+	for status, v := range s.httpErrCounts {
 		if v == 0 {
 			continue
 		}
@@ -361,22 +504,28 @@ func (b *Backend) Flush() error {
 	}
 
 	// HTTP percentiles.
-	for status, samples := range httpReqDur {
-		addPercentilesWithStatus(&series, b.baseTags, "etl.http.request_duration_seconds", status, samples, addGauge)
+	for status, samples := range s.httpReqDur {
+		addPercentilesWithStatus(&series, b.baseTags, "etl.http.request_duration_seconds", status, samples, addGauge, nowUnix)
 	}
-	for status, samples := range httpRespDur {
-		addPercentilesWithStatus(&series, b.baseTags, "etl.http.response_duration_seconds", status, samples, addGauge)
+	for status, samples := range s.httpRespDur {
+		addPercentilesWithStatus(&series, b.baseTags, "etl.http.response_duration_seconds", status, samples, addGauge, nowUnix)
 	}
-	for status, samples := range httpDownloadB {
-		addPercentilesWithStatus(&series, b.baseTags, "etl.http.download_bytes", status, samples, addGauge)
+	for status, samples := range s.httpDownloadB {
+		addPercentilesWithStatus(&series, b.baseTags, "etl.http.download_bytes", status, samples, addGauge, nowUnix)
 	}
 
-	payload := datadogV2.MetricPayload{Series: series}
-	_, _, err := b.api.SubmitMetrics(b.ctx, payload, *datadogV2.NewSubmitMetricsOptionalParameters())
-	return err
+	return series
 }
 
-func addPercentiles(series *[]datadogV2.MetricSeries, baseTags []string, metricPrefix, keyKind, key string, samples []float64) {
+// addPercentiles appends a fixed set of percentile gauges for a sample set.
+//
+// When to use:
+//   - Used by Flush() to publish percentiles for step durations.
+//
+// Edge cases:
+//   - If samples is empty, it does nothing.
+//   - It sorts a copy of samples (does not mutate input).
+func addPercentiles(series *[]datadogV2.MetricSeries, baseTags []string, metricPrefix, keyKind, key string, samples []float64, nowUnix int64) {
 	if len(samples) == 0 {
 		return
 	}
@@ -386,12 +535,12 @@ func addPercentiles(series *[]datadogV2.MetricSeries, baseTags []string, metricP
 	step, status := splitStepStatusKey(key)
 	tags := withTags(baseTags, "step:"+step, "status:"+status)
 
-	*series = append(*series, gaugeSeries(metricPrefix+".p50", percentileNearestRank(cp, 0.50), tags))
-	*series = append(*series, gaugeSeries(metricPrefix+".p90", percentileNearestRank(cp, 0.90), tags))
-	*series = append(*series, gaugeSeries(metricPrefix+".p95", percentileNearestRank(cp, 0.95), tags))
-	*series = append(*series, gaugeSeries(metricPrefix+".p99", percentileNearestRank(cp, 0.99), tags))
-	*series = append(*series, gaugeSeries(metricPrefix+".max", cp[len(cp)-1], tags))
-	*series = append(*series, gaugeSeries(metricPrefix+".samples", float64(len(cp)), tags))
+	*series = append(*series, gaugeSeries(metricPrefix+".p50", percentileNearestRank(cp, 0.50), tags, nowUnix))
+	*series = append(*series, gaugeSeries(metricPrefix+".p90", percentileNearestRank(cp, 0.90), tags, nowUnix))
+	*series = append(*series, gaugeSeries(metricPrefix+".p95", percentileNearestRank(cp, 0.95), tags, nowUnix))
+	*series = append(*series, gaugeSeries(metricPrefix+".p99", percentileNearestRank(cp, 0.99), tags, nowUnix))
+	*series = append(*series, gaugeSeries(metricPrefix+".max", cp[len(cp)-1], tags, nowUnix))
+	*series = append(*series, gaugeSeries(metricPrefix+".samples", float64(len(cp)), tags, nowUnix))
 
 	_ = keyKind // reserved for future key schemas
 }
@@ -403,6 +552,7 @@ func addPercentilesWithStatus(
 	status string,
 	samples []float64,
 	addGauge func(metric string, value float64, tags []string) datadogV2.MetricSeries,
+	nowUnix int64,
 ) {
 	if len(samples) == 0 {
 		return
@@ -417,15 +567,16 @@ func addPercentilesWithStatus(
 	*series = append(*series, addGauge(metricPrefix+".p99", percentileNearestRank(cp, 0.99), tags))
 	*series = append(*series, addGauge(metricPrefix+".max", cp[len(cp)-1], tags))
 	*series = append(*series, addGauge(metricPrefix+".samples", float64(len(cp)), tags))
+
+	_ = nowUnix // reserved for future if addGauge is replaced by gaugeSeries
 }
 
-func gaugeSeries(metric string, value float64, tags []string) datadogV2.MetricSeries {
-	now := time.Now().Unix()
+func gaugeSeries(metric string, value float64, tags []string, nowUnix int64) datadogV2.MetricSeries {
 	return datadogV2.MetricSeries{
 		Metric: metric,
 		Type:   datadogV2.METRICINTAKETYPE_GAUGE.Ptr(),
 		Points: []datadogV2.MetricPoint{
-			{Timestamp: dd.PtrInt64(now), Value: dd.PtrFloat64(value)},
+			{Timestamp: dd.PtrInt64(nowUnix), Value: dd.PtrFloat64(value)},
 		},
 		Tags: tags,
 	}

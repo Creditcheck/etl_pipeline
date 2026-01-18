@@ -666,7 +666,7 @@ func TestLoadFactsStreaming_WorkerErrorCancels(t *testing.T) {
 		}, nil, &streamCalls),
 	}
 
-	err = e.loadFactsStreaming(context.Background(), cfg, []string{"user"}, plan, false)
+	_, err = e.loadFactsStreaming(context.Background(), cfg, []string{"user"}, plan, false)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("loadFactsStreaming() err=%v, want %v", err, wantErr)
 	}
