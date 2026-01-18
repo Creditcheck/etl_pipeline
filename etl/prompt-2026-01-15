@@ -1,6 +1,6 @@
 We’re working on a Go ETL system with streaming parsers + transformers and multiple storage backends (Postgres/MSSQL/SQLite etc) written using google's best practices and golang coding standards (all code is well-commented, includes unit tests, godoc comments, etc). Historically the system had a fast single-table pipeline (cmd/etl) that uses a streaming architecture with pooled rows, bounded channels, and batch loading. A new multi-table pipeline runner (cmd/etl_multi) was added, but the initial implementation buffered all rows in memory, causing very high RAM usage (e.g., 2.8GB for ~2.6M CSV rows).
 
-We reworked /internal/multitable to reuse the project’s performant streaming components (internal/parser/csv streaming + internal/transformer/stream_transform + internal/transformer/stream_validate + row pooling). The multi-table engine now uses a two-pass streaming design (“Option 2”):
+We reworked /internal/multitable to reuse the project’s performant streaming components (internal/parser/csv streaming + internal/transformer/stream_transform + internal/transformer/stream_validate + row pooling). The multi-table engine now uses a two-pass streaming design:
 
 * Pass 1: stream validated rows and ensure dimension keys exist (idempotent inserts) without building full in-memory record slices.
 * Pass 2: stream validated rows again, resolve dimension IDs per batch via SelectKeyValueByKeys, and insert fact rows per batch via InsertFactRows.

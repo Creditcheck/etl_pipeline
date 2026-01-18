@@ -21,7 +21,16 @@ SELECT name, type_desc, is_disabled
 FROM sys.sql_logins;
 GO
 
+# update password
 ALTER LOGIN [user] WITH PASSWORD = 'password';
+
+# show tables
+SELECT name
+FROM sys.tables
+ORDER BY name;
+go
+
+
 
 # remove volume
 docker stop -t 0 mssql
