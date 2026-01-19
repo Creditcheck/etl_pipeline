@@ -1,7 +1,14 @@
 {
+  "record_selector": "div.subCategories span.category",
   "mappings": [
     {
-      "selector": "div.firstRow div.row span.recordCount",
+      "selector": "span.category a",
+      "extract": "attr",
+      "attr": "href",
+      "json_path": "href"
+    },
+    {
+      "selector": "span.recordCount",
 	  "match": ".*?([0-9]\\s?[0-9]+).*",
       "extract": "text",
       "json_path": "count"

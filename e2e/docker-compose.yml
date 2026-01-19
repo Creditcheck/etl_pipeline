@@ -1,18 +1,7 @@
 services:
-  pushgateway:
-    image: prom/pushgateway:v1.11.2
-    ports:
-      - "9091:9091"
-
-  etl-probe:
+  etl:
     build:
       context: ..
       dockerfile: e2e/Dockerfile
       network: host
-    depends_on:
-      - pushgateway
-    environment:
-      # Prometheus Pushgateway config for ETL
-      METRICS_BACKEND: pushgateway
-      PUSHGATEWAY_URL: http://pushgateway:9091
-
+#    environment:

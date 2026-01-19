@@ -41,8 +41,8 @@ jobs:
           cd etl
           go test ./... 
 
-#      - name: E2E tests
-#        run: |
-#          cd e2e
-#          ./test.sh
+      - name: E2E tests
+        run: |
+          cd e2e
+          ./test.sh
 

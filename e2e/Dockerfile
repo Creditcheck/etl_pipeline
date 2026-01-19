@@ -1,18 +1,25 @@
 FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
-COPY ../etl .
+#COPY ../etl .
+COPY etl .
 
 # Build etl and probe binaries.
-RUN go build -o /app/bin/etl ./cmd/etl && \
-    go build -o /app/bin/probe ./cmd/probe
+RUN set -eu; \
+  mkdir -p /app/bin; \
+  for d in ./cmd/*; do \
+    [ -d "$d" ] || continue; \
+    [ -f "$d/main.go" ] || continue; \
+    name="$(basename "$d")"; \
+    echo "==> building $name"; \
+    go build -o "/app/bin/$name" "./cmd/$name"; \
+  done
 
 # Runtime image
-FROM alpine:3.22.2
+FROM alpine:3
 
 WORKDIR /app
-COPY --from=builder /app/bin/etl /usr/local/bin/etl
-COPY --from=builder /app/bin/probe /usr/local/bin/probe
+COPY --from=builder /app/bin/ /usr/local/bin/
 
 # directory for generated configs and sqlite DB
 RUN mkdir -p /configs /data/db

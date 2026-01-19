@@ -802,6 +802,26 @@ func formatUniquenessReport(stats sampleUniqueness) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// Multi-table configs need backend-specific table qualification.
+// - Postgres: schema-qualified under public.
+// - MSSQL: schema-qualified under dbo.
+// - SQLite: no schema prefix.
+func qualifyTable(backend, base string) string {
+
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return base
+	}
+	switch backend {
+	case "postgres":
+		return "public." + base
+	case "mssql":
+		return "dbo." + base
+	default: // sqlite and others
+		return base
+	}
+}
+
 // -------------------- multi-table conversion --------------------
 
 // buildMultiTableFromSingle converts a single-table pipeline into the multi-table
@@ -850,7 +870,7 @@ func buildMultiTableFromSingle(p config.Pipeline, stats sampleUniqueness, breako
 	sort.Strings(breakouts)
 
 	for _, b := range breakouts {
-		dimTableName := fmt.Sprintf("public.%s_%s", dataset, b)
+		dimTableName := qualifyTable(p.Storage.Kind, fmt.Sprintf("%s_%s", dataset, b))
 		pkName := fmt.Sprintf("%s_id", b)
 
 		// Use varchar(512) as requested for non-JSON-capable backends.
@@ -919,7 +939,7 @@ func buildMultiTableFromSingle(p config.Pipeline, stats sampleUniqueness, breako
 		factFromRows = append(factFromRows, map[string]any{"target_column": c, "source_field": c})
 	}
 
-	factTableName := fmt.Sprintf("public.%s", dataset)
+	factTableName := qualifyTable(p.Storage.Kind, dataset)
 	fact := map[string]any{
 		"name":              factTableName,
 		"auto_create_table": true,

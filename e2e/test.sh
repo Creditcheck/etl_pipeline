@@ -12,13 +12,10 @@
 cd "$(dirname "$0")"
 
 # 1. Build etl & probe via docker compose build
-docker compose build
-
-# 2. start pushgateway
-docker compose up pushgateway -d
-
 # 3. Use probe to generate config from CSV into /configs/pipeline.json
-docker compose run --rm etl-probe -c '
+#DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 docker compose build --no-cache etl
+DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 docker compose build etl
+docker compose run --rm etl -c '
 #  set -eux
 NAME="sample"
 # populate file
@@ -31,31 +28,31 @@ echo -n "id,shape,volume
     -url="file://sample.csv" \
     -name="$NAME" \
     -bytes=8192 \
+    -multitable \
     -backend=sqlite \
     -pretty > /configs/pipeline.json
   ls /data
 
   cat /configs/pipeline.json
 
-# 4. delete old pushgateway metrics
-for i in $(wget -O - pushgateway:9091/metrics | grep -o job=.* | cut -f2 -d\" | sort | uniq); do
-		echo $i
-		wget --method=DELETE --quiet http://pushgateway:9091/metrics/job/$i
-done
-
-
 # 5. Run ETL with generated config; SQLite DB will be created in /data/db/etl.db
-  etl -metrics-backend pushgateway -pushgateway-url http://pushgateway:9091 -config /configs/pipeline.json
+output=$(etl_multi -config /configs/pipeline.json | grep summary | grep -o "inserted=.*" | sed "s/ .*//g")
 
-# 6. Verify metrics in Pushgateway.
 
-GOT=$(wget --quiet -O - http://pushgateway:9091/metrics | grep "$NAME" | grep inserted | cut -f2 -d" ")
-if [[ $(wget -O - --quiet http://pushgateway:9091/metrics | grep "$NAME" | grep inserted | cut -f2 -d" ") -eq 2 ]]
+# 6. Verify name in config
+GOT=$(grep -c "$NAME" /configs/pipeline.json)
+echo "GOT ${GOT}"
+echo "output ${output}"
+if [ "$GOT" -lt 4 ]; then
+		exit 1
+fi
+
+if [[ "$output" == "inserted=2" ]]
 then
 	# echo "E2E test passed."
 	exit 0
 else
-	echo "FAILED: E2E test failed. Expected 2, got $GOT"
+	echo "FAILED: E2E test failed"
 	exit 1
 fi
 

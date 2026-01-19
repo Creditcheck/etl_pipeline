@@ -11,7 +11,7 @@ RUN go mod download
 COPY . .
 
 # Build Linux binary
-RUN cd cmd/etl && \
+RUN cd cmd/etl_multi && \
     CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -o /out/etl-linux
 
@@ -21,7 +21,7 @@ RUN cd cmd/etl && \
 #    go build -o /out/etl-windows.exe
 
 # ---------- runtime stage (Linux only) ----------
-FROM alpine:3.19
+FROM alpine:3.22
 
 RUN apk add --no-cache ca-certificates
 
