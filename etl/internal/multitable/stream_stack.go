@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"etl/internal/config"
+	"etl/internal/metrics"
 	csvparser "etl/internal/parser/csv"
 	jsonparser "etl/internal/parser/json"
 	"etl/internal/transformer"
@@ -33,6 +34,58 @@ type ValidatedStream struct {
 	// These errors do not stop the run; they are intended to be counted and emitted
 	// as metrics/logs by the caller.
 	ParseErrorCount func() uint64
+
+	// ProcessedCount returns the number of rows that successfully parsed and
+	// entered the transform stage.
+	//
+	// This is the multitable streaming equivalent of the single-table pipeline's
+	// "processed" metric.
+	ProcessedCount func() uint64
+
+	// TransformRejectedCount returns the number of rows dropped by the coerce/
+	// transform stage.
+	//
+	// This counter is incremented when transformer.TransformLoopRows rejects a row
+	// (for example, when a value cannot be coerced into the requested type).
+	TransformRejectedCount func() uint64
+
+	// ValidateDroppedCount returns the number of rows dropped by the contract
+	// validation stage.
+	//
+	// In lenient validation mode, invalid rows are dropped instead of failing the
+	// run; this counter allows operators to track data quality over time.
+	ValidateDroppedCount func() uint64
+}
+
+// streamMetricsKey is a private context key used to control whether
+// StreamValidatedRows should emit metrics.RecordRow calls while streaming.
+//
+// Why context?
+//   - StreamValidatedRows is used by both pass1 and pass2.
+//   - The multitable engine reads the input file twice (two-pass design).
+//   - We want row-level metrics (processed/parse_errors/validate_dropped/...) to
+//     match the single-table pipeline semantics: count the input once per run.
+//   - The engine can therefore enable metric emission only for pass2 by wrapping
+//     the context passed to StreamValidatedRows.
+//
+// The key is unexported to avoid collisions with other packages.
+type streamMetricsKey struct{}
+
+// WithStreamRowMetrics returns a derived context that instructs StreamValidatedRows
+// to emit row-level metrics (metrics.RecordRow) while streaming.
+//
+// When to use:
+//   - Engine pass2 should enable row-level metrics.
+//   - Engine pass1 should usually disable row-level metrics to avoid double
+//     counting (because pass1 and pass2 both parse/validate the same file).
+func WithStreamRowMetrics(ctx context.Context, enabled bool) context.Context {
+	return context.WithValue(ctx, streamMetricsKey{}, enabled)
+}
+
+func streamRowMetricsEnabled(ctx context.Context) bool {
+	v := ctx.Value(streamMetricsKey{})
+	b, _ := v.(bool)
+	return b
 }
 
 // Dependency seams for unit testing.
@@ -75,7 +128,12 @@ func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*
 
 	// Channel wiring is part of the public contract: downstream code expects
 	// a single output channel that closes when the pipeline completes.
+	//
+	// We introduce a "tap" between parse and coerce to count "processed" rows.
+	// This mirrors the single-table pipeline where processed == successfully parsed
+	// rows entering the transform stage.
 	rawRowCh := make(chan *transformer.Row, rt.ChannelBuffer)
+	tapRawCh := make(chan *transformer.Row, rt.ChannelBuffer)
 	coercedRowCh := make(chan *transformer.Row, rt.ChannelBuffer)
 
 	// Optional: hash stage sits between coerce and validate.
@@ -93,6 +151,11 @@ func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*
 
 	// Parse errors are non-fatal. We count them and continue.
 	var parseErrCount atomic.Uint64
+	var processedCount atomic.Uint64
+	var transformRejectedCount atomic.Uint64
+	var validateDroppedCount atomic.Uint64
+
+	emitRowMetrics := streamRowMetricsEnabled(ctx)
 
 	// Terminal errors are fatal to the pipeline (I/O, context, misconfiguration).
 	// We capture the first terminal error deterministically.
@@ -111,8 +174,44 @@ func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*
 		return nil, err
 	}
 
+	// Stage 1.5: tap -> tapRawCh.
+	//
+	// The tap exists solely to count "processed" rows (successfully parsed rows).
+	// It is implemented as a single goroutine because:
+	//   - It performs O(1) work per row (an atomic increment and a channel send).
+	//   - It preserves ordering (useful for deterministic tests).
+	//   - It does not allocate per row.
+	//
+	// Ownership:
+	//   - The tap does NOT take ownership of the pooled row; it forwards the pointer.
+	//   - Downstream stages and the ultimate consumer still own/free rows.
+	//
+	// Closing behavior:
+	//   - rawRowCh is closed by the parse stage.
+	//   - tapRawCh is closed by this tap goroutine once rawRowCh is drained.
+	wgTap := &sync.WaitGroup{}
+	wgTap.Add(1)
+	go func() {
+		defer wgTap.Done()
+		defer close(tapRawCh)
+		for r := range rawRowCh {
+			processedCount.Add(1)
+			if emitRowMetrics {
+				metrics.RecordRow(cfg.Job, "processed", 1)
+			}
+			select {
+			case tapRawCh <- r:
+			case <-ctx.Done():
+				// If the context is canceled, downstream work should stop promptly.
+				// We still forward ownership rules: the coerce/validate pipeline will
+				// not see this row, so we must free it here.
+				r.Free()
+			}
+		}
+	}()
+
 	// Stage 2: coerce -> coercedRowCh.
-	wgCoerce, err := startCoerceStage(ctx, cfg, columns, rawRowCh, coercedRowCh, rt)
+	wgCoerce, err := startCoerceStage(ctx, cfg, columns, tapRawCh, coercedRowCh, rt, &transformRejectedCount, emitRowMetrics)
 	if err != nil {
 		return nil, err
 	}
@@ -121,13 +220,14 @@ func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*
 	wgHash := startHashStage(ctx, cfg, columns, coercedRowCh, hashOutCh, hasHash, hashSpec)
 
 	// Stage 4: validate -> validCh.
-	wgValidate, err := startValidateStage(ctx, cfg, columns, hashOutCh, validCh)
+	wgValidate, err := startValidateStage(ctx, cfg, columns, hashOutCh, validCh, &validateDroppedCount, emitRowMetrics)
 	if err != nil {
 		return nil, err
 	}
 
 	wait := func() error {
 		wgParse.Wait()
+		wgTap.Wait()
 		wgCoerce.Wait()
 		wgHash.Wait()
 		wgValidate.Wait()
@@ -148,6 +248,15 @@ func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*
 		Wait: wait,
 		ParseErrorCount: func() uint64 {
 			return parseErrCount.Load()
+		},
+		ProcessedCount: func() uint64 {
+			return processedCount.Load()
+		},
+		TransformRejectedCount: func() uint64 {
+			return transformRejectedCount.Load()
+		},
+		ValidateDroppedCount: func() uint64 {
+			return validateDroppedCount.Load()
 		},
 	}, nil
 }
@@ -229,6 +338,12 @@ func startParseStage(
 				return
 			}
 			parseErrCount.Add(1)
+
+			// Metric emission is controlled by WithStreamRowMetrics.
+			// See streamMetricsKey comment for why we do not always emit metrics.
+			if streamRowMetricsEnabled(ctx) {
+				metrics.RecordRow(cfg.Job, "parse_errors", 1)
+			}
 		}
 
 		switch cfg.Parser.Kind {
@@ -260,6 +375,8 @@ func startCoerceStage(
 	in <-chan *transformer.Row,
 	out chan<- *transformer.Row,
 	rt RuntimeConfig,
+	transformRejectedCount *atomic.Uint64,
+	emitRowMetrics bool,
 ) (*sync.WaitGroup, error) {
 	coerceSpec := buildCoerceSpec(
 		coerceTypesFromPipeline(cfg.Transform),
@@ -285,6 +402,13 @@ func startCoerceStage(
 				coerceSpec,
 				func(_ int, _ string) {
 					// TransformLoopRows owns rejected rows and frees them.
+					// We only record a count/metric.
+					if transformRejectedCount != nil {
+						transformRejectedCount.Add(1)
+					}
+					if emitRowMetrics {
+						metrics.RecordRow(cfg.Job, "transform_rejected", 1)
+					}
 				},
 			)
 		}()
@@ -351,6 +475,8 @@ func startValidateStage(
 	columns []string,
 	in <-chan *transformer.Row,
 	validCh chan<- *transformer.Row,
+	validateDroppedCount *atomic.Uint64,
+	emitRowMetrics bool,
 ) (*sync.WaitGroup, error) {
 	requiredFields, typeMap, err := validateInputsFromPipeline(cfg.Transform)
 	if err != nil {
@@ -372,6 +498,13 @@ func startValidateStage(
 			validCh,
 			func(_ int, _ string) {
 				// ValidateLoopRows owns rejected rows and frees them.
+				// We only record a count/metric.
+				if validateDroppedCount != nil {
+					validateDroppedCount.Add(1)
+				}
+				if emitRowMetrics {
+					metrics.RecordRow(cfg.Job, "validate_dropped", 1)
+				}
 			},
 		)
 	}()

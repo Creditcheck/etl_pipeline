@@ -174,3 +174,196 @@ func TestSetBackendAndFlush(t *testing.T) {
 		t.Fatal("SetBackend(nil) should not change backend")
 	}
 }
+
+func TestRecordHTTP(t *testing.T) {
+	orig := backend
+	defer func() { backend = orig }()
+
+	tests := []struct {
+		name           string
+		job            string
+		status         int
+		err            error
+		reqDur         time.Duration
+		respDur        time.Duration
+		bytes          int64
+		wantCounters   []counterCall
+		wantHistograms []histCall
+	}{
+		{
+			name:    "success_records_all_metrics",
+			job:     "jobA",
+			status:  200,
+			err:     nil,
+			reqDur:  120 * time.Millisecond,
+			respDur: 350 * time.Millisecond,
+			bytes:   12345,
+			wantCounters: []counterCall{
+				{
+					name:  "etl_http_requests_total",
+					delta: 1,
+					labels: Labels{
+						"job":    "jobA",
+						"status": "200",
+					},
+				},
+			},
+			wantHistograms: []histCall{
+				{
+					name:  "etl_http_request_duration_seconds",
+					value: (120 * time.Millisecond).Seconds(),
+					labels: Labels{
+						"job":    "jobA",
+						"status": "200",
+					},
+				},
+				{
+					name:  "etl_http_response_duration_seconds",
+					value: (350 * time.Millisecond).Seconds(),
+					labels: Labels{
+						"job":    "jobA",
+						"status": "200",
+					},
+				},
+				{
+					name:  "etl_http_download_bytes",
+					value: float64(12345),
+					labels: Labels{
+						"job":    "jobA",
+						"status": "200",
+					},
+				},
+			},
+		},
+		{
+			name:    "error_increments_error_counter",
+			job:     "jobB",
+			status:  429,
+			err:     errors.New("rate limited"),
+			reqDur:  10 * time.Millisecond,
+			respDur: 20 * time.Millisecond,
+			bytes:   0,
+			wantCounters: []counterCall{
+				{
+					name:  "etl_http_requests_total",
+					delta: 1,
+					labels: Labels{
+						"job":    "jobB",
+						"status": "429",
+					},
+				},
+				{
+					name:  "etl_http_errors_total",
+					delta: 1,
+					labels: Labels{
+						"job":    "jobB",
+						"status": "429",
+					},
+				},
+			},
+			wantHistograms: []histCall{
+				{
+					name:  "etl_http_request_duration_seconds",
+					value: (10 * time.Millisecond).Seconds(),
+					labels: Labels{
+						"job":    "jobB",
+						"status": "429",
+					},
+				},
+				{
+					name:  "etl_http_response_duration_seconds",
+					value: (20 * time.Millisecond).Seconds(),
+					labels: Labels{
+						"job":    "jobB",
+						"status": "429",
+					},
+				},
+				{
+					name:  "etl_http_download_bytes",
+					value: float64(0),
+					labels: Labels{
+						"job":    "jobB",
+						"status": "429",
+					},
+				},
+			},
+		},
+		{
+			name:    "negative_values_are_ignored_except_request_counter",
+			job:     "jobC",
+			status:  0, // useful convention for transport errors
+			err:     errors.New("dial tcp timeout"),
+			reqDur:  -1 * time.Millisecond,
+			respDur: -2 * time.Millisecond,
+			bytes:   -1,
+			wantCounters: []counterCall{
+				{
+					name:  "etl_http_requests_total",
+					delta: 1,
+					labels: Labels{
+						"job":    "jobC",
+						"status": "0",
+					},
+				},
+				{
+					name:  "etl_http_errors_total",
+					delta: 1,
+					labels: Labels{
+						"job":    "jobC",
+						"status": "0",
+					},
+				},
+			},
+			wantHistograms: nil, // all negative => ignored by RecordHTTP
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			fb := &fakeBackend{}
+			backend = fb
+
+			RecordHTTP(tc.job, tc.status, tc.err, tc.reqDur, tc.respDur, tc.bytes)
+
+			if len(fb.callsCounters) != len(tc.wantCounters) {
+				t.Fatalf("expected %d counter calls, got %d: %#v", len(tc.wantCounters), len(fb.callsCounters), fb.callsCounters)
+			}
+			for i := range tc.wantCounters {
+				got := fb.callsCounters[i]
+				want := tc.wantCounters[i]
+
+				if got.name != want.name || got.delta != want.delta {
+					t.Fatalf("counter[%d]=%#v; want %#v", i, got, want)
+				}
+				// Label maps are order-independent; just compare values for required keys.
+				for k, v := range want.labels {
+					if got.labels[k] != v {
+						t.Fatalf("counter[%d].labels[%q]=%q; want %q (all labels: %v)", i, k, got.labels[k], v, got.labels)
+					}
+				}
+			}
+
+			if len(fb.callsHistograms) != len(tc.wantHistograms) {
+				t.Fatalf("expected %d histogram calls, got %d: %#v", len(tc.wantHistograms), len(fb.callsHistograms), fb.callsHistograms)
+			}
+			for i := range tc.wantHistograms {
+				got := fb.callsHistograms[i]
+				want := tc.wantHistograms[i]
+
+				if got.name != want.name {
+					t.Fatalf("hist[%d].name=%q; want %q", i, got.name, want.name)
+				}
+				// Allow tiny float error.
+				if got.value < want.value-1e-9 || got.value > want.value+1e-9 {
+					t.Fatalf("hist[%d].value=%v; want %v", i, got.value, want.value)
+				}
+				for k, v := range want.labels {
+					if got.labels[k] != v {
+						t.Fatalf("hist[%d].labels[%q]=%q; want %q (all labels: %v)", i, k, got.labels[k], v, got.labels)
+					}
+				}
+			}
+		})
+	}
+}

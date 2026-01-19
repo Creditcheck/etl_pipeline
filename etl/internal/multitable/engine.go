@@ -9,9 +9,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"etl/internal/config"
+	"etl/internal/metrics"
 	"etl/internal/storage"
 	"etl/internal/transformer"
 	"etl/internal/transformer/builtin"
@@ -49,6 +51,27 @@ type Engine2Pass struct {
 	Stream StreamFn
 }
 
+// EngineRunStats are the high-level counters emitted by the multitable engine.
+//
+// These are intentionally aligned with cmd/etl single-table counters so that
+// dashboards and operators can reason about both pipeline types consistently.
+//
+// Definitions:
+//   - Processed: successfully parsed rows entering the transform stage.
+//   - ParseErrors: non-fatal parse/decode errors during parsing.
+//   - TransformRejected: rows rejected during the coerce/transform stage.
+//   - ValidateDropped: rows dropped by contract validation (lenient policy).
+//   - Inserted: total fact rows inserted.
+//   - Batches: number of fact insert batches.
+type EngineRunStats struct {
+	Processed         uint64
+	ParseErrors       uint64
+	TransformRejected uint64
+	ValidateDropped   uint64
+	Inserted          uint64
+	Batches           uint64
+}
+
 // Run executes the two-pass streaming plan.
 func (e *Engine2Pass) Run(ctx context.Context, cfg Pipeline, columns []string) error {
 	if e.Repo == nil {
@@ -64,24 +87,40 @@ func (e *Engine2Pass) Run(ctx context.Context, cfg Pipeline, columns []string) e
 	}
 
 	ddlStart := time.Now()
-	if err := e.Repo.EnsureTables(ctx, plan.AllTables()); err != nil {
+	err = e.Repo.EnsureTables(ctx, plan.AllTables())
+	metrics.RecordStep(cfg.Job, "ddl", err, time.Since(ddlStart))
+	if err != nil {
 		return err
 	}
 	logf("stage=ddl ok duration=%s", durMS(ddlStart))
 
 	// Pass 1: ensure dimensions (streaming).
 	pass1Start := time.Now()
-	if err := e.ensureDimensionsStreaming(ctx, cfg, columns, plan); err != nil {
+	err = e.ensureDimensionsStreaming(ctx, cfg, columns, plan)
+	metrics.RecordStep(cfg.Job, "pass1_ensure_dims", err, time.Since(pass1Start))
+	if err != nil {
 		return err
 	}
 	logf("stage=pass1_ensure_dims ok duration=%s", durMS(pass1Start))
 
 	// Pass 2: load facts (streaming).
 	pass2Start := time.Now()
-	if err := e.loadFactsStreaming(ctx, cfg, columns, plan, lenient); err != nil {
+	stats, err := e.loadFactsStreaming(ctx, cfg, columns, plan, lenient)
+	metrics.RecordStep(cfg.Job, "pass2_load_facts", err, time.Since(pass2Start))
+	if err != nil {
 		return err
 	}
 	logf("stage=pass2_load_facts ok duration=%s", durMS(pass2Start))
+
+	logf(
+		"summary: processed=%d parse_errors=%d transform_rejected=%d validate_dropped=%d inserted=%d batches=%d",
+		stats.Processed,
+		stats.ParseErrors,
+		stats.TransformRejected,
+		stats.ValidateDropped,
+		stats.Inserted,
+		stats.Batches,
+	)
 
 	return nil
 }
@@ -206,8 +245,10 @@ func (e *Engine2Pass) ensureDimensionsStreaming(
 	if err := flushAll(); err != nil {
 		return err
 	}
-	if err := stream.Wait(); err != nil {
-		return err
+	if stream.Wait != nil {
+		if err := stream.Wait(); err != nil {
+			return err
+		}
 	}
 
 	logf("stage=pass1_rows seen_rows=%d", seenRows)
@@ -216,13 +257,9 @@ func (e *Engine2Pass) ensureDimensionsStreaming(
 
 // loadFactsStreaming streams validated rows again and inserts facts in batches.
 // Dimension ID resolution is done per batch using SelectKeyValueByKeys.
-//
-// Performance note:
-// For SQL Server specifically, many small inserts on a single connection tend to be
-// single-core and slow. To drive higher throughput (and multiple SQL Server schedulers),
-// this stage supports configurable loader worker concurrency.
-func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, columns []string, plan indexedPlan, lenient bool) error {
+func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, columns []string, plan indexedPlan, lenient bool) (EngineRunStats, error) {
 	logf := e.logger()
+	var stats EngineRunStats
 
 	batchSize := cfg.Runtime.BatchSize
 	if batchSize <= 0 {
@@ -236,9 +273,6 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 
 	debug := cfg.Runtime.DebugTimings
 
-	// Cancellation model:
-	// - Any worker error cancels derived context with a cause.
-	// - Producer stops early and frees owned rows promptly.
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
@@ -255,173 +289,174 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 		}
 	}
 
+	// Enable row-level metric emission ONLY for pass2.
+	ctx = WithStreamRowMetrics(ctx, true)
 	stream, err := e.stream(ctx, cfg, columns)
 	if err != nil {
-		return err
+		return stats, err
 	}
 
-	// Producer: batches of pooled rows. Ownership transfers to the consumer worker,
-	// which must Free() each row exactly once.
-	batchCh := make(chan []*transformer.Row, loaderWorkers*2)
+	var insertedTotal atomic.Uint64
+	var batchesTotal atomic.Uint64
 
-	// Worker pool: per-worker cache to avoid locks.
-	var wg sync.WaitGroup
-	wg.Add(loaderWorkers)
-	for w := 0; w < loaderWorkers; w++ {
-		go func(workerID int) {
-			defer wg.Done()
+	type batchJob struct {
+		rows []*transformer.Row
+	}
 
-			// cache[dimTable][normalizedKey] = id
-			cache := make(map[string]map[string]int64, len(plan.Dimensions))
+	jobs := make(chan batchJob, loaderWorkers*2)
 
-			for batch := range batchCh {
-				// If canceled, drain and free quickly.
-				select {
-				case <-ctx.Done():
-					for _, r := range batch {
-						r.Free()
-					}
-					continue
-				default:
-				}
+	// Producer: group validated rows into batches and send to workers.
+	var producerWG sync.WaitGroup
+	producerWG.Add(1)
+	go func() {
+		defer producerWG.Done()
+		defer close(jobs)
 
-				start := time.Now()
-				err := e.processFactBatch(ctx, plan, batch, cache, lenient, debug, logf)
-				dur := time.Since(start).Truncate(time.Millisecond)
+		batch := make([]*transformer.Row, 0, batchSize)
 
-				// Always free owned rows.
+		flush := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			job := batchJob{rows: batch}
+			select {
+			case jobs <- job:
+				batch = make([]*transformer.Row, 0, batchSize)
+				return true
+			case <-ctx.Done():
 				for _, r := range batch {
 					r.Free()
 				}
+				return false
+			}
+		}
 
-				if err != nil {
-					setErr(err)
-					if debug {
-						logf("stage=pass2_batch worker=%d status=error duration=%s err=%v", workerID, dur, err)
-					}
-					continue
-				}
-				if debug {
-					logf("stage=pass2_batch worker=%d status=ok duration=%s rows=%d", workerID, dur, len(batch))
+		for r := range stream.Rows {
+			if ctx.Err() != nil {
+				r.Free()
+				continue
+			}
+			batch = append(batch, r)
+			if len(batch) >= batchSize {
+				if ok := flush(); !ok {
+					return
 				}
 			}
-		}(w)
-	}
-
-	// Producer loop: build batches and hand off to workers.
-	seenRows := 0
-	batch := make([]*transformer.Row, 0, batchSize)
-
-	flush := func() {
-		if len(batch) == 0 {
-			return
 		}
-		out := batch
-		batch = make([]*transformer.Row, 0, batchSize)
+		_ = flush()
+	}()
 
-		select {
-		case batchCh <- out:
-		case <-ctx.Done():
-			// Producer still owns out when send fails; free it.
-			for _, r := range out {
+	workerFn := func(workerID int) {
+		cache := make(map[string]map[string]int64, len(plan.Dimensions))
+
+		for job := range jobs {
+			if ctx.Err() != nil {
+				for _, r := range job.rows {
+					r.Free()
+				}
+				continue
+			}
+
+			startBatch := time.Now()
+
+			if err := e.prewarmBatchLookups(ctx, plan, job.rows, cache); err != nil {
+				for _, r := range job.rows {
+					r.Free()
+				}
+				setErr(err)
+				continue
+			}
+
+			for _, fact := range plan.Facts {
+				inserted, dropped, err := e.insertFactBatch(ctx, fact, job.rows, cache, lenient)
+				if err != nil {
+					for _, r := range job.rows {
+						r.Free()
+					}
+					setErr(err)
+					break
+				}
+				if inserted > 0 {
+					insertedTotal.Add(uint64(inserted))
+				}
+				if inserted > 0 || dropped > 0 {
+					batchesTotal.Add(1)
+				}
+			}
+
+			for _, r := range job.rows {
 				r.Free()
 			}
+
+			if debug {
+				logf("debug: worker=%d batch=%d duration=%s", workerID, len(job.rows), time.Since(startBatch).Truncate(time.Millisecond))
+			}
 		}
 	}
 
-	for r := range stream.Rows {
-		select {
-		case <-ctx.Done():
-			// Context canceled: producer must free incoming rows.
-			r.Free()
-			continue
-		default:
-		}
-
-		seenRows++
-		batch = append(batch, r)
-		if len(batch) >= batchSize {
-			flush()
-		}
+	var workersWG sync.WaitGroup
+	workersWG.Add(loaderWorkers)
+	for i := 0; i < loaderWorkers; i++ {
+		go func(id int) {
+			defer workersWG.Done()
+			workerFn(id)
+		}(i + 1)
 	}
-	flush()
 
-	close(batchCh)
-	wg.Wait()
+	producerWG.Wait()
+	workersWG.Wait()
 
-	// Prefer terminal stream error unless worker error already captured.
-	if err := stream.Wait(); err != nil {
-		// If we were canceled due to a worker error, surface that first.
-		select {
-		case werr := <-errCh:
-			return werr
-		default:
+	if stream.Wait != nil {
+		if err := stream.Wait(); err != nil {
+			setErr(err)
 		}
-		return err
 	}
 
 	select {
-	case werr := <-errCh:
-		return werr
+	case err := <-errCh:
+		return stats, err
 	default:
 	}
 
-	logf("stage=pass2_rows seen_rows=%d loader_workers=%d", seenRows, loaderWorkers)
-	return nil
-}
-
-func (e *Engine2Pass) processFactBatch(
-	ctx context.Context,
-	plan indexedPlan,
-	batch []*transformer.Row,
-	cache map[string]map[string]int64,
-	lenient bool,
-	debug bool,
-	logf func(format string, v ...any),
-) error {
-	if len(batch) == 0 {
-		return nil
-	}
-
-	lookupStart := time.Now()
-	if err := e.resolveBatchLookups(ctx, plan, batch, cache); err != nil {
-		return err
-	}
-	if debug {
-		logf("stage=pass2_resolve_lookups batch_rows=%d duration=%s", len(batch), time.Since(lookupStart).Truncate(time.Millisecond))
-	}
-
-	for _, fact := range plan.Facts {
-		start := time.Now()
-		inserted, dropped, err := e.insertFactBatch(ctx, fact, batch, cache, lenient)
-		dur := time.Since(start).Truncate(time.Millisecond)
-
-		if err != nil {
-			return err
+	// Populate final counters from the validated stream and loader atomics.
+	//
+	// IMPORTANT: StreamFn seams used by unit tests may return a ValidatedStream that
+	// only implements a subset of the counter accessors. Calling a nil accessor panics,
+	// so treat missing accessors as "counter not available" (zero).
+	if stream != nil {
+		if stream.ProcessedCount != nil {
+			stats.Processed = stream.ProcessedCount()
 		}
-
-		if debug {
-			logf(
-				"stage=pass2_insert_fact table=%s batch_rows=%d inserted=%d dropped=%d duration=%s",
-				fact.Table.Name, len(batch), inserted, dropped, dur,
-			)
-		} else if lenient && dropped > 0 {
-			logf("stage=fact_batch table=%s inserted=%d dropped=%d", fact.Table.Name, inserted, dropped)
+		if stream.ParseErrorCount != nil {
+			stats.ParseErrors = stream.ParseErrorCount()
+		}
+		if stream.TransformRejectedCount != nil {
+			stats.TransformRejected = stream.TransformRejectedCount()
+		}
+		if stream.ValidateDroppedCount != nil {
+			stats.ValidateDropped = stream.ValidateDroppedCount()
 		}
 	}
 
-	return nil
+	stats.Inserted = insertedTotal.Load()
+	stats.Batches = batchesTotal.Load()
+
+	return stats, nil
 }
 
-// resolveBatchLookups fetches (key->id) mappings needed by this batch for all lookup tables.
-func (e *Engine2Pass) resolveBatchLookups(
+// prewarmBatchLookups fetches only the dimension keys needed by this batch.
+// It avoids "SELECT *" table scans.
+//
+// IMPORTANT: for lookup prewarm we pass STRING keys (normalized) to SelectKeyValueByKeys
+// so cache keys are consistent across []byte vs string sources and mocks/backends.
+func (e *Engine2Pass) prewarmBatchLookups(
 	ctx context.Context,
 	plan indexedPlan,
 	batch []*transformer.Row,
 	cache map[string]map[string]int64,
 ) error {
-	// needed[dimTable][normalizedKey] = typedValue
-	needed := make(map[string]map[string]any, len(plan.Dimensions))
+	// Collect needed keys per dimension table for this batch (exclude already cached keys).
+	needed := make(map[string]map[string]struct{})
 
 	for _, fact := range plan.Facts {
 		for _, col := range fact.Columns {
@@ -447,12 +482,10 @@ func (e *Engine2Pass) resolveBatchLookups(
 				}
 				m := needed[dimTable]
 				if m == nil {
-					m = make(map[string]any)
+					m = make(map[string]struct{})
 					needed[dimTable] = m
 				}
-				if _, exists := m[nk]; !exists {
-					m[nk] = typedBindValue(v)
-				}
+				m[nk] = struct{}{}
 			}
 		}
 	}
@@ -465,8 +498,8 @@ func (e *Engine2Pass) resolveBatchLookups(
 		}
 
 		keys := make([]any, 0, len(m))
-		for _, v := range m {
-			keys = append(keys, v)
+		for k := range m {
+			keys = append(keys, k) // normalized string key
 		}
 
 		kv, err := e.Repo.SelectKeyValueByKeys(ctx, dim.Table.Name, dim.KeyColumn, dim.ValueColumn, keys)
@@ -557,6 +590,27 @@ func (e *Engine2Pass) insertFactBatch(
 		return 0, dropped, nil
 	}
 
+	// If dedupe is enabled (ON CONFLICT / IGNORE semantics), sort each batch by the
+	// conflict key to impose a stable lock acquisition order.
+	//
+	// This is a common root-cause for "deadlock detected" (SQLSTATE 40P01) in Postgres
+	// when multiple workers concurrently insert overlapping keys using multi-row INSERTs.
+	if len(fact.DedupeIndices) > 0 && len(outRows) > 1 {
+		sort.SliceStable(outRows, func(i, j int) bool {
+			a := outRows[i]
+			b := outRows[j]
+			for _, idx := range fact.DedupeIndices {
+				ka := normalizeKey(a[idx])
+				kb := normalizeKey(b[idx])
+				if ka == kb {
+					continue
+				}
+				return ka < kb
+			}
+			return false
+		})
+	}
+
 	affected, err := e.Repo.InsertFactRows(ctx, fact.Table.Name, cols, outRows, fact.DedupeColumns)
 	if err != nil {
 		return 0, dropped, err
@@ -613,7 +667,12 @@ type indexedFact struct {
 	Table         storage.TableSpec
 	TargetColumns []string
 	DedupeColumns []string
-	Columns       []indexedFactColumn
+
+	// DedupeIndices are the positional indices (into TargetColumns/out rows)
+	// corresponding to DedupeColumns.
+	DedupeIndices []int
+
+	Columns []indexedFactColumn
 }
 
 type indexedFactColumn struct {
@@ -628,14 +687,6 @@ type indexedLookup struct {
 	MatchFieldIndex int
 }
 
-// buildIndexedPlan compiles a runtime plan for streaming execution.
-//
-// It converts column names into integer indices so the engine can read values from
-// []*transformer.Row without per-row map allocations.
-//
-// Errors:
-//   - Returns an error for unknown table load kinds.
-//   - Does not validate storage schema correctness beyond what is needed to build indices.
 func buildIndexedPlan(cfg Pipeline, columns []string) (indexedPlan, error) {
 	colIndex := indexColumns(columns)
 
@@ -741,6 +792,19 @@ func compileFact(t storage.TableSpec, colIndex map[string]int) (indexedFact, err
 		f.DedupeColumns = append(f.DedupeColumns, t.Load.Dedupe.ConflictColumns...)
 	}
 
+	// Precompute the output row indices for the dedupe columns.
+	if len(f.DedupeColumns) > 0 && len(f.TargetColumns) > 0 {
+		idx := make(map[string]int, len(f.TargetColumns))
+		for i, c := range f.TargetColumns {
+			idx[c] = i
+		}
+		for _, c := range f.DedupeColumns {
+			if i, ok := idx[c]; ok {
+				f.DedupeIndices = append(f.DedupeIndices, i)
+			}
+		}
+	}
+
 	return f, nil
 }
 
@@ -757,15 +821,6 @@ func mapNullableByColumn(cols []storage.ColumnSpec) map[string]bool {
 }
 
 // pickLookupMatchField chooses a stable match field from a lookup match map.
-//
-// The storage schema represents lookup match as a map (db key column -> source field). :contentReference[oaicite:3]{index=3}
-// Map iteration order is random, so selecting an arbitrary value would make plan
-// compilation nondeterministic and brittle for tests.
-//
-// Behavior:
-//   - If match is empty, returns "".
-//   - Otherwise returns the source field corresponding to the lexicographically
-//     smallest db key column.
 func pickLookupMatchField(match map[string]string) string {
 	if len(match) == 0 {
 		return ""
@@ -793,11 +848,6 @@ func isLenient(ts []config.Transform) bool {
 }
 
 // normalizeKey produces a stable string form used for in-memory caches.
-//
-// Hot-path rules:
-//   - Avoid fmt.Sprint for common primitive types (it allocates heavily).
-//   - Preserve current trim semantics for strings/[]byte.
-//   - Treat nil/empty as "".
 func normalizeKey(v any) string {
 	switch t := v.(type) {
 	case nil:
@@ -810,7 +860,6 @@ func normalizeKey(v any) string {
 		return t
 
 	case []byte:
-		// Convert once.
 		s := string(t)
 		if builtin.HasEdgeSpace(s) {
 			return strings.TrimSpace(s)
