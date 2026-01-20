@@ -119,7 +119,7 @@ func writeExpanded(w io.Writer, rows []row, perPage int) error {
 	}
 
 	for i, it := range rows {
-		href := strings.TrimSpace(it.Href)
+		href := strings.TrimSuffix(strings.TrimSpace(it.Href), "/")
 		if href == "" {
 			continue
 		}

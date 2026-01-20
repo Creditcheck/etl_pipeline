@@ -7,17 +7,24 @@ import "sync"
 
 // Row is a pooled container holding a positional row for database COPY.
 //
-// Contract:
-//   - The owner goroutine writes into r.V[0:colCount] (no re-slice growth).
-//   - After the row has been successfully persisted, the loader **must**
-//     call r.Free() to return it to the pool.
-//   - Do not retain references to r or r.V beyond the owning stage.
+// Ownership contract:
+//   - Exactly one goroutine "owns" a Row at a time.
+//   - A Row may be passed downstream via channels (ownership transfer).
+//   - The final consumer (typically loader) must call Free() AFTER it is fully
+//     done with the Row (and anything referencing r.V).
 //
-// We keep V as []any to feed pgx CopyFromRows directly.
+// IMPORTANT:
+//   - During ctx cancellation, drain-safe stages may still be running while the
+//     parser is also unwinding. If canceled rows are returned to the pool, they
+//     can be reused immediately and written concurrently with downstream reads.
+//     That produces the races / corruption you've observed.
+//
+// Therefore:
+//   - Use Free() only on the normal path.
+//   - Use Drop() on cancellation paths (no re-pooling; allow GC to reclaim).
 type Row struct {
 	V    []any
-	Line int // 1-based "logical" line/record number from the source, if known.
-
+	Line int // 1-based logical record number, if known
 }
 
 var rowPool sync.Pool
@@ -27,7 +34,6 @@ var rowPool sync.Pool
 func GetRow(colCount int) *Row {
 	if v := rowPool.Get(); v != nil {
 		r := v.(*Row)
-		// Ensure capacity; grow only rarely.
 		if cap(r.V) < colCount {
 			r.V = make([]any, colCount)
 		}
@@ -35,7 +41,7 @@ func GetRow(colCount int) *Row {
 		for i := range r.V {
 			r.V[i] = nil
 		}
-		r.Line = 0 // reset metadata
+		r.Line = 0
 		return r
 	}
 	return &Row{
@@ -44,8 +50,19 @@ func GetRow(colCount int) *Row {
 	}
 }
 
-// Free returns the Row to the pool. The caller must not use r after Free().
+// Free returns the Row to the pool.
+// Call this ONLY when you're sure no other goroutine can observe r or r.V.
 func (r *Row) Free() {
-	// Optional: shrink very large rows; omitted for speed.
 	rowPool.Put(r)
+}
+
+// Drop discards the Row WITHOUT returning it to the pool.
+//
+// Use this on ctx-cancellation paths to prevent "canceled drain" from racing
+// with upstream reuse of the same pooled Row.
+func (r *Row) Drop() {
+	// Help GC a bit on cancel paths (optional).
+	// Avoid per-element nil for speed; releasing the slice header is enough.
+	r.V = nil
+	r.Line = 0
 }

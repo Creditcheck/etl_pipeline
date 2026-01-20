@@ -133,14 +133,17 @@ func (e *Engine2Pass) logger() func(format string, v ...any) {
 	return e.Logger.Printf
 }
 
-// stream returns the validated row stream implementation.
+// stream returns the validated row stream implementation used by Engine2Pass.
 //
-// When to use:
-//   - Production: uses StreamValidatedRows (file->parse->transform->validate).
-//   - Tests: inject Engine2Pass.Stream to provide deterministic rows.
+// In production, this constructs the default file->parse->transform->validate
+// streaming pipeline (StreamValidatedRows). In unit tests or alternate runtimes,
+// Engine2Pass.Stream may be provided to inject a deterministic stream.
 //
 // Errors:
+//
 //   - Returns any fatal initialization error from the stream provider.
+//   - Row-level parse/transform/validation issues are reflected via stream counters
+//     and/or stream.Wait (consistent with StreamValidatedRows).
 func (e *Engine2Pass) stream(ctx context.Context, cfg Pipeline, columns []string) (*ValidatedStream, error) {
 	if e.Stream != nil {
 		return e.Stream(ctx, cfg, columns)
@@ -255,9 +258,46 @@ func (e *Engine2Pass) ensureDimensionsStreaming(
 	return nil
 }
 
-// loadFactsStreaming streams validated rows again and inserts facts in batches.
-// Dimension ID resolution is done per batch using SelectKeyValueByKeys.
-func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, columns []string, plan indexedPlan, lenient bool) (EngineRunStats, error) {
+// loadFactsStreaming performs pass 2 of the two-pass multitable pipeline.
+//
+// It streams validated rows again, resolves dimension foreign keys per-batch,
+// and inserts fact rows into the target tables using the repository backend.
+//
+// Concurrency model:
+//
+//   - A single producer goroutine reads from the validated stream and groups
+//     rows into batches pushed onto a jobs channel.
+//   - One or more loader workers consume batches, prewarm dimension lookups,
+//     and execute fact inserts.
+//
+// Cancellation & pooling:
+//
+//   - The function is drain-safe: it does not abruptly stop reading from the
+//     upstream validated stream on ctx cancellation. Instead, it cancels work
+//     via ctx and continues draining to avoid goroutine leaks.
+//   - To prevent reuse races with pooled *transformer.Row values during
+//     cancellation unwinding, rows observed on cancellation paths are discarded
+//     via r.Drop() (not returned to the sync.Pool). Rows on the normal path are
+//     returned to the pool via r.Free() after all downstream work completes.
+//
+// Stats:
+//
+//   - Row-level counters (processed/parse_errors/transform_rejected/validate_dropped)
+//     are sourced from the returned ValidatedStream counters.
+//   - Inserted/batches are tracked locally from repository insert results.
+//
+// Closing semantics:
+//
+//   - Does not close any external channels. It consumes stream.Rows until closed,
+//     and waits on stream.Wait (if non-nil) before returning.
+//   - Returns the first fatal error encountered (via repository calls or stream.Wait).
+func (e *Engine2Pass) loadFactsStreaming(
+	ctx context.Context,
+	cfg Pipeline,
+	columns []string,
+	plan indexedPlan,
+	lenient bool,
+) (EngineRunStats, error) {
 	logf := e.logger()
 	var stats EngineRunStats
 
@@ -285,11 +325,10 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 		case errCh <- err:
 			cancel(err)
 		default:
-			// First error wins.
 		}
 	}
 
-	// Enable row-level metric emission ONLY for pass2.
+	// Only pass2 should emit row-level metrics, but counters always work.
 	ctx = WithStreamRowMetrics(ctx, true)
 	stream, err := e.stream(ctx, cfg, columns)
 	if err != nil {
@@ -302,10 +341,9 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 	type batchJob struct {
 		rows []*transformer.Row
 	}
-
 	jobs := make(chan batchJob, loaderWorkers*2)
 
-	// Producer: group validated rows into batches and send to workers.
+	// Producer: read validated rows and bundle into batches.
 	var producerWG sync.WaitGroup
 	producerWG.Add(1)
 	go func() {
@@ -324,8 +362,9 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 				batch = make([]*transformer.Row, 0, batchSize)
 				return true
 			case <-ctx.Done():
+				// On cancellation: do not re-pool
 				for _, r := range batch {
-					r.Free()
+					r.Drop()
 				}
 				return false
 			}
@@ -333,7 +372,7 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 
 		for r := range stream.Rows {
 			if ctx.Err() != nil {
-				r.Free()
+				r.Drop()
 				continue
 			}
 			batch = append(batch, r)
@@ -346,13 +385,21 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 		_ = flush()
 	}()
 
+	// workerFn consumes fact batch jobs, prewarms dimension lookups for the batch,
+	// inserts fact rows, and returns input rows to the pool on the normal path.
+	//
+	// Cancellation & pooling:
+	//   - On ctx cancellation, rows are discarded via Drop() to avoid pooled-row reuse
+	//     races during cancellation unwinding.
+	//   - On the normal path, rows are returned to the pool via Free() after all
+	//     inserts are complete for the batch.
 	workerFn := func(workerID int) {
 		cache := make(map[string]map[string]int64, len(plan.Dimensions))
 
 		for job := range jobs {
 			if ctx.Err() != nil {
 				for _, r := range job.rows {
-					r.Free()
+					r.Drop()
 				}
 				continue
 			}
@@ -361,17 +408,25 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 
 			if err := e.prewarmBatchLookups(ctx, plan, job.rows, cache); err != nil {
 				for _, r := range job.rows {
-					r.Free()
+					if ctx.Err() != nil {
+						r.Drop()
+					} else {
+						r.Free()
+					}
 				}
 				setErr(err)
 				continue
 			}
 
 			for _, fact := range plan.Facts {
-				inserted, dropped, err := e.insertFactBatch(ctx, fact, job.rows, cache, lenient)
+				inserted, dropped, err := e.insertFactBatch(ctx, cfg.Job, fact, job.rows, cache, lenient)
 				if err != nil {
 					for _, r := range job.rows {
-						r.Free()
+						if ctx.Err() != nil {
+							r.Drop()
+						} else {
+							r.Free()
+						}
 					}
 					setErr(err)
 					break
@@ -384,8 +439,15 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 				}
 			}
 
-			for _, r := range job.rows {
-				r.Free()
+			// Normal path: return to pool
+			if ctx.Err() != nil {
+				for _, r := range job.rows {
+					r.Drop()
+				}
+			} else {
+				for _, r := range job.rows {
+					r.Free()
+				}
 			}
 
 			if debug {
@@ -393,6 +455,73 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 			}
 		}
 	}
+
+	// START
+	//workerFn := func(workerID int) {
+	//	cache := make(map[string]map[string]int64, len(plan.Dimensions))
+
+	//	for job := range jobs {
+	//		if ctx.Err() != nil {
+	//			for _, r := range job.rows {
+	//				r.Drop()
+	//			}
+	//			continue
+	//		}
+
+	//		startBatch := time.Now()
+
+	//		if err := e.prewarmBatchLookups(ctx, plan, job.rows, cache); err != nil {
+	//			for _, r := range job.rows {
+	//				if ctx.Err() != nil {
+	//					r.Drop()
+	//				} else {
+	//					r.Free()
+	//				}
+	//			}
+	//			setErr(err)
+	//			continue
+	//		}
+
+	//		for _, fact := range plan.Facts {
+	//			inserted, dropped, err := e.insertFactBatch(ctx, fact, job.rows, cache, lenient)
+	//			if err != nil {
+	//				for _, r := range job.rows {
+	//					if ctx.Err() != nil {
+	//						r.Drop()
+	//					} else {
+	//						r.Free()
+	//					}
+	//				}
+	//				setErr(err)
+	//				break
+	//			}
+
+	//			if inserted > 0 {
+	//				insertedTotal.Add(uint64(inserted))
+	//			}
+	//			// Count batches that did any work (inserted or dropped)
+	//			if inserted > 0 || dropped > 0 {
+	//				batchesTotal.Add(1)
+	//			}
+	//		}
+
+	//		// Release rows
+	//		if ctx.Err() != nil {
+	//			for _, r := range job.rows {
+	//				r.Drop()
+	//			}
+	//		} else {
+	//			for _, r := range job.rows {
+	//				r.Free()
+	//			}
+	//		}
+
+	//		if debug {
+	//			logf("debug: worker=%d batch=%d duration=%s", workerID, len(job.rows), time.Since(startBatch).Truncate(time.Millisecond))
+	//		}
+	//	}
+	//}
+	// END
 
 	var workersWG sync.WaitGroup
 	workersWG.Add(loaderWorkers)
@@ -406,6 +535,7 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 	producerWG.Wait()
 	workersWG.Wait()
 
+	// Wait for upstream pipeline (parse/transform/validate) to finish and report terminal errors.
 	if stream.Wait != nil {
 		if err := stream.Wait(); err != nil {
 			setErr(err)
@@ -418,26 +548,19 @@ func (e *Engine2Pass) loadFactsStreaming(ctx context.Context, cfg Pipeline, colu
 	default:
 	}
 
-	// Populate final counters from the validated stream and loader atomics.
-	//
-	// IMPORTANT: StreamFn seams used by unit tests may return a ValidatedStream that
-	// only implements a subset of the counter accessors. Calling a nil accessor panics,
-	// so treat missing accessors as "counter not available" (zero).
-	if stream != nil {
-		if stream.ProcessedCount != nil {
-			stats.Processed = stream.ProcessedCount()
-		}
-		if stream.ParseErrorCount != nil {
-			stats.ParseErrors = stream.ParseErrorCount()
-		}
-		if stream.TransformRejectedCount != nil {
-			stats.TransformRejected = stream.TransformRejectedCount()
-		}
-		if stream.ValidateDroppedCount != nil {
-			stats.ValidateDropped = stream.ValidateDroppedCount()
-		}
+	// Populate stats from stream counters + loader counters.
+	if stream.ProcessedCount != nil {
+		stats.Processed = stream.ProcessedCount()
 	}
-
+	if stream.ParseErrorCount != nil {
+		stats.ParseErrors = stream.ParseErrorCount()
+	}
+	if stream.TransformRejectedCount != nil {
+		stats.TransformRejected = stream.TransformRejectedCount()
+	}
+	if stream.ValidateDroppedCount != nil {
+		stats.ValidateDropped = stream.ValidateDroppedCount()
+	}
 	stats.Inserted = insertedTotal.Load()
 	stats.Batches = batchesTotal.Load()
 
@@ -520,8 +643,32 @@ func (e *Engine2Pass) prewarmBatchLookups(
 	return nil
 }
 
+// insertFactBatch builds and inserts a batch of fact rows for a single fact table.
+//
+// For each input *transformer.Row in the batch, it produces an output row matching
+// the fact's TargetColumns by copying source fields and/or resolving dimension IDs
+// from the provided lookup cache.
+//
+// Leniency:
+//   - If lenient is true, rows with missing lookup keys or lookup misses are dropped
+//     (counted as dropped) rather than producing an error.
+//   - If lenient is false, missing lookup keys or lookup misses are fatal.
+//
+// Dedupe / deadlock avoidance:
+//   - If ON CONFLICT / dedupe is enabled for the fact table, output rows are sorted
+//     by conflict keys to impose a stable lock acquisition order in Postgres.
+//
+// Metrics:
+//   - Emits loader-side counters via metrics.RecordRow(job, kind, n) so etl.records.total
+//     includes inserted rows and conflict/dropped visibility (not just "processed").
+//
+// Return values:
+//   - inserted: number of rows reported as inserted by the repository backend.
+//   - dropped:  number of rows dropped due to lenient lookup policy.
+//   - error:    non-nil on fatal lookup failures or repository insert errors.
 func (e *Engine2Pass) insertFactBatch(
 	ctx context.Context,
+	job string,
 	fact indexedFact,
 	batch []*transformer.Row,
 	cache map[string]map[string]int64,
@@ -586,15 +733,16 @@ func (e *Engine2Pass) insertFactBatch(
 		outRows = append(outRows, rowOut)
 	}
 
+	// Emit drop metric (optional but useful).
+	if dropped > 0 {
+		metrics.RecordRow(job, "fact_dropped", int64(dropped))
+	}
+
 	if len(outRows) == 0 {
 		return 0, dropped, nil
 	}
 
-	// If dedupe is enabled (ON CONFLICT / IGNORE semantics), sort each batch by the
-	// conflict key to impose a stable lock acquisition order.
-	//
-	// This is a common root-cause for "deadlock detected" (SQLSTATE 40P01) in Postgres
-	// when multiple workers concurrently insert overlapping keys using multi-row INSERTs.
+	// Stable lock acquisition order when ON CONFLICT is enabled (reduces deadlocks).
 	if len(fact.DedupeIndices) > 0 && len(outRows) > 1 {
 		sort.SliceStable(outRows, func(i, j int) bool {
 			a := outRows[i]
@@ -612,11 +760,166 @@ func (e *Engine2Pass) insertFactBatch(
 	}
 
 	affected, err := e.Repo.InsertFactRows(ctx, fact.Table.Name, cols, outRows, fact.DedupeColumns)
-	if err != nil {
-		return 0, dropped, err
+
+	if err == nil && affected == 0 {
+		log.Printf("debug: op=insert all_conflicts table=%s rows=%d", fact.Table.Name, len(outRows))
+		metrics.RecordRow(job, "all_conflicts", int64(len(outRows)))
 	}
+
+	if err != nil {
+		// Attach high-signal context: table, columns, and a typed sample row.
+		bad := ""
+		if len(outRows) > 0 {
+			// If you want: locate "row_hash" index generically; for now just sample first row.
+			bad = fmtRowForCols(cols, outRows[0])
+		}
+		return 0, dropped, fmt.Errorf(
+			"insert facts failed table=%s cols=%v bad=%s: %w",
+			fact.Table.Name, cols, bad, err,
+		)
+	}
+
+	if affected > 0 {
+		metrics.RecordRow(job, "inserted", int64(affected))
+	}
+
 	return int(affected), dropped, nil
 }
+
+//// insertFactBatch builds and inserts a batch of fact rows for a single fact table.
+////
+//// For each input *transformer.Row in the batch, it produces an output row matching
+//// the fact's TargetColumns by copying source fields and/or resolving dimension IDs
+//// from the provided lookup cache.
+////
+//// Leniency:
+////   - If lenient is true, rows with missing lookup keys or lookup misses are dropped
+////     (counted as dropped) rather than producing an error.
+////   - If lenient is false, missing lookup keys or lookup misses are fatal.
+////
+//// Dedupe / deadlock avoidance:
+////   - If ON CONFLICT / dedupe is enabled for the fact table, output rows are sorted
+////     by conflict keys to impose a stable lock acquisition order in Postgres.
+////
+//// Metrics:
+////   - Records loader-side row metrics (inserted / dropped / all_conflicts) so
+////     etl.records.total is not limited to "processed" rows from the stream stack.
+//func (e *Engine2Pass) insertFactBatch(
+//	ctx context.Context,
+//	fact indexedFact,
+//	batch []*transformer.Row,
+//	cache map[string]map[string]int64,
+//	lenient bool,
+//) (inserted int, dropped int, _ error) {
+//	if len(batch) == 0 {
+//		return 0, 0, nil
+//	}
+//
+//	cols := fact.TargetColumns
+//	outRows := make([][]any, 0, len(batch))
+//
+//	for _, r := range batch {
+//		rowOut := make([]any, len(fact.Columns))
+//		drop := false
+//
+//		for i, c := range fact.Columns {
+//			if c.Lookup != nil {
+//				dimTable := c.Lookup.Table
+//				matchIdx := c.Lookup.MatchFieldIndex
+//				key := normalizeKey(r.V[matchIdx])
+//				if key == "" {
+//					if c.Nullable {
+//						rowOut[i] = nil
+//						continue
+//					}
+//					if lenient {
+//						drop = true
+//						break
+//					}
+//					return inserted, dropped, fmt.Errorf("fact %s: empty lookup key table=%s", fact.Table.Name, dimTable)
+//				}
+//
+//				cm := cache[dimTable]
+//				id, ok := int64(0), false
+//				if cm != nil {
+//					id, ok = cm[key]
+//				}
+//				if !ok {
+//					if lenient {
+//						drop = true
+//						break
+//					}
+//					return inserted, dropped, fmt.Errorf("fact %s: lookup miss table=%s key=%q", fact.Table.Name, dimTable, key)
+//				}
+//
+//				rowOut[i] = id
+//				continue
+//			}
+//
+//			if c.SourceFieldIndex >= 0 {
+//				rowOut[i] = r.V[c.SourceFieldIndex]
+//				continue
+//			}
+//			rowOut[i] = nil
+//		}
+//
+//		if drop {
+//			dropped++
+//			continue
+//		}
+//		outRows = append(outRows, rowOut)
+//	}
+//
+//	// Optional: report fact-stage drops (these are not validation drops; they’re lookup/lenient drops).
+//	if dropped > 0 {
+//		metrics.RecordRow(cfgJobFromCtx(ctx), "fact_dropped", uint64(dropped))
+//	}
+//
+//	if len(outRows) == 0 {
+//		return 0, dropped, nil
+//	}
+//
+//	// Stable lock acquisition order when ON CONFLICT is enabled.
+//	if len(fact.DedupeIndices) > 0 && len(outRows) > 1 {
+//		sort.SliceStable(outRows, func(i, j int) bool {
+//			a := outRows[i]
+//			b := outRows[j]
+//			for _, idx := range fact.DedupeIndices {
+//				ka := normalizeKey(a[idx])
+//				kb := normalizeKey(b[idx])
+//				if ka == kb {
+//					continue
+//				}
+//				return ka < kb
+//			}
+//			return false
+//		})
+//	}
+//
+//	affected, err := e.Repo.InsertFactRows(ctx, fact.Table.Name, cols, outRows, fact.DedupeColumns)
+//
+//	if err == nil && affected == 0 {
+//		log.Printf("debug: op=insert all_conflicts table=%s rows=%d", fact.Table.Name, len(outRows))
+//		metrics.RecordRow(cfgJobFromCtx(ctx), "all_conflicts", uint64(len(outRows)))
+//	}
+//
+//	if err != nil {
+//		bad := ""
+//		if len(outRows) > 0 {
+//			bad = fmtRowForCols(cols, outRows[0])
+//		}
+//		return 0, dropped, fmt.Errorf(
+//			"insert facts failed table=%s cols=%v bad=%s: %w",
+//			fact.Table.Name, cols, bad, err,
+//		)
+//	}
+//
+//	if affected > 0 {
+//		metrics.RecordRow(cfgJobFromCtx(ctx), "inserted", uint64(affected))
+//	}
+//
+//	return int(affected), dropped, nil
+//}
 
 // dedupeTypedKeys performs bounded dedupe for a slice of typed values.
 // It uses normalizeKey for keying but preserves the first typed value.
@@ -929,3 +1232,50 @@ func typedBindValue(v any) any {
 type discardWriter struct{}
 
 func (discardWriter) Write(p []byte) (n int, err error) { return len(p), nil }
+
+// fmtAny formats a value with its Go type, truncating long strings/bytes.
+func fmtAny(v any) string {
+	if v == nil {
+		return "nil"
+	}
+
+	switch x := v.(type) {
+	case string:
+		const max = 200
+		if len(x) > max {
+			return fmt.Sprintf("%q(string,len=%d)", x[:max]+"…", len(x))
+		}
+		return fmt.Sprintf("%q(string)", x)
+	case []byte:
+		const max = 64
+		if len(x) > max {
+			return fmt.Sprintf("%x([]byte,len=%d)", x[:max], len(x))
+		}
+		return fmt.Sprintf("%x([]byte)", x)
+	default:
+		// Covers int/int64/float64/bool/time.Time/etc.
+		return fmt.Sprintf("%v(%T)", v, v)
+	}
+}
+
+func fmtRowForCols(cols []string, row []any) string {
+	n := len(cols)
+	if len(row) < n {
+		n = len(row)
+	}
+	var b strings.Builder
+	b.WriteByte('[')
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(cols[i])
+		b.WriteByte('=')
+		b.WriteString(fmtAny(row[i]))
+	}
+	if len(row) > n {
+		b.WriteString(", …")
+	}
+	b.WriteByte(']')
+	return b.String()
+}

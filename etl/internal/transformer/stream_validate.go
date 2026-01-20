@@ -141,7 +141,13 @@ func ValidateLoopRows(
 		}
 
 		// Forward; the downstream stage is responsible for honoring ctx.
-		out <- r
+		//		out <- r
+		select {
+		case out <- r:
+		case <-ctx.Done():
+			r.Free()
+		}
+
 	}
 }
 
