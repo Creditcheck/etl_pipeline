@@ -1,0 +1,48 @@
+#### Get top-level category urls ###
+# input: url of landing page 
+# output: links, one per line
+# first expand all categories, using the '?hp=1' parameter
+# links are assumed in format <a href class='homeMainCategoryButton' ...> ####
+go run get-subcategory-urls.go -url "https://www.firmy.cz/?hp=1" -class "homeMainCategoryButton" -single -depth 1 -n 1 > categories
+
+#### Get subcategory urls ####
+# input: text file with a list of top-level category url's
+# output: list of links
+# description: crawls around looking for <a class="[class]"
+go run get-subcategory-urls.go -depth 20 -i categories -n 7 -class category > subcategory-urls
+
+#### Generate links to subcategory pages ###
+# description: figures out how many subpages are in each category, and outputs them all as a list
+# input: stdin. text file 
+# output: list of all category/subcategory URLs
+# TODO: refactor: extract hardcoded patterns so the script can be reused
+counter=0; 
+cat subcategory-urls | while read line; do 
+	counter=$((counter + 1)); 
+	echo $counter; 
+	./generate-subcategory-urls -url "$line" -getUrl
+done > output-$(date +%F)
+
+#### Get subcategory pages ####
+time go run get-ico.go -n 3 -i subcategory-urls-extended -o subcategories >> subcategories.log
+# real    538m43.667s
+
+#### Extract 'detail' links from subcategory pages ####
+extract-html-experimental -mappings mappings-subcategory-page.json -dir subcategories > subcategories.json
+cat subcategories.json | jq -r '.[].href' > detail-links.all
+
+#### Get detail pages ####
+go run get-ico.go -o detail -i detail-links.remaining -n 2 -t 45s >> detail-links.log
+# note: dec 25, 2025: it gets a '0' response code one each day around 4am. this was killing the get-ico.go. may be fixed now
+
+#### (OPTIONAL) reduce detail pages - cut away excess tags ####
+# go run extract-inner-html.go -startElement "div.detailContainer" -dir detail
+# extract-inner-html -startElement "div.detailContainer" -n 8 -dir .
+# 257868 files
+# real    4m45.936s
+
+#### extract html to json ####
+time go run extract-html-elements.go -mappings mappings-detail.json -dir detail > detail-$(date +%F).json
+real    1m37.575s
+user    1m27.362s
+sys     0m9.971s

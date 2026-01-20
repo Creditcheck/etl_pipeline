@@ -1,31 +1,33 @@
-# ---------- build stage ----------
 FROM golang:1.25-alpine AS builder
 
-WORKDIR /workspace
-
-RUN apk add --no-cache git
-
-COPY go.mod go.sum ./
-RUN go mod download
-
+WORKDIR /app
 COPY . .
 
-# Build Linux binary
-RUN cd cmd/etl_multi && \
-    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -o /out/etl-linux
+# Build etl and probe binaries.
+RUN set -eu; \
+  mkdir -p /app/bin; \
+  for d in ./cmd/*; do \
+    [ -d "$d" ] || continue; \
+    [ -f "$d/main.go" ] || continue; \
+    name="$(basename "$d")"; \
+    echo "==> building $name"; \
+    go build -o "/app/bin/$name" "./cmd/$name"; \
+  done
 
-# Build Windows binary
-#RUN cd cmd/etl && \
-#    CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
-#    go build -o /out/etl-windows.exe
+FROM alpine:3
 
-# ---------- runtime stage (Linux only) ----------
-FROM alpine:3.22
+RUN apk add bash jq
 
-RUN apk add --no-cache ca-certificates
+# Create non-root user/group
+RUN addgroup -S etl && adduser -S -G etl -h /home/etl etl
 
-COPY --from=builder /out/etl-linux /usr/local/bin/etl
+WORKDIR /app
+COPY --from=builder /app/bin/ /usr/local/bin/
+COPY --from=builder /app/tests/ /app/tests/
+COPY --from=builder /app/configs/ /app/configs/
 
-ENTRYPOINT ["/usr/local/bin/etl"]
+# directories for generated configs and sqlite DB (owned by non-root)
+RUN mkdir -p /configs /data/db /home/etl && \
+    chown -R etl:etl /configs /data/db /home/etl /app
 
+USER etl

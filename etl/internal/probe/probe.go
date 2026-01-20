@@ -1,3 +1,20 @@
+// Package probe implements dataset sampling, schema inference, and
+// ETL pipeline generation.
+//
+// The probe package is responsible for:
+//   - Fetching a bounded sample of input data (file:// or http(s)://)
+//   - Detecting file format (CSV, JSON, XML)
+//   - Inferring column names, types, and contracts
+//   - Generating config.Pipeline objects for cmd/etl
+//   - Optionally producing multi-table configs for cmd/etl_multi
+//
+// Design constraints:
+//   - Sampling must be bounded in memory and time.
+//   - All inference is best-effort and must never fail the probe run.
+//   - Generated pipelines must be safe defaults and easy to refine manually.
+//
+// This package is intentionally dependency-light and side-effect free,
+// except where explicitly documented (e.g., SaveSample).
 package probe
 
 import (
@@ -131,6 +148,20 @@ var httpPeekFn = func(ctx context.Context, url string, n int, insecure bool) ([]
 //   - readCSVSample   → headers+records (best-effort, skip bad/misaligned rows)
 //   - inferTypes      → per-column types
 //   - (optionally) build + pretty-print JSON config (internal jsonConfig shape)
+//
+// Probe runs the legacy CSV-only sampling and inference pipeline.
+//
+// It fetches a bounded byte sample from the configured URL, infers headers
+// and column types, and returns either:
+//   - A human-readable CSV summary, or
+//   - A JSON configuration object (legacy format)
+//
+// This function exists for backward compatibility and SHOULD NOT be used
+// for new ETL pipelines. New callers should prefer ProbeURLAny.
+//
+// Errors:
+//   - Returns an error if the sample cannot be fetched or parsed.
+//   - Inference errors are handled leniently and do not fail the probe.
 func Probe(opt Options) (Result, error) {
 	res := Result{}
 
@@ -250,7 +281,7 @@ const (
 	formatJSON
 )
 
-// ProbeURLAny runs the probe pipeline and returns either a config.Pipeline
+// this may be outdated: ... ProbeURLAny runs the probe pipeline and returns either a config.Pipeline
 // (single-table) or a multi-table JSON object (as map[string]any).
 //
 // It ALSO returns an optional report string (empty unless Options.Report=true).
@@ -260,6 +291,26 @@ const (
 //     all normalized fields (hash transform).
 //   - In multi-table mode, ProbeURLAny can optionally break selected fields into
 //     dimension tables; if fields aren't provided, it uses sample uniqueness.
+// end...this may be outdated section
+
+// ProbeURLAny runs the unified probe pipeline and returns either a single-table
+// or multi-table ETL configuration.
+//
+// Behavior:
+//   - Automatically detects CSV, JSON, or XML input.
+//   - Generates a config.Pipeline with safe defaults.
+//   - Always injects a deterministic row_hash column.
+//   - Optionally emits a multi-table configuration when Multitable is true.
+//
+// Return values:
+//   - out: either config.Pipeline (single-table) or map[string]any (multi-table)
+//   - report: optional human-readable uniqueness report
+//   - err: fatal probe errors only (sampling, parsing, config generation)
+//
+// Invariants:
+//   - row_hash is always present and required in single-table output.
+//   - The hash transform never includes row_hash in its own input fields.
+
 func ProbeURLAny(ctx context.Context, opt Options) (out any, report string, err error) {
 	p, sampleStats, err := probeURLWithStats(ctx, opt)
 	if err != nil {
@@ -360,6 +411,8 @@ func probeURLWithStats(ctx context.Context, opt Options) (config.Pipeline, sampl
 	}
 }
 
+// sniffFormat infers the input file format from a byte sample.
+// Detection is heuristic and intentionally conservative.
 func sniffFormat(sample []byte) fileFormat {
 	trim := bytes.TrimSpace(sample)
 	if len(trim) == 0 {
@@ -390,6 +443,19 @@ func saveSample(name string, ff fileFormat, sample []byte) error {
 
 // -------------------- row_hash injection (single-table) --------------------
 
+// injectRowHashIntoSingle mutates a single-table pipeline to ensure row_hash
+// is consistently generated, validated, and stored.
+//
+// Specifically, it:
+//   - Ensures row_hash exists in storage columns
+//   - Ensures the validate contract requires row_hash
+//   - Ensures a hash transform exists and runs before validation
+//
+// This function is idempotent and safe to call multiple times.
+//
+// IMPORTANT:
+//   - row_hash MUST NOT be included in the hash input fields.
+//   - The hash transform is deterministic across runs.
 func injectRowHashIntoSingle(p *config.Pipeline) {
 	if p == nil {
 		return
@@ -425,12 +491,33 @@ func injectRowHashIntoSingle(p *config.Pipeline) {
 	ensureHashTransform(p)
 }
 
+// ensureHashTransform ensures a hash transform exists and is correctly configured.
+//
+// The hash transform:
+//   - Computes row_hash using all non-row_hash columns
+//   - Uses a stable, deterministic configuration (sha256 + hex)
+//   - Is inserted before validate when possible
+//
+// If a hash transform already exists, it is replaced to enforce invariants.
+//
+// Edge cases:
+//   - If no validate transform exists, the hash transform is appended.
+//   - If the pipeline is nil, the function is a no-op.
 func ensureHashTransform(p *config.Pipeline) {
 	if p == nil {
 		return
 	}
 
-	cols := append([]string(nil), p.Storage.DB.Columns...)
+	// NOTE: the hash transform's input fields MUST NOT include the target field
+	// itself (row_hash). Including it would make the hash value depend on its
+	// previous value and can create unstable results across runs.
+	cols := make([]string, 0, len(p.Storage.DB.Columns))
+	for _, c := range p.Storage.DB.Columns {
+		if c == "row_hash" {
+			continue
+		}
+		cols = append(cols, c)
+	}
 	sort.Strings(cols)
 
 	hashIdx := -1
@@ -519,9 +606,74 @@ func containsString(ss []string, v string) bool {
 
 const distinctCapPerColumn = 10000
 
+// computeUniquenessFromCSVSample computes bounded per-column uniqueness statistics
+// from a sampled CSV dataset.
+//
+// This helper is used by ProbeURLAny when Options.Report is enabled for CSV inputs.
+// It scans the sampled rows and estimates how "unique" each column is, which is
+// useful for:
+//   - generating a human-readable uniqueness report (formatUniquenessReport), and
+//   - auto-selecting breakout/dimension candidates in multi-table configs
+//     (autoSelectBreakouts), when the user has not specified BreakoutFields.
+//
+// # What it measures
+//
+// For each column, this function computes:
+//   - PerColumnTotal[col]:
+//     the number of sampled rows where the column has a "meaningful" value.
+//     A value is meaningful if strings.TrimSpace(value) != "".
+//     This is the correct denominator for uniqueness ratios.
+//   - PerColumnDistinct[col]:
+//     the number of distinct meaningful values observed for the column,
+//     bounded by distinctCapPerColumn.
+//   - PerColumnCapped[col]:
+//     whether distinct counting was capped for this column.
+//
+// TotalRows is also tracked as the number of sampled rows processed overall,
+// but is informational only. It MUST NOT be used as the denominator for ratios.
+// Ratios should always use PerColumnTotal for the given column.
+//
+// # Memory and runtime safety
+//
+// Distinct counting is bounded by distinctCapPerColumn per column.
+// Once the cap is reached for a column:
+//   - stats.PerColumnCapped[col] is set to true, and
+//   - the backing distinct set for that column is dropped (set to nil)
+//     to release memory and prevent further growth.
+//
+// This ensures the probe remains safe even when a sampled column has extremely
+// high cardinality (e.g., UUIDs, row-level IDs).
+//
+// Input requirements and edge cases
+//
+//   - rows is expected to be a rectangular matrix where each record has the
+//     same number of fields as normalizedCols.
+//   - If a row has a mismatched field count, it is skipped.
+//     (Probe sampling is best-effort; bad rows must not fail the run.)
+//   - If rows is empty or normalizedCols is empty, an empty stats object is returned.
+//   - Empty / whitespace-only values are treated as missing and do not contribute
+//     to totals or distinct counts.
+//
+// # Ordering guarantees
+//
+// stats.ColumnOrder is a stable copy of normalizedCols. This ordering is used
+// by the reporting and breakout-selection logic to ensure deterministic output.
+//
+// # Errors
+//
+// This function never returns an error. Any malformed input is handled by
+// skipping rows/values as described above.
+//
+// Note: normalizedCols must match the column order of the sample rows.
+// The caller is responsible for ensuring alignment.
 func computeUniquenessFromCSVSample(rows [][]string, normalizedCols []string) sampleUniqueness {
 	stats := sampleUniqueness{
-		TotalRows:         0,
+		TotalRows: 0,
+
+		// PerColumnTotal is required for meaningful uniqueness ratios and reporting.
+		// It counts only rows where the column had a meaningful value.
+		PerColumnTotal: make(map[string]int, len(normalizedCols)),
+
 		PerColumnDistinct: make(map[string]int, len(normalizedCols)),
 		PerColumnCapped:   make(map[string]bool, len(normalizedCols)),
 		ColumnOrder:       append([]string(nil), normalizedCols...),
@@ -543,16 +695,24 @@ func computeUniquenessFromCSVSample(rows [][]string, normalizedCols []string) sa
 		stats.TotalRows++
 
 		for i := range normalizedCols {
-			if stats.PerColumnCapped[normalizedCols[i]] {
-				continue
-			}
+			col := normalizedCols[i]
+
+			// Only count rows where this column has a meaningful value.
 			v := strings.TrimSpace(r[i])
 			if v == "" {
 				continue
 			}
+
+			// Increment the per-column denominator.
+			stats.PerColumnTotal[col]++
+
+			// Distinct tracking (bounded).
+			if stats.PerColumnCapped[col] {
+				continue
+			}
 			sets[i][v] = struct{}{}
 			if len(sets[i]) >= distinctCapPerColumn {
-				stats.PerColumnCapped[normalizedCols[i]] = true
+				stats.PerColumnCapped[col] = true
 				sets[i] = nil
 			}
 		}
@@ -565,6 +725,7 @@ func computeUniquenessFromCSVSample(rows [][]string, normalizedCols []string) sa
 		}
 		stats.PerColumnDistinct[col] = len(sets[i])
 	}
+
 	return stats
 }
 
@@ -685,6 +846,16 @@ func computeUniquenessFromJSONRecords(recs []records.Record, columns []string) s
 	return stats
 }
 
+// autoSelectBreakouts heuristically selects dimension breakout candidates
+// based on column uniqueness ratios.
+//
+// Selection rules:
+//   - Excludes row_hash unconditionally.
+//   - Uses per-column denominators (rows where the column had a value).
+//   - Prefers columns with low-to-moderate uniqueness.
+//   - Caps selection at a small, fixed number for safety.
+//
+// The returned slice is deterministic and stable across runs.
 func autoSelectBreakouts(stats sampleUniqueness) []string {
 	// We need per-column denominators to compute meaningful ratios.
 	if len(stats.PerColumnTotal) == 0 {
@@ -998,6 +1169,59 @@ func buildMultiTableFromSingle(p config.Pipeline, stats sampleUniqueness, breako
 
 // -------------------- probeCSV/probeJSON/probeXML WithStats --------------------
 
+// probeCSVWithStats builds a single-table ETL pipeline config from a sampled CSV
+// input and also computes bounded uniqueness statistics for reporting and
+// multi-table breakout selection.
+//
+// This function exists as the CSV-specific entry in the unified probe pipeline.
+// It is used by probeURLWithStats after the file format has been detected as CSV.
+//
+// What it does
+//
+//  1. Sample normalization (safety):
+//     The input sample is truncated to the last newline ('\n') to avoid
+//     processing a partial trailing record. This prevents producing a
+//     misaligned row slice from an incomplete line.
+//
+//  2. CSV sample parsing:
+//     It parses the sample into:
+//     - headers: the raw CSV header row (un-normalized)
+//     - rows:    sampled records, each aligned with the header column order
+//
+//     Parsing is best-effort: malformed rows may be skipped by readCSVSample,
+//     but fatal CSV parsing errors are returned.
+//
+//  3. Pipeline generation:
+//     It delegates to probeCSV to construct a config.Pipeline containing:
+//     - file source
+//     - csv parser options (header map, expected fields, trim behavior)
+//     - coerce + validate transform chain
+//     - backend-specific storage defaults
+//
+//  4. Uniqueness statistics:
+//     It computes per-column uniqueness statistics (distinct counts + ratios)
+//     from the sampled rows. These stats are later used to:
+//     - render a human-readable uniqueness report (formatUniquenessReport), and
+//     - auto-select dimension breakouts in multi-table mode (autoSelectBreakouts).
+//
+// Important invariants
+//
+//   - Column alignment matters: uniqueness computation assumes that the i-th value
+//     in each row corresponds to the i-th entry in the provided normalized column
+//     slice. This function therefore derives the normalized column list directly
+//     from the sampled header order to ensure index alignment.
+//
+// Errors
+//
+//   - Returns an error if CSV parsing fails (readCSVSample).
+//   - Returns an error if probeCSV fails to generate a pipeline config.
+//   - Uniqueness computation never fails; it is bounded and best-effort.
+//
+// Performance and memory behavior
+//
+//   - Uniqueness counting is bounded per column by distinctCapPerColumn.
+//   - Parsing and uniqueness are limited to the sampled rows only; this function
+//     never reads the full dataset.
 func probeCSVWithStats(sample []byte, opt Options) (config.Pipeline, sampleUniqueness, error) {
 	// Cut sample at last newline to avoid a half-line record at the end.
 	if i := bytes.LastIndexByte(sample, '\n'); i > 0 {
@@ -1014,8 +1238,24 @@ func probeCSVWithStats(sample []byte, opt Options) (config.Pipeline, sampleUniqu
 		return config.Pipeline{}, sampleUniqueness{}, err
 	}
 
-	stats := computeUniquenessFromCSVSample(rows, p.Storage.DB.Columns)
-	_ = headers
+	// Compute uniqueness using the normalized header order derived from the
+	// sampled rows, not p.Storage.DB.Columns.
+	//
+	// Why:
+	//   - readCSVSample returns row slices ordered exactly as the CSV header.
+	//   - probeCSV produces p.Storage.DB.Columns from normalized header names,
+	//     which SHOULD match that order, but the storage column list may diverge
+	//     in the future (e.g., if a caller injects columns, reorders columns, or
+	//     applies mapping logic).
+	//   - Uniqueness stats depend on column index alignment between rows[i] and
+	//     normalizedCols[i]. Using the sampled header order is the safest source
+	//     of truth.
+	normalizedCols := make([]string, 0, len(headers))
+	for _, h := range headers {
+		normalizedCols = append(normalizedCols, truncateFieldName(normalizeFieldName(h)))
+	}
+
+	stats := computeUniquenessFromCSVSample(rows, normalizedCols)
 	return p, stats, nil
 }
 
@@ -1310,10 +1550,10 @@ func probeCSV(sample []byte, opt Options) (config.Pipeline, error) {
 	// Runtime: conservative defaults; user may tune later.
 	p.Runtime = config.RuntimeConfig{
 		ReaderWorkers:    1,
-		TransformWorkers: 1,
+		TransformWorkers: 2,
 		LoaderWorkers:    1,
-		BatchSize:        1,
-		ChannelBuffer:    1000,
+		BatchSize:        512,
+		ChannelBuffer:    256,
 	}
 
 	// Parser config.
@@ -1398,7 +1638,7 @@ func probeXML(sample []byte, opt Options) (config.Pipeline, error) {
 
 	p.Runtime = config.RuntimeConfig{
 		ReaderWorkers:    1,
-		TransformWorkers: 1,
+		TransformWorkers: 2,
 		LoaderWorkers:    1,
 		BatchSize:        5000,
 		ChannelBuffer:    1000,
@@ -1513,6 +1753,8 @@ func defaultDBConfigForBackend(backend, name string, columns []string) config.DB
 // Normalization helpers (used by both legacy + unified probes)
 // ----------------------------------------------------------------------------
 
+// truncateFieldName enforces backend identifier length limits while
+// preserving UTF-8 validity.
 func truncateFieldName(s string) string {
 	const maxLen = 63
 	if len(s) <= maxLen {
@@ -1533,6 +1775,8 @@ func truncateFieldName(s string) string {
 	return string(b[:cut])
 }
 
+// normalizeFieldName converts an arbitrary input string into a safe,
+// lowercase identifier suitable for column and table names.
 func normalizeFieldName(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
