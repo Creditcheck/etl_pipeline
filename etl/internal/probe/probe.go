@@ -20,6 +20,8 @@ package probe
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1761,89 +1763,70 @@ func defaultDBConfigForBackend(backend, name string, columns []string) config.DB
 // Normalization helpers (used by both legacy + unified probes)
 // ----------------------------------------------------------------------------
 
+const maxDBFieldLength = 63
+
 // truncateFieldName enforces backend identifier length limits while
 // preserving UTF-8 validity.
 func truncateFieldName(s string) string {
-	return EnforceStringLength(s, maxDBFieldLength)
-
-	const maxLen = 63
-	if len(s) <= maxLen {
-		return s
-	}
-	// Ensure we cut on UTF-8 boundary.
-	b := []byte(s)
-	if len(b) <= maxLen {
-		return s
-	}
-	cut := maxLen
-	for cut > 0 && !utf8.Valid(b[:cut]) {
-		cut--
-	}
-	if cut <= 0 {
-		return s[:maxLen]
-	}
-	return string(b[:cut])
+	return EnforceDBIdentifierLength(s, maxDBFieldLength)
 }
 
-const maxDBFieldLength = 63
-
-// EnforceStringLength truncates s to ensure it is no longer than length bytes,
-// while preserving both a meaningful prefix and suffix.
+// EnforceDBIdentifierLength returns a database-safe identifier that fits within
+// maxLen bytes while remaining stable across runs.
 //
-// This helper is designed for database identifier constraints (for example,
-// PostgreSQL limits identifiers to 63 bytes). Naively truncating identifiers
-// from the right can cause collisions when many columns share a long prefix
-// (e.g., nested JSON paths, verbose CSV headers). To reduce collisions while
-// retaining readability, this function keeps both the start and end of the
-// input string and inserts an underscore separator:
+// Best practice for DB identifier limits (e.g., Postgres identifiers are limited
+// to 63 bytes) is to preserve a readable prefix and append a short, stable hash
+// suffix derived from the *full* input. This dramatically reduces collision risk
+// compared to naive truncation and avoids the ambiguity of keeping only the
+// first N characters.
 //
-//   - If len(s) <= length: s is returned unchanged.
-//   - Otherwise:
-//     prefix := first (length/2 - 1) bytes (UTF-8 safe)
-//     suffix := last  (length/2 - 1) bytes (UTF-8 safe)
-//     result := prefix + "_" + suffix
-//
-// The output is guaranteed to be <= length bytes and UTF-8 valid.
+// Behavior:
+//   - If len(normalized) <= maxLen: returns normalized unchanged.
+//   - Otherwise: returns "<prefix>__<hash>", where:
+//   - prefix is a UTF-8 safe byte prefix of normalized
+//   - hash is the first hashLen hex chars of sha256(normalized)
 //
 // Notes:
-//   - length is interpreted in bytes, matching how most SQL engines enforce
-//     identifier length limits.
-//   - The function is conservative: if length is too small to hold a useful
-//     "prefix_suffix" form, it falls back to a simple UTF-8 safe truncation.
-func EnforceStringLength(s string, length int) string {
-	if length <= 0 {
+//   - maxLen is interpreted as bytes (matching Postgres behavior).
+//   - The output is guaranteed to be <= maxLen bytes and valid UTF-8.
+func EnforceDBIdentifierLength(normalized string, maxLen int) string {
+	if maxLen <= 0 {
 		return ""
 	}
-	if len(s) <= length {
-		return s
+	if len(normalized) <= maxLen {
+		return normalized
 	}
 
-	// Need at least 3 bytes to form "a_b" minimally.
-	if length < 3 {
-		return utf8SafePrefix(s, length)
+	const (
+		sep     = "__"
+		hashLen = 8 // short on purpose; collision risk is extremely low in practice
+	)
+
+	// If maxLen is too small to hold sep+hash, fall back to a UTF-8 safe truncation.
+	minNeeded := len(sep) + hashLen
+	if maxLen <= minNeeded {
+		return utf8SafePrefix(normalized, maxLen)
 	}
 
-	// Keep both ends: (50% - 1) + "_" + (50% - 1)
-	half := length / 2
-	prefixLen := half - 1
-	suffixLen := half - 1
+	// Compute a stable short hash of the full input.
+	sum := sha256.Sum256([]byte(normalized))
+	hash := hex.EncodeToString(sum[:])
+	hash = hash[:hashLen]
 
-	// If length is odd, give the extra byte to the suffix (stable choice).
-	// Example: length=63 => half=31 => prefix=30, suffix=30, plus "_" => 61.
-	// We then add 2 bytes to suffix by recomputing remainder below.
-	remainder := length - (prefixLen + 1 + suffixLen)
-	suffixLen += remainder
+	// Reserve space for "__" + hash.
+	prefixMax := maxLen - minNeeded
+	prefix := utf8SafePrefix(normalized, prefixMax)
 
-	prefix := utf8SafePrefix(s, prefixLen)
-	suffix := utf8SafeSuffix(s, suffixLen)
+	// Avoid ugly trailing underscores before the separator.
+	prefix = strings.TrimRight(prefix, "_")
 
-	out := prefix + "_" + suffix
-	if len(out) <= length {
+	out := prefix + sep + hash
+	if len(out) <= maxLen {
 		return out
 	}
 
-	// Defensive fallback (should not happen, but keep invariant).
-	return utf8SafePrefix(out, length)
+	// Defensive: ensure the invariant even if trimming changed byte counts.
+	return utf8SafePrefix(out, maxLen)
 }
 
 // utf8SafePrefix returns the first n bytes of s without splitting UTF-8 runes.
@@ -1863,30 +1846,6 @@ func utf8SafePrefix(s string, n int) string {
 		return ""
 	}
 	return string(b[:cut])
-}
-
-// utf8SafeSuffix returns the last n bytes of s without splitting UTF-8 runes.
-func utf8SafeSuffix(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	if len(s) <= n {
-		return s
-	}
-	b := []byte(s)
-	start := len(b) - n
-	if start < 0 {
-		start = 0
-	}
-
-	// Move start forward until the slice is valid UTF-8.
-	for start < len(b) && !utf8.Valid(b[start:]) {
-		start++
-	}
-	if start >= len(b) {
-		return ""
-	}
-	return string(b[start:])
 }
 
 // normalizeFieldName converts an arbitrary input string into a safe,
