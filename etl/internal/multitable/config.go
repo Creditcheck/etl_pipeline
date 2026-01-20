@@ -67,4 +67,11 @@ type RuntimeConfig struct {
 	// DedupeDimensionKeysWithinBatch controls whether the engine performs a small
 	// in-memory dedupe inside each batch before calling EnsureDimensionKeys.
 	DedupeDimensionKeysWithinBatch bool `json:"dedupe_dimension_keys_within_batch"`
+
+	// ValidateLogFirstN controls debug logging for contract validation failures.
+	// When > 0, the validate stage logs the first N validation drop reasons.
+	//
+	// This is intended for troubleshooting mapping/type issues without turning the
+	// run into "policy=strict".
+	ValidateLogFirstN int `json:"validate_log_first_n"`
 }

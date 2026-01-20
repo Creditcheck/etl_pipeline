@@ -1,7 +1,6 @@
 FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
-#COPY ../etl .
 COPY etl .
 
 # Build etl and probe binaries.

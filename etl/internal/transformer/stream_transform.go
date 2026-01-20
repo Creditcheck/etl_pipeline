@@ -63,27 +63,43 @@ type CoerceSpec struct {
 //   - If coercion fails for any column, the row is dropped (fail-soft), the row
 //     is returned to the pool via r.Free(), and the error is reported through
 //     onReject, if provided.
-//   - The function never returns early on context cancellation. It drains the
-//     'in' channel, freeing each row, to avoid upstream goroutine leaks.
+//   - The function does not stop reading from 'in' when ctx is canceled. It
+//     continues draining 'in' to avoid upstream goroutine leaks and pipeline
+//     deadlocks.
+//
+// Cancellation & pooling:
+//
+//   - To prevent use-after-reuse races with pooled rows during cancellation
+//     unwinding, rows observed after ctx cancellation are NOT returned to the
+//     pool. Instead they are discarded via r.Drop().
+//   - This is intentional: during cancellation other goroutines may still be
+//     reading in-flight rows, and immediate re-pooling could allow the parser
+//     to reuse and overwrite the same Row concurrently.
+//
+// Channel send behavior:
+//
+//   - Forwarding to 'out' must not deadlock the pipeline. If ctx is canceled
+//     while attempting to send, the row is discarded via r.Drop() instead of
+//     blocking indefinitely.
 //
 // Parameters:
 //
 //   - ctx:      cancellation context for the overall pipeline. Cancellation
-//     prevents further forwarding to 'out' but rows are still drained
-//     from 'in' and freed.
+//     prevents further forwarding to 'out' but rows are still drained from 'in'.
 //   - columns:  positional list of column names; len(columns) must match len(r.V).
-//   - in:       upstream channel of pooled rows (typically from the tap stage).
-//   - out:      downstream channel for successfully coerced rows (to validator).
+//   - in:       upstream channel of pooled rows (typically from the parse/tap stage).
+//   - out:      downstream channel for successfully coerced rows (to hash/validator).
 //   - spec:     high-level coercion specification (types, date layout, etc.).
 //   - onReject: optional callback invoked when a row is dropped due to coercion
-//     failure. It receives the row's logical line number (if known)
-//     and a human-readable reason string.
+//     failure. It receives the row's logical line number (if known) and a
+//     human-readable reason string.
 //
 // Closing semantics:
 //
 //   - TransformLoopRows does not close 'out'; the caller must close it after all
 //     transform goroutines have completed.
-//   - All rows received from 'in' are eventually freed, regardless of ctx.
+//   - All rows received from 'in' are eventually released: rows on the normal
+//     path use r.Free(), and rows drained during cancellation use r.Drop().
 func TransformLoopRows(
 	ctx context.Context,
 	columns []string,
@@ -92,14 +108,9 @@ func TransformLoopRows(
 	spec CoerceSpec,
 	onReject func(line int, reason string),
 ) {
-	// buildCoercePlan is assumed to be your existing helper that compiles the
-	// high-level CoerceSpec into a hot-path plan with per-column coerce funcs.
-	//	plan := buildCoercePlan(columns, spec)
-
 	plan := compilePlan(columns, spec)
 
 	for r := range in {
-		// Even if ctx is canceled, we must *drain and Free*; do not return early.
 		if r == nil || len(r.V) != len(columns) {
 			if r != nil {
 				r.Free()
@@ -107,32 +118,30 @@ func TransformLoopRows(
 			continue
 		}
 
-		// If the context has been cancelled, we no longer forward rows
-		// downstream but we still drain and Free them to avoid backpressure.
+		// On cancellation: drain without re-pooling
 		select {
 		case <-ctx.Done():
-			r.Free()
+			r.Drop()
 			continue
 		default:
 		}
 
 		ok := true
 
-		// Hot path: normalize/convert in place, avoiding extra allocations.
 		for i := range columns {
 			raw := r.V[i]
 			if raw == nil {
-				// Keep NULL as-is.
 				continue
 			}
 
-			s, _ := raw.(string) // parser fills strings
-			// Normalize edge whitespace only when necessary to save CPU.
-			if builtin.HasEdgeSpace(s) {
-				s = strings.TrimSpace(s)
+			s, okStr := raw.(string)
+			if !okStr {
+				continue
 			}
 
-			// Empty string becomes NULL.
+			if s != "" && builtin.HasEdgeSpace(s) {
+				s = strings.TrimSpace(s)
+			}
 			if s == "" {
 				r.V[i] = nil
 				continue
@@ -142,8 +151,6 @@ func TransformLoopRows(
 				applyAnchorRealignment(columns, r, spec.Anchor)
 			}
 
-			// Delegate to the compiled coerce plan for this column. The plan may
-			// parse integers, dates, booleans, etc. in-place into r.V[i].
 			if !plan.cols[i].coerce(&r.V[i], s) {
 				ok = false
 				if onReject != nil {
@@ -157,13 +164,10 @@ func TransformLoopRows(
 		}
 
 		if !ok {
-			// Row failed coercion; drop it (fail-soft) and return to pool.
 			r.Free()
 			continue
 		}
 
-		// Successfully coerced row; forward to the next stage. The downstream
-		// consumer is now responsible for calling r.Free() after persistence.
 		out <- r
 	}
 }

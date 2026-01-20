@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"sort"
 	"strings"
@@ -202,10 +203,8 @@ func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*
 			select {
 			case tapRawCh <- r:
 			case <-ctx.Done():
-				// If the context is canceled, downstream work should stop promptly.
-				// We still forward ownership rules: the coerce/validate pipeline will
-				// not see this row, so we must free it here.
-				r.Free()
+				// On cancellation: do not re-pool
+				r.Drop()
 			}
 		}
 	}()
@@ -220,7 +219,7 @@ func StreamValidatedRows(ctx context.Context, cfg Pipeline, columns []string) (*
 	wgHash := startHashStage(ctx, cfg, columns, coercedRowCh, hashOutCh, hasHash, hashSpec)
 
 	// Stage 4: validate -> validCh.
-	wgValidate, err := startValidateStage(ctx, cfg, columns, hashOutCh, validCh, &validateDroppedCount, emitRowMetrics)
+	wgValidate, err := startValidateStage(ctx, cfg, columns, hashOutCh, validCh, &validateDroppedCount, emitRowMetrics, rt.ValidateLogFirstN)
 	if err != nil {
 		return nil, err
 	}
@@ -477,6 +476,7 @@ func startValidateStage(
 	validCh chan<- *transformer.Row,
 	validateDroppedCount *atomic.Uint64,
 	emitRowMetrics bool,
+	logFirstN int,
 ) (*sync.WaitGroup, error) {
 	requiredFields, typeMap, err := validateInputsFromPipeline(cfg.Transform)
 	if err != nil {
@@ -489,6 +489,11 @@ func startValidateStage(
 		defer wg.Done()
 		defer close(validCh)
 
+		// Debug: log the first N validation drop reasons (if enabled).
+		// Uses a separate counter so operators can distinguish "first N" logging
+		// from the overall validateDroppedCount metric.
+		var logged atomic.Int64
+
 		validateLoop(
 			ctx,
 			columns,
@@ -496,9 +501,22 @@ func startValidateStage(
 			typeMap,
 			in,
 			validCh,
-			func(_ int, _ string) {
+			func(rowIndex int, reason string) {
 				// ValidateLoopRows owns rejected rows and frees them.
 				// We only record a count/metric.
+				if logFirstN > 0 {
+					n := logged.Add(1)
+					if n <= int64(logFirstN) {
+						// Keep logs reasonably bounded even if the validator returns
+						// a very long message.
+						const maxReason = 1000
+						if len(reason) > maxReason {
+							reason = reason[:maxReason] + "…"
+						}
+						log.Printf("stage=validate drop=%d row_index=%d reason=%s", n, rowIndex, reason)
+					}
+				}
+
 				if validateDroppedCount != nil {
 					validateDroppedCount.Add(1)
 				}

@@ -31,3 +31,10 @@ go test ./... -count=1 -coverprofile=/tmp/coverage.out; go tool cover -html=/tmp
 ### ETL
 ### validate config
 etl -config configs/pipelines/technickeprohlidky.json -validate  
+
+### datadog
+export DD_CLIENT_API_KEY=""
+export DD_CLIENT_APP_KEY=""
+export DD_API_KEY=""
+export DD_SITE="datadoghq.eu"     # or datadoghq.com, us3.datadoghq.com, etc.
+export DD_ENV="dev" # "unit_tests", "staging", "prod"

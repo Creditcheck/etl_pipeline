@@ -502,6 +502,7 @@ func TestInsertFactBatch_StrictVsLenient(t *testing.T) {
 	}
 
 	for _, tt := range tests {
+		const job = "test"
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			repo.mu.Lock()
@@ -515,7 +516,7 @@ func TestInsertFactBatch_StrictVsLenient(t *testing.T) {
 				}
 			}()
 
-			inserted, dropped, err := e.insertFactBatch(context.Background(), fact, batch, cache, tt.lenient)
+			inserted, dropped, err := e.insertFactBatch(context.Background(), job, fact, batch, cache, tt.lenient)
 
 			if tt.wantErrLike != "" {
 				if err == nil {
@@ -792,6 +793,7 @@ func BenchmarkBuildIndexedPlan(b *testing.B) {
 //
 // Note: this benchmark uses a no-op repo and focuses on row construction cost.
 func BenchmarkInsertFactBatch(b *testing.B) {
+	const job = "benchmark"
 	fact := indexedFact{
 		Table: storage.TableSpec{Name: "facts"},
 		TargetColumns: []string{
@@ -833,7 +835,7 @@ func BenchmarkInsertFactBatch(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, _, err := e.insertFactBatch(context.Background(), fact, batch, cache, false)
+		_, _, err := e.insertFactBatch(context.Background(), job, fact, batch, cache, false)
 		if err != nil {
 			b.Fatalf("insertFactBatch() err=%v", err)
 		}

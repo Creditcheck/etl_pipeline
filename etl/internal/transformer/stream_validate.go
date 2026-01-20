@@ -28,11 +28,21 @@ import (
 //     - "date"  : time.Time (non-zero) or empty string for nullable
 //
 // Rows that fail either check are dropped (fail-soft) and optionally reported
-// via onReject. The function NEVER returns early on context cancellation; it
-// drains the entire input channel, freeing each row, to avoid upstream hangs.
+// via onReject.
+//
+// Drain-safety & cancellation:
+//
+//   - ValidateLoopRows never returns early on context cancellation; it continues
+//     draining 'in' until it is closed to avoid upstream hangs and goroutine leaks.
+//   - Forwarding valid rows is cancellation-aware: once ctx is canceled, valid rows
+//     are not forwarded to 'out' (which may no longer be serviced). Instead, the row
+//     is discarded via r.Drop() to avoid potential pooled-row reuse hazards during
+//     shutdown unwinding.
 //
 // Closing semantics:
-//   - The caller is responsible for closing 'out' after this function returns.
+//
+//   - ValidateLoopRows does not close 'out'; the caller must close it after all
+//     validate goroutines have completed.
 func ValidateLoopRows(
 	ctx context.Context,
 	columns []string, // positional order (same as TransformLoopRows)
@@ -68,7 +78,7 @@ func ValidateLoopRows(
 	}
 
 	for r := range in {
-		// Even if ctx is canceled, we must *drain and Free*; do not return early.
+		// Even if ctx is canceled, we must *drain*; do not return early.
 		if r == nil || len(r.V) != len(columns) {
 			if r != nil {
 				r.Free()
@@ -92,7 +102,7 @@ func ValidateLoopRows(
 		if ok {
 			for idx, meta := range colMetaByIdx {
 				if meta.kind == "" {
-					continue // no type constraint for this column
+					continue
 				}
 				if idx < 0 || idx >= len(r.V) {
 					continue
@@ -100,7 +110,6 @@ func ValidateLoopRows(
 
 				v := r.V[idx]
 				if v == nil {
-					// Nullable field: allowed for non-required columns.
 					continue
 				}
 
@@ -121,9 +130,7 @@ func ValidateLoopRows(
 						reason = fmt.Sprintf("field %q: %v not a valid date", columns[idx], v)
 					}
 				default:
-					// reason = fmt.Sprintf("field %q: %v is an unknown type", columns[idx], v)
-
-					// Unknown/unsupported kind -> no extra check; DB/COPY will enforce.
+					// Unknown kind: no extra check; DB layer enforces.
 				}
 
 				if !ok {
@@ -140,8 +147,14 @@ func ValidateLoopRows(
 			continue
 		}
 
-		// Forward; the downstream stage is responsible for honoring ctx.
-		out <- r
+		// Forward valid rows, but never block forever if downstream stopped.
+		select {
+		case out <- r:
+			// ownership transfers
+		case <-ctx.Done():
+			// Do not re-pool during cancellation unwinding.
+			r.Drop()
+		}
 	}
 }
 

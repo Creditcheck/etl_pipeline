@@ -1,0 +1,163 @@
+{
+  "job": "szrcr.cz_ukoncene_osoby",
+  "source": {
+    "kind": "file",
+    "file": {
+      "path": "/data/szrcr.cz_ukoncene_osoby_v_ros.csv"
+    }
+  },
+  "parser": {
+    "kind": "csv",
+    "options": {
+      "comma": ",",
+      "expected_fields": 4,
+      "has_header": true,
+      "trim_space": true,
+      "header_map": {
+        "ICO": "ico",
+        "DATZAN": "datzan",
+        "AGENDA": "agenda",
+        "DATPLAT": "datplat"
+      }
+    }
+  },
+  "runtime": {
+    "batch_size": 4192,
+    "channel_buffer": 1024,
+    "reader_workers": 1,
+    "transform_workers": 4,
+    "loader_workers": 4,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": true,
+    "debug_timings": false,
+    "validate_log_first_n": 25
+  },
+  "storage": {
+    "kind": "postgres",
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "mode": "multi_table",
+      "tables": [
+        {
+          "name": "public.company",
+          "auto_create_table": true,
+          "primary_key": { "name": "company_id", "type": "serial" },
+          "columns": [
+            { "name": "ico", "type": "text", "nullable": false }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["ico"] }
+          ],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [
+              { "target_column": "ico", "source_field": "ico" }
+            ],
+            "conflict": {
+              "target_columns": ["ico"],
+              "action": "do_nothing"
+            },
+            "returning": ["company_id", "ico"],
+            "cache": {
+              "key_column": "ico",
+              "value_column": "company_id",
+              "prewarm": false
+            }
+          }
+        },
+        {
+          "name": "public.ros04_osoby",
+          "auto_create_table": true,
+          "primary_key": { "name": "ros04_osoby_id", "type": "serial" },
+          "columns": [
+            {
+              "name": "company_id",
+              "type": "int",
+              "nullable": false,
+              "references": "public.company(company_id)"
+            },
+            { "name": "row_hash", "type": "text", "nullable": false },
+            { "name": "datzan", "type": "date", "nullable": true },
+            { "name": "agenda", "type": "text", "nullable": true },
+            { "name": "datplat", "type": "date", "nullable": true }
+          ],
+		  "constraints": [
+            { "kind": "unique", "columns": ["company_id", "row_hash"] }
+          ],
+          "load": {
+            "kind": "fact",
+            "dedupe": {
+              "action": "do_nothing",
+			  "conflict_columns": ["company_id", "row_hash"]
+            },
+            "from_rows": [
+              {
+                "target_column": "company_id",
+                "lookup": {
+                  "table": "public.company",
+                  "match": { "ico": "ico" },
+                  "return": "company_id",
+                  "on_missing": "insert"
+                }
+              },
+              { "target_column": "row_hash", "source_field": "row_hash" },
+
+              { "target_column": "datzan", "source_field": "datzan" },
+              { "target_column": "agenda", "source_field": "agenda" },
+              { "target_column": "datplat", "source_field": "datplat" }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "2006-01-02",
+        "types": {
+          "datzan": "date",
+          "datplat": "date"
+        }
+      }
+    },
+    {
+      "kind": "hash",
+      "options": {
+        "algorithm": "sha256",
+        "encoding": "hex",
+        "fields": [
+          "ico",
+          "datzan",
+          "agenda",
+          "datplat"
+        ],
+        "include_field_names": true,
+        "overwrite": true,
+        "separator": "\u001f",
+        "target_field": "row_hash",
+        "trim_space": true
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "policy": "lenient",
+        "contract": {
+          "name": "ros04_osoby",
+          "fields": [
+            { "name": "ico", "type": "text", "required": true },
+
+            { "name": "datzan", "type": "date", "layout": "2006-01-02" },
+            { "name": "agenda", "type": "text" },
+            { "name": "datplat", "type": "date", "layout": "2006-01-02" },
+
+            { "name": "row_hash", "type": "text", "required": true }
+          ]
+        }
+      }
+    }
+  ]
+}
+

@@ -1,0 +1,255 @@
+{
+  "job": "szrcr.cz_activni_osoby",
+  "source": {
+    "kind": "file",
+    "file": {
+	   "path": "/data/activni_osoby.csv"
+    }
+  },
+  "parser": {
+    "kind": "csv",
+    "options": {
+      "comma": ",",
+      "expected_fields": 24,
+      "has_header": true,
+      "trim_space": true,
+      "header_map": {
+        "ICO": "ico",
+        "AGENDA": "agenda",
+        "FIRMA": "firma",
+        "STAV": "stav",
+        "FORMA": "forma",
+        "KODADM": "kodadm",
+        "TEXTADR": "textadr",
+        "STAT": "stat",
+        "LIKV": "likv",
+        "OPAT": "opat",
+        "INS": "ins",
+        "NS": "ns",
+        "ZASTFO": "zastfo",
+        "PROV": "prov",
+        "DATVZN": "datvzn",
+        "DATZAN": "datzan",
+        "PRERUSENI": "preruseni",
+        "DARUIAN": "daruian",
+        "DATEXT": "datext",
+        "DAPSČ": "daps",
+        "OVM": "ovm",
+        "DATZAP": "datzap",
+        "DATZMĚN": "datzmn",
+        "DATPLAT": "datplat"
+      }
+    }
+  },
+  "runtime": {
+    "batch_size": 2048,
+    "channel_buffer": 512,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": false,
+    "loader_workers": 2,
+    "reader_workers": 1,
+    "transform_workers": 2,
+    "validate_log_first_n": 25
+  },
+  "storage": {
+    "kind": "postgres",
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "mode": "multi_table",
+      "tables": [
+        {
+          "name": "public.ros01_activni_osoby",
+          "auto_create_table": true,
+          "primary_key": {
+            "name": "ros01_activni_osoby_id",
+            "type": "serial"
+          },
+          "columns": [
+            { "name": "row_hash", "type": "text", "nullable": false },
+            { "name": "ico", "type": "text", "nullable": false },
+            { "name": "agenda", "type": "text", "nullable": true },
+            { "name": "firma", "type": "text", "nullable": true },
+            { "name": "stav", "type": "bigint", "nullable": true },
+            { "name": "forma", "type": "bigint", "nullable": true },
+            { "name": "kodadm", "type": "text", "nullable": true },
+            { "name": "textadr", "type": "text", "nullable": true },
+            { "name": "stat", "type": "bigint", "nullable": true },
+            { "name": "likv", "type": "bigint", "nullable": true },
+            { "name": "opat", "type": "bigint", "nullable": true },
+            { "name": "ins", "type": "bigint", "nullable": true },
+            { "name": "ns", "type": "bigint", "nullable": true },
+            { "name": "zastfo", "type": "bigint", "nullable": true },
+            { "name": "prov", "type": "bigint", "nullable": true },
+            { "name": "datvzn", "type": "date", "nullable": true },
+            { "name": "datzan", "type": "date", "nullable": true },
+            { "name": "preruseni", "type": "bigint", "nullable": true },
+            { "name": "daruian", "type": "text", "nullable": true },
+            { "name": "datext", "type": "text", "nullable": true },
+            { "name": "daps", "type": "text", "nullable": true },
+            { "name": "ovm", "type": "text", "nullable": true },
+
+            { "name": "datzap", "type": "date", "nullable": true },
+            { "name": "datzmn", "type": "date", "nullable": true },
+            { "name": "datplat", "type": "date", "nullable": true }
+          ],
+		  "constraints": [
+            { "kind": "unique", "columns": ["ico", "row_hash"] }
+          ],
+
+          "load": {
+            "kind": "fact",
+            "dedupe": {
+              "action": "do_nothing",
+              "conflict_columns": ["ico", "row_hash"]
+            },
+            "from_rows": [
+              { "source_field": "row_hash", "target_column": "row_hash" },
+
+              { "source_field": "ico", "target_column": "ico" },
+              { "source_field": "agenda", "target_column": "agenda" },
+              { "source_field": "firma", "target_column": "firma" },
+
+              { "source_field": "stav", "target_column": "stav" },
+              { "source_field": "forma", "target_column": "forma" },
+
+              { "source_field": "kodadm", "target_column": "kodadm" },
+              { "source_field": "textadr", "target_column": "textadr" },
+
+              { "source_field": "stat", "target_column": "stat" },
+              { "source_field": "likv", "target_column": "likv" },
+              { "source_field": "opat", "target_column": "opat" },
+              { "source_field": "ins", "target_column": "ins" },
+              { "source_field": "ns", "target_column": "ns" },
+              { "source_field": "zastfo", "target_column": "zastfo" },
+              { "source_field": "prov", "target_column": "prov" },
+
+              { "source_field": "datvzn", "target_column": "datvzn" },
+              { "source_field": "datzan", "target_column": "datzan" },
+
+              { "source_field": "preruseni", "target_column": "preruseni" },
+
+              { "source_field": "daruian", "target_column": "daruian" },
+              { "source_field": "datext", "target_column": "datext" },
+              { "source_field": "daps", "target_column": "daps" },
+              { "source_field": "ovm", "target_column": "ovm" },
+
+              { "source_field": "datzap", "target_column": "datzap" },
+              { "source_field": "datzmn", "target_column": "datzmn" },
+              { "source_field": "datplat", "target_column": "datplat" }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "2006-01-02",
+        "types": {
+          "stav": "bigint",
+          "forma": "bigint",
+          "stat": "bigint",
+          "likv": "bigint",
+          "opat": "bigint",
+          "ins": "bigint",
+          "ns": "bigint",
+          "zastfo": "bigint",
+          "prov": "bigint",
+          "preruseni": "bigint",
+
+          "datvzn": "date",
+          "datzan": "date",
+          "datzap": "date",
+          "datzmn": "date",
+          "datplat": "date"
+        }
+      }
+    },
+    {
+      "kind": "hash",
+      "options": {
+        "algorithm": "sha256",
+        "encoding": "hex",
+        "fields": [
+          "ico",
+          "agenda",
+          "firma",
+          "stav",
+          "forma",
+          "kodadm",
+          "textadr",
+          "stat",
+          "likv",
+          "opat",
+          "ins",
+          "ns",
+          "zastfo",
+          "prov",
+          "datvzn",
+          "datzan",
+          "preruseni",
+          "daruian",
+          "datext",
+          "daps",
+          "ovm",
+          "datzap",
+          "datzmn",
+          "datplat"
+        ],
+        "include_field_names": true,
+        "overwrite": true,
+        "separator": "\u001f",
+        "target_field": "row_hash",
+        "trim_space": true
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "policy": "lenient",
+        "contract": {
+          "name": "ros01_activni_osoby",
+          "fields": [
+            { "name": "ico", "type": "text", "required": true },
+
+            { "name": "agenda", "type": "text" },
+            { "name": "firma", "type": "text" },
+
+            { "name": "stav", "type": "bigint" },
+            { "name": "forma", "type": "bigint" },
+
+            { "name": "kodadm", "type": "text" },
+            { "name": "textadr", "type": "text" },
+
+            { "name": "stat", "type": "bigint" },
+            { "name": "likv", "type": "bigint" },
+            { "name": "opat", "type": "bigint" },
+            { "name": "ins", "type": "bigint" },
+            { "name": "ns", "type": "bigint" },
+            { "name": "zastfo", "type": "bigint" },
+            { "name": "prov", "type": "bigint" },
+
+            { "name": "datvzn", "type": "date", "layout": "2006-01-02" },
+            { "name": "datzan", "type": "date", "layout": "2006-01-02" },
+
+            { "name": "preruseni", "type": "bigint" },
+
+            { "name": "daruian", "type": "text" },
+            { "name": "datext", "type": "text" },
+            { "name": "daps", "type": "text" },
+            { "name": "ovm", "type": "text" },
+
+            { "name": "datzap", "type": "date", "layout": "2006-01-02" },
+            { "name": "datzmn", "type": "date", "layout": "2006-01-02" },
+            { "name": "datplat", "type": "date", "layout": "2006-01-02" },
+
+            { "name": "row_hash", "type": "text", "required": true }
+          ]
+        }
+      }
+    }
+  ]
+}
+
