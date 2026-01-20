@@ -25,12 +25,16 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 
 	"etl/internal/config"
 	"etl/internal/datasource/file"
 	"etl/internal/datasource/httpds"
 	"etl/internal/inspect"
+	csvparser "etl/internal/parser/csv"
 	xmlparser "etl/internal/parser/xml"
 	"etl/internal/schema"
 	"etl/pkg/records"
@@ -188,9 +192,11 @@ func Probe(opt Options) (Result, error) {
 
 	// Read CSV sample.
 	headers, rows, err := readCSVSample(b, delim)
+
 	if err != nil {
 		return res, fmt.Errorf("read csv: %w", err)
 	}
+	headers = csvparser.StripHeaderBOM(headers)
 	res.Headers = headers
 
 	// Normalize header names.
@@ -1232,6 +1238,7 @@ func probeCSVWithStats(sample []byte, opt Options) (config.Pipeline, sampleUniqu
 	if err != nil {
 		return config.Pipeline{}, sampleUniqueness{}, fmt.Errorf("parse csv sample: %w", err)
 	}
+	headers = csvparser.StripHeaderBOM(headers)
 
 	p, err := probeCSV(sample, opt)
 	if err != nil {
@@ -1484,6 +1491,7 @@ func probeCSV(sample []byte, opt Options) (config.Pipeline, error) {
 	if err != nil {
 		return config.Pipeline{}, fmt.Errorf("parse csv sample: %w", err)
 	}
+	headers = csvparser.StripHeaderBOM(headers)
 
 	types := inferTypes(headers, rows)
 	colLayouts := detectColumnLayouts(rows, types)
@@ -1776,17 +1784,29 @@ func truncateFieldName(s string) string {
 }
 
 // normalizeFieldName converts an arbitrary input string into a safe,
-// lowercase identifier suitable for column and table names.
+// lowercase ASCII identifier suitable for column and table names.
+//
+// Behavior:
+//   - strips UTF-8 BOM if present
+//   - removes diacritics using Unicode decomposition (č → c, á → a)
+//   - lowercases
+//   - converts separators to underscore
+//   - drops remaining non [a-z0-9_]
+//   - trims leading/trailing underscores
+//
+// This function is intentionally deterministic and locale-independent.
 func normalizeFieldName(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return ""
 	}
 
-	// Simple ASCII-ish normalization:
-	//  - lower
-	//  - replace whitespace with underscore
-	//  - remove non [a-z0-9_]
+	// Strip UTF-8 BOM defensively (legacy CSV paths).
+	s = strings.TrimPrefix(s, "\uFEFF")
+
+	// Normalize Unicode and strip accents (pčv → pcv).
+	s = stripAccents(s)
+
 	s = strings.ToLower(s)
 
 	var b strings.Builder
@@ -1794,25 +1814,21 @@ func normalizeFieldName(s string) string {
 
 	lastUnderscore := false
 	for _, r := range s {
-		if r == ' ' || r == '-' || r == '.' || r == '/' || r == '\\' || r == ':' || r == ';' {
+		switch {
+		case r == ' ' || r == '-' || r == '.' || r == '/' || r == '\\' || r == ':' || r == ';':
 			if !lastUnderscore {
 				b.WriteByte('_')
 				lastUnderscore = true
 			}
-			continue
-		}
-
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_':
 			b.WriteRune(r)
 			lastUnderscore = (r == '_')
-			continue
+		default:
+			// Drop everything else.
 		}
-
-		// Drop everything else.
 	}
 
-	out := strings.Trim(b.String(), "_")
-	return out
+	return strings.Trim(b.String(), "_")
 }
 
 func sampleJSONRecords(sample []byte, maxRecords int) ([]map[string]any, error) {
@@ -1915,4 +1931,21 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// stripAccents removes Unicode combining marks after NFD normalization.
+// Example: "pčv" -> "pcv", "Stát" -> "Stat".
+func stripAccents(s string) string {
+	t := norm.NFD.String(s)
+
+	b := strings.Builder{}
+	b.Grow(len(t))
+
+	for _, r := range t {
+		if unicode.Is(unicode.Mn, r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

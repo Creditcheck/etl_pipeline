@@ -1,0 +1,246 @@
+{
+  "job": "azet_sk_multi",
+  "source": {
+    "kind": "file",
+    "file": { "path": "/home/zippy/projects/data/azetsk-detail.json" }
+  },
+  "parser": {
+    "kind": "json",
+    "options": {
+      "allow_arrays": true,
+      "array_join_separator": " ~ ",
+      "header_map": {
+        "addressLocality": "addresslocality",
+        "breadcrumbs": "breadcrumbs",
+        "companyName": "companyname",
+        "description": "description",
+        "dic": "dic",
+        "email": "email",
+        "facebook_url": "facebook_url",
+        "ic_dph": "ic_dph",
+        "ico": "ico",
+        "instagram_url": "instagram_url",
+        "linkedin_url": "linkedin_url",
+        "logo_src": "logo_src",
+        "mobile": "mobile",
+        "name": "name",
+        "phone": "phone",
+        "postalCode": "postalcode",
+        "rating_class": "rating_class",
+        "rating_count": "rating_count",
+        "sidlo": "sidlo",
+        "source_file": "source_file",
+        "streetAddress": "streetaddress",
+        "twitter_url": "twitter_url",
+        "website": "website"
+      }
+    }
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "",
+        "types": {}
+      }
+    },
+    {
+      "kind": "hash",
+      "options": {
+        "target_field": "row_hash",
+        "fields": [
+          "addresslocality",
+          "breadcrumbs",
+          "companyname",
+          "description",
+          "dic",
+          "email",
+          "facebook_url",
+          "ic_dph",
+          "ico",
+          "instagram_url",
+          "linkedin_url",
+          "logo_src",
+          "mobile",
+          "name",
+          "phone",
+          "postalcode",
+          "rating_class",
+          "rating_count",
+          "sidlo",
+          "source_file",
+          "streetaddress",
+          "twitter_url",
+          "website"
+        ],
+        "include_field_names": true,
+        "trim_space": true,
+        "separator": "\u001f",
+        "algorithm": "sha256",
+        "encoding": "hex",
+        "overwrite": true
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "contract": {
+          "name": "azet_sk",
+          "fields": [
+            { "name": "ico", "type": "text", "required": true },
+            { "name": "row_hash", "type": "text", "required": true },
+
+            { "name": "addresslocality", "type": "text" },
+            { "name": "breadcrumbs", "type": "text" },
+            { "name": "companyname", "type": "text" },
+            { "name": "description", "type": "text" },
+            { "name": "dic", "type": "text" },
+            { "name": "email", "type": "text" },
+            { "name": "facebook_url", "type": "text" },
+            { "name": "ic_dph", "type": "text" },
+            { "name": "instagram_url", "type": "text" },
+            { "name": "linkedin_url", "type": "text" },
+            { "name": "logo_src", "type": "text" },
+            { "name": "mobile", "type": "text" },
+            { "name": "name", "type": "text" },
+            { "name": "phone", "type": "text" },
+            { "name": "postalcode", "type": "text" },
+            { "name": "rating_class", "type": "text" },
+            { "name": "rating_count", "type": "text" },
+            { "name": "sidlo", "type": "text" },
+            { "name": "source_file", "type": "text" },
+            { "name": "streetaddress", "type": "text" },
+            { "name": "twitter_url", "type": "text" },
+            { "name": "website", "type": "text" }
+          ]
+        },
+        "policy": "lenient"
+      }
+    }
+  ],
+  "storage": {
+    "kind": "postgres",
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "mode": "multi_table",
+      "tables": [
+        {
+          "name": "public.companies",
+          "auto_create_table": true,
+          "primary_key": { "name": "company_id", "type": "serial" },
+          "columns": [
+            { "name": "ico", "type": "varchar(64)", "nullable": false }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["ico"] }
+          ],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [
+              { "target_column": "ico", "source_field": "ico" }
+            ],
+            "conflict": { "target_columns": ["ico"], "action": "do_nothing" },
+            "returning": ["company_id", "ico"],
+            "cache": {
+              "key_column": "ico",
+              "value_column": "company_id",
+              "prewarm": false
+            }
+          }
+        },
+        {
+          "name": "public.azet_sk",
+          "auto_create_table": true,
+          "primary_key": { "name": "azet_sk_id", "type": "serial" },
+          "columns": [
+            {
+              "name": "company_id",
+              "type": "int",
+              "nullable": false,
+              "references": "public.companies(company_id)"
+            },
+            { "name": "row_hash", "type": "text", "nullable": false },
+
+            { "name": "addresslocality", "type": "text", "nullable": true },
+            { "name": "breadcrumbs", "type": "text", "nullable": true },
+            { "name": "companyname", "type": "text", "nullable": true },
+            { "name": "description", "type": "text", "nullable": true },
+            { "name": "dic", "type": "text", "nullable": true },
+            { "name": "email", "type": "text", "nullable": true },
+            { "name": "facebook_url", "type": "text", "nullable": true },
+            { "name": "ic_dph", "type": "text", "nullable": true },
+            { "name": "instagram_url", "type": "text", "nullable": true },
+            { "name": "linkedin_url", "type": "text", "nullable": true },
+            { "name": "logo_src", "type": "text", "nullable": true },
+            { "name": "mobile", "type": "text", "nullable": true },
+            { "name": "name", "type": "text", "nullable": true },
+            { "name": "phone", "type": "text", "nullable": true },
+            { "name": "postalcode", "type": "text", "nullable": true },
+            { "name": "rating_class", "type": "text", "nullable": true },
+            { "name": "rating_count", "type": "text", "nullable": true },
+            { "name": "sidlo", "type": "text", "nullable": true },
+            { "name": "source_file", "type": "text", "nullable": true },
+            { "name": "streetaddress", "type": "text", "nullable": true },
+            { "name": "twitter_url", "type": "text", "nullable": true },
+            { "name": "website", "type": "text", "nullable": true }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["company_id", "row_hash"] }
+          ],
+          "load": {
+            "kind": "fact",
+            "dedupe": {
+              "conflict_columns": ["company_id", "row_hash"],
+              "action": "do_nothing"
+            },
+            "from_rows": [
+              {
+                "target_column": "company_id",
+                "lookup": {
+                  "table": "public.companies",
+                  "match": { "ico": "ico" },
+                  "return": "company_id",
+                  "on_missing": "insert"
+                }
+              },
+              { "target_column": "row_hash", "source_field": "row_hash" },
+
+              { "target_column": "addresslocality", "source_field": "addresslocality" },
+              { "target_column": "breadcrumbs", "source_field": "breadcrumbs" },
+              { "target_column": "companyname", "source_field": "companyname" },
+              { "target_column": "description", "source_field": "description" },
+              { "target_column": "dic", "source_field": "dic" },
+              { "target_column": "email", "source_field": "email" },
+              { "target_column": "facebook_url", "source_field": "facebook_url" },
+              { "target_column": "ic_dph", "source_field": "ic_dph" },
+              { "target_column": "instagram_url", "source_field": "instagram_url" },
+              { "target_column": "linkedin_url", "source_field": "linkedin_url" },
+              { "target_column": "logo_src", "source_field": "logo_src" },
+              { "target_column": "mobile", "source_field": "mobile" },
+              { "target_column": "name", "source_field": "name" },
+              { "target_column": "phone", "source_field": "phone" },
+              { "target_column": "postalcode", "source_field": "postalcode" },
+              { "target_column": "rating_class", "source_field": "rating_class" },
+              { "target_column": "rating_count", "source_field": "rating_count" },
+              { "target_column": "sidlo", "source_field": "sidlo" },
+              { "target_column": "source_file", "source_field": "source_file" },
+              { "target_column": "streetaddress", "source_field": "streetaddress" },
+              { "target_column": "twitter_url", "source_field": "twitter_url" },
+              { "target_column": "website", "source_field": "website" }
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "runtime": {
+    "reader_workers": 1,
+    "transform_workers": 3,
+    "loader_workers": 4,
+    "batch_size": 1024,
+    "channel_buffer": 512,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": false
+  }
+}
+

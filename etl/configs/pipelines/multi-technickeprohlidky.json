@@ -1,0 +1,450 @@
+{
+  "job": "rsv_technicky_prohlidky_multi",
+  "source": {
+    "kind": "file",
+    "file": {
+      "path": "/home/zippy/projects/data/RSV_technicke_prohlidky.csv-1000000"
+    }
+  },
+  "runtime": {
+    "reader_workers": 1,
+    "transform_workers": 7,
+    "loader_workers": 1,
+    "batch_size": 4096,
+    "channel_buffer": 8192,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": false
+  },
+  "parser": {
+    "kind": "csv",
+    "options": {
+      "has_header": true,
+      "stream_scrub_likvidaci": true,
+      "lazy_quotes": true,
+      "comma": ",",
+      "trim_space": false,
+      "expected_fields": 9,
+      "header_map": {
+        "PČV": "pcv",
+        "Typ": "typ",
+        "Stav": "stav",
+        "Kód STK": "kod_stk",
+        "Název STK": "nazev_stk",
+        "Platnost od": "platnost_od",
+        "Platnost do": "platnost_do",
+        "Číslo protokolu": "cislo_protokolu",
+        "Aktuální": "aktualni"
+      }
+    }
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "02.01.2006",
+        "types": {
+          "aktualni": "bool",
+          "kod_stk": "int",
+          "pcv": "bigint",
+          "platnost_do": "date",
+          "platnost_od": "date",
+          "typ": "text",
+          "stav": "text",
+          "nazev_stk": "text",
+          "cislo_protokolu": "text"
+        }
+      }
+    },
+    {
+      "kind": "hash",
+      "options": {
+        "fields": [
+          "pcv",
+          "platnost_od",
+          "typ",
+          "stav",
+          "cislo_protokolu",
+          "aktualni",
+          "platnost_do"
+        ],
+        "target_field": "row_hash",
+        "include_field_names": true,
+        "trim_space": true,
+        "separator": "\u001f",
+        "algorithm": "sha256",
+        "encoding": "hex",
+        "overwrite": true
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "policy": "lenient",
+        "contract": {
+          "name": "technickeprohlidky",
+          "fields": [
+            {
+              "name": "pcv",
+              "type": "bigint",
+              "required": true
+            },
+            {
+              "name": "typ",
+              "type": "text"
+            },
+            {
+              "name": "stav",
+              "type": "text"
+            },
+            {
+              "name": "kod_stk",
+              "type": "int"
+            },
+            {
+              "name": "nazev_stk",
+              "type": "text"
+            },
+            {
+              "name": "platnost_od",
+              "type": "date",
+              "layout": "02.01.2006"
+            },
+            {
+              "name": "platnost_do",
+              "type": "date",
+              "layout": "02.01.2006"
+            },
+            {
+              "name": "cislo_protokolu",
+              "type": "text"
+            },
+            {
+              "name": "aktualni",
+              "type": "bool",
+              "truthy": [
+                "1",
+                "t",
+                "true",
+                "yes",
+                "y"
+              ],
+              "falsy": [
+                "0",
+                "f",
+                "false",
+                "no",
+                "n"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "storage": {
+    "kind": "postgres",
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "mode": "multi_table",
+      "tables": [
+        {
+          "name": "public.vehicles",
+          "auto_create_table": true,
+          "primary_key": {
+            "name": "vehicle_id",
+            "type": "serial"
+          },
+          "columns": [
+            {
+              "name": "pcv",
+              "type": "bigint",
+              "nullable": false
+            }
+          ],
+          "constraints": [
+            {
+              "kind": "unique",
+              "columns": [
+                "pcv"
+              ]
+            }
+          ],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [
+              {
+                "target_column": "pcv",
+                "source_field": "pcv"
+              }
+            ],
+            "conflict": {
+              "target_columns": [
+                "pcv"
+              ],
+              "action": "do_nothing"
+            },
+            "returning": [
+              "vehicle_id",
+              "pcv"
+            ],
+            "cache": {
+              "key_column": "pcv",
+              "value_column": "vehicle_id",
+              "prewarm": false
+            }
+          }
+        },
+        {
+          "name": "public.stk_typ",
+          "auto_create_table": true,
+          "primary_key": {
+            "name": "stk_typ_id",
+            "type": "serial"
+          },
+          "columns": [
+            {
+              "name": "name",
+              "type": "text",
+              "nullable": false
+            }
+          ],
+          "constraints": [
+            {
+              "kind": "unique",
+              "columns": [
+                "name"
+              ]
+            }
+          ],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [
+              {
+                "target_column": "name",
+                "source_field": "typ",
+                "transform": [
+                  {
+                    "kind": "trim"
+                  }
+                ]
+              }
+            ],
+            "conflict": {
+              "target_columns": [
+                "name"
+              ],
+              "action": "do_nothing"
+            },
+            "returning": [
+              "stk_typ_id",
+              "name"
+            ],
+            "cache": {
+              "key_column": "name",
+              "value_column": "stk_typ_id",
+              "prewarm": true
+            }
+          }
+        },
+        {
+          "name": "public.stk_stav",
+          "auto_create_table": true,
+          "primary_key": {
+            "name": "stk_stav_id",
+            "type": "serial"
+          },
+          "columns": [
+            {
+              "name": "name",
+              "type": "text",
+              "nullable": false
+            }
+          ],
+          "constraints": [
+            {
+              "kind": "unique",
+              "columns": [
+                "name"
+              ]
+            }
+          ],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [
+              {
+                "target_column": "name",
+                "source_field": "stav",
+                "transform": [
+                  {
+                    "kind": "trim"
+                  }
+                ]
+              }
+            ],
+            "conflict": {
+              "target_columns": [
+                "name"
+              ],
+              "action": "do_nothing"
+            },
+            "returning": [
+              "stk_stav_id",
+              "name"
+            ],
+            "cache": {
+              "key_column": "name",
+              "value_column": "stk_stav_id",
+              "prewarm": true
+            }
+          }
+        },
+        {
+          "name": "public.technicky_prohlidky",
+          "auto_create_table": true,
+          "primary_key": {
+            "name": "technicky_prohlidky_id",
+            "type": "serial"
+          },
+          "columns": [
+            {
+              "name": "vehicle_id",
+              "type": "int",
+              "nullable": false,
+              "references": "public.vehicles(vehicle_id)"
+            },
+            {
+              "name": "row_hash",
+              "type": "text",
+              "nullable": false
+            },
+            {
+              "name": "typ_id",
+              "type": "int",
+              "nullable": true,
+              "references": "public.stk_typ(stk_typ_id)"
+            },
+            {
+              "name": "stav_id",
+              "type": "int",
+              "nullable": true,
+              "references": "public.stk_stav(stk_stav_id)"
+            },
+            {
+              "name": "kod_stk",
+              "type": "int",
+              "nullable": true
+            },
+            {
+              "name": "nazev_stk",
+              "type": "text",
+              "nullable": true
+            },
+            {
+              "name": "platnost_od",
+              "type": "date",
+              "nullable": true
+            },
+            {
+              "name": "platnost_do",
+              "type": "date",
+              "nullable": true
+            },
+            {
+              "name": "cislo_protokolu",
+              "type": "text",
+              "nullable": true
+            },
+            {
+              "name": "aktualni",
+              "type": "boolean",
+              "nullable": true
+            }
+          ],
+          "constraints": [
+            {
+              "kind": "unique",
+              "columns": [
+                "vehicle_id",
+                "row_hash"
+              ]
+            }
+          ],
+          "load": {
+            "kind": "fact",
+            "dedupe": {
+              "conflict_columns": [
+                "vehicle_id",
+                "row_hash"
+              ],
+              "action": "do_nothing"
+            },
+            "from_rows": [
+              {
+                "target_column": "vehicle_id",
+                "lookup": {
+                  "table": "public.vehicles",
+                  "match": {
+                    "pcv": "pcv"
+                  },
+                  "return": "vehicle_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "row_hash",
+                "source_field": "row_hash"
+              },
+              {
+                "target_column": "typ_id",
+                "lookup": {
+                  "table": "public.stk_typ",
+                  "match": {
+                    "name": "typ"
+                  },
+                  "return": "stk_typ_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "stav_id",
+                "lookup": {
+                  "table": "public.stk_stav",
+                  "match": {
+                    "name": "stav"
+                  },
+                  "return": "stk_stav_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "kod_stk",
+                "source_field": "kod_stk"
+              },
+              {
+                "target_column": "nazev_stk",
+                "source_field": "nazev_stk"
+              },
+              {
+                "target_column": "platnost_od",
+                "source_field": "platnost_od"
+              },
+              {
+                "target_column": "platnost_do",
+                "source_field": "platnost_do"
+              },
+              {
+                "target_column": "cislo_protokolu",
+                "source_field": "cislo_protokolu"
+              },
+              {
+                "target_column": "aktualni",
+                "source_field": "aktualni"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+

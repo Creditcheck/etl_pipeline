@@ -1,0 +1,170 @@
+{
+  "job": "vozidla_dovoz_multi",
+  "source": {
+    "kind": "file",
+    "file": { "path": "/home/zippy/projects/data/RSV_vozidla_dovoz_20251201.csv" }
+  },
+  "parser": {
+    "kind": "csv",
+    "options": {
+      "comma": ",",
+      "expected_fields": 3,
+      "has_header": true,
+      "header_map": {
+        "Datum dovozu": "datum_dovozu",
+        "PČV": "pcv",
+        "Stát": "stat"
+      },
+      "trim_space": true
+    }
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "02.01.2006",
+        "types": {
+          "datum_dovozu": "date",
+          "pcv": "bigint",
+          "stat": "text"
+        }
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "contract": {
+          "name": "vozidla_dovoz",
+          "fields": [
+            { "name": "pcv", "type": "bigint", "required": true },
+            { "name": "stat", "type": "text", "required": true },
+            { "name": "datum_dovozu", "type": "date", "layout": "02.01.2006" }
+          ]
+        },
+        "policy": "lenient"
+      }
+    }
+  ],
+  "storage": {
+    "kind": "postgres",
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+
+      "mode": "multi_table",
+
+
+	  "tables": [
+  {
+    "name": "public.vehicles",
+    "auto_create_table": true,
+    "primary_key": { "name": "vehicle_id", "type": "serial" },
+    "columns": [
+      { "name": "pcv", "type": "bigint", "nullable": false }
+    ],
+    "constraints": [
+      { "kind": "unique", "columns": ["pcv"] }
+    ],
+    "load": {
+      "kind": "dimension",
+      "from_rows": [
+        { "target_column": "pcv", "source_field": "pcv" }
+      ],
+      "conflict": {
+        "target_columns": ["pcv"],
+        "action": "do_nothing"
+      },
+      "returning": ["vehicle_id", "pcv"],
+      "cache": {
+        "key_column": "pcv",
+        "value_column": "vehicle_id",
+        "prewarm": false
+      }
+    }
+  },
+  {
+    "name": "public.countries",
+    "auto_create_table": true,
+    "primary_key": { "name": "country_id", "type": "serial" },
+    "columns": [
+      { "name": "name", "type": "varchar(100)", "nullable": false }
+    ],
+    "constraints": [
+      { "kind": "unique", "columns": ["name"] }
+    ],
+    "load": {
+      "kind": "dimension",
+      "from_rows": [
+        {
+          "target_column": "name",
+          "source_field": "stat",
+          "transform": [{ "kind": "trim" }]
+        }
+      ],
+      "conflict": {
+        "target_columns": ["name"],
+        "action": "do_nothing"
+      },
+      "returning": ["country_id", "name"],
+      "cache": {
+        "key_column": "name",
+        "value_column": "country_id",
+        "prewarm": true
+      }
+    }
+  },
+  {
+    "name": "public.imports",
+    "auto_create_table": true,
+    "primary_key": { "name": "import_id", "type": "serial" },
+    "columns": [
+      { "name": "vehicle_id", "type": "int", "nullable": false, "references": "public.vehicles(vehicle_id)" },
+      { "name": "country_id", "type": "int", "nullable": false, "references": "public.countries(country_id)" },
+      { "name": "import_date", "type": "date", "nullable": true }
+    ],
+	"constraints": [
+	  { "kind": "unique", "columns": ["vehicle_id", "country_id"] }
+	],
+    "load": {
+      "kind": "fact",
+      "dedupe": {
+        "conflict_columns": ["vehicle_id", "country_id"],
+        "action": "do_nothing"
+      },
+      "from_rows": [
+        {
+          "target_column": "vehicle_id",
+          "lookup": {
+            "table": "public.vehicles",
+            "match": { "pcv": "pcv" },
+            "return": "vehicle_id",
+            "on_missing": "insert"
+          }
+        },
+        {
+          "target_column": "country_id",
+          "lookup": {
+            "table": "public.countries",
+            "match": { "name": "stat" },
+            "return": "country_id",
+            "on_missing": "insert"
+          }
+        },
+        { "target_column": "import_date", "source_field": "datum_dovozu" }
+      ]
+    }
+  }
+]
+
+    }
+  },
+  "runtime": {
+    "reader_workers": 1,
+    "transform_workers": 4,
+    "loader_workers": 4,
+    "batch_size": 8192,
+    "channel_buffer": 2048,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": false
+  }
+}
+

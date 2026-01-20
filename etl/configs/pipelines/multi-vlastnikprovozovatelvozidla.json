@@ -1,0 +1,191 @@
+{
+  "job": "vlastnik_provozovatel_vozidla_multi",
+  "source": {
+    "kind": "file",
+    "file": {
+      "path": "/home/zippy/projects/data/RSV_vlastnik_provozovatel_vozidla_20251201.csv"
+    }
+  },
+  "runtime": {
+    "reader_workers": 1,
+    "transform_workers": 2,
+    "loader_workers": 4,
+    "batch_size": 4096,
+    "channel_buffer": 1024,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": false
+  },
+  "parser": {
+    "kind": "csv",
+    "options": {
+      "has_header": true,
+      "stream_scrub_likvidaci": true,
+      "comma": ",",
+      "trim_space": true,
+      "expected_fields": 9,
+      "lazy_quotes": true,
+      "header_map": {
+        "PČV": "pcv",
+        "Typ subjektu": "typ_subjektu",
+        "Vztah k vozidlu": "vztah_k_vozidlu",
+        "Aktuální": "aktualni",
+        "IČO": "ico",
+        "Název": "nazev",
+        "Adresa": "adresa",
+        "Datum od": "datum_od",
+        "Datum do": "datum_do"
+      }
+    }
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "02.01.2006",
+        "types": {
+          "aktualni": "bool",
+          "datum_do": "date",
+          "datum_od": "date",
+          "ico": "int",
+          "pcv": "bigint",
+          "typ_subjektu": "int",
+          "vztah_k_vozidlu": "int"
+        }
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "policy": "lenient",
+        "contract": {
+          "name": "vlastnikprovozovatelvozidla",
+          "fields": [
+            {
+              "name": "pcv",
+              "type": "bigint",
+              "required": true
+            },
+            {
+              "name": "typ_subjektu",
+              "type": "int"
+            },
+            {
+              "name": "vztah_k_vozidlu",
+              "type": "int"
+            },
+            {
+              "name": "aktualni",
+              "type": "bool",
+              "truthy": ["1", "t", "true", "yes", "y"],
+              "falsy": ["0", "f", "false", "no", "n"]
+            },
+            {
+              "name": "ico",
+              "type": "int"
+            },
+            {
+              "name": "nazev",
+              "type": "text"
+            },
+            {
+              "name": "adresa",
+              "type": "text"
+            },
+            {
+              "name": "datum_od",
+              "type": "date",
+              "layout": "02.01.2006"
+            },
+            {
+              "name": "datum_do",
+              "type": "date",
+              "layout": "02.01.2006"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "storage": {
+    "kind": "postgres",
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "mode": "multi_table",
+      "tables": [
+        {
+          "name": "public.vehicles",
+          "auto_create_table": true,
+          "primary_key": { "name": "vehicle_id", "type": "serial" },
+          "columns": [
+            { "name": "pcv", "type": "bigint", "nullable": false }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["pcv"] }
+          ],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [
+              { "target_column": "pcv", "source_field": "pcv" }
+            ],
+            "conflict": {
+              "target_columns": ["pcv"],
+              "action": "do_nothing"
+            },
+            "returning": ["vehicle_id", "pcv"],
+            "cache": {
+              "key_column": "pcv",
+              "value_column": "vehicle_id",
+              "prewarm": false
+            }
+          }
+        },
+        {
+          "name": "public.vlastnikprovozovatelvozidla",
+          "auto_create_table": true,
+          "primary_key": { "name": "vlastnikprovozovatelvozidla_id", "type": "serial" },
+          "columns": [
+            { "name": "vehicle_id", "type": "int", "nullable": false, "references": "public.vehicles(vehicle_id)" },
+            { "name": "typ_subjektu", "type": "int", "nullable": true },
+            { "name": "vztah_k_vozidlu", "type": "int", "nullable": true },
+            { "name": "aktualni", "type": "boolean", "nullable": true },
+            { "name": "ico", "type": "bigint", "nullable": true },
+            { "name": "nazev", "type": "text", "nullable": true },
+            { "name": "adresa", "type": "text", "nullable": true },
+            { "name": "datum_od", "type": "date", "nullable": true },
+            { "name": "datum_do", "type": "date", "nullable": true }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["vehicle_id", "typ_subjektu", "vztah_k_vozidlu", "datum_od", "datum_do"] }
+          ],
+          "load": {
+            "kind": "fact",
+            "dedupe": {
+              "conflict_columns": ["vehicle_id", "typ_subjektu", "vztah_k_vozidlu", "datum_od", "datum_do"],
+              "action": "do_nothing"
+            },
+            "from_rows": [
+              {
+                "target_column": "vehicle_id",
+                "lookup": {
+                  "table": "public.vehicles",
+                  "match": { "pcv": "pcv" },
+                  "return": "vehicle_id",
+                  "on_missing": "insert"
+                }
+              },
+              { "target_column": "typ_subjektu", "source_field": "typ_subjektu" },
+              { "target_column": "vztah_k_vozidlu", "source_field": "vztah_k_vozidlu" },
+              { "target_column": "aktualni", "source_field": "aktualni" },
+              { "target_column": "ico", "source_field": "ico" },
+              { "target_column": "nazev", "source_field": "nazev" },
+              { "target_column": "adresa", "source_field": "adresa" },
+              { "target_column": "datum_od", "source_field": "datum_od" },
+              { "target_column": "datum_do", "source_field": "datum_do" }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+
