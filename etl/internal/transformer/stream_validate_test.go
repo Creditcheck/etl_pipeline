@@ -178,41 +178,45 @@ func TestValidateLoopRows_BadRowLenAndNil(t *testing.T) {
 }
 
 /*
-TestValidateLoopRows_CancelStillDrains verifies the "drain-safe" guarantee:
-even when the context is canceled before or during processing, the function
-drains the input channel, frees rejected rows, and forwards valid ones.
+TestValidateLoopRows_CancelStillDrains verifies ValidateLoopRows is drain-safe
+and cancellation-aware with respect to forwarding.
 
-We pre-cancel the context, then push 50 rows:
+Contract under test:
+
+  - ValidateLoopRows must keep draining `in` even when ctx is canceled (so
+    upstream producers are not blocked).
+  - When ctx is canceled, ValidateLoopRows must not block attempting to forward
+    valid rows to `out`. Instead it should select on ctx.Done() and discard the
+    row (Drop) during shutdown unwinding.
+  - Invalid rows must still be rejected and reported via onReject while draining.
+
+This test pre-cancels ctx, then pushes 50 rows:
   - even index rows: valid
-  - odd index rows: invalid (missing required field)
+  - odd index rows: invalid (required field missing)
 
-Despite ctx being canceled, ValidateLoopRows must:
-  - still consider each row,
-  - reject 25 invalid rows,
-  - forward 25 valid rows,
-
-before returning.
+To make the forwarding behavior deterministic, `out` is unbuffered and there is
+no receiver. Therefore `out <- r` is never ready, and the validate stage must
+take the `<-ctx.Done()` branch for valid rows (resulting in zero forwarded).
 */
 func TestValidateLoopRows_CancelStillDrains(t *testing.T) {
 	columns := []string{"id"}
 	required := []string{"id"}
-	types := map[string]string{} // type hints unused in this test
+	colKinds := map[string]string{} // no type checks in this test
 
 	ctx, cancel := context.WithCancel(context.Background())
-	in := make(chan *Row, 100)
-	out := make(chan *Row, 100)
+	cancel() // pre-cancel to force ctx.Done() readiness
 
-	// Pre-cancel the context to simulate shutdown.
-	cancel()
+	in := make(chan *Row, 100)
+
+	// Unbuffered out + no receiver => send is never ready => forwarding is impossible.
+	out := make(chan *Row)
 
 	const total = 50
 	for i := 0; i < total; i++ {
 		r := GetRow(1)
 		if i%2 == 0 {
-			// valid: required field present
 			r.V[0] = "ok"
 		} else {
-			// invalid: required field missing
 			r.V[0] = nil
 		}
 		in <- r
@@ -220,18 +224,33 @@ func TestValidateLoopRows_CancelStillDrains(t *testing.T) {
 	close(in)
 
 	var rejects int
-	ValidateLoopRows(ctx, columns, required, types, in, out, func(_ int, _ string) { rejects++ })
+	done := make(chan struct{})
+
+	go func() {
+		ValidateLoopRows(ctx, columns, required, colKinds, in, out, func(_ int, _ string) { rejects++ })
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("ValidateLoopRows did not return after ctx cancellation")
+	}
 
 	if rejects != total/2 {
 		t.Fatalf("rejects=%d; want %d", rejects, total/2)
 	}
-	if got := len(out); got != total/2 {
-		t.Fatalf("forwarded=%d; want %d", got, total/2)
-	}
 
-	// Free all forwarded rows.
-	for i := 0; i < total/2; i++ {
-		(<-out).Free()
+	// Ensure nothing was forwarded.
+	select {
+	case r := <-out:
+		if r != nil {
+			r.Free()
+		}
+		t.Fatalf("forwarded unexpectedly; want 0")
+	default:
+		// ok
 	}
 }
 

@@ -160,29 +160,57 @@ func (nopReadCloser) Close() error { return nil }
 // TestStreamValidatedRows_TerminalParserError verifies a fatal parser error is
 // surfaced by Wait() after Rows closes.
 //
-// When to use:
-//   - Ensuring that fatal errors (I/O, parser failures) are not lost.
-//   - Preventing regressions where terminal errors are overwritten or ignored.
+// This test patches StreamValidatedRows' package-level dependency seams directly
+// (openSource / streamCSVRows / downstream loops) to avoid coupling to helper
+// patch functions and to ensure the parser error returned by the parser adapter
+// becomes the stream's terminal error.
+//
+// Concurrency note:
+//   - This test intentionally does NOT use t.Parallel() because it mutates
+//     package-level variables that are shared across tests.
 func TestStreamValidatedRows_TerminalParserError(t *testing.T) {
-	t.Parallel()
-
 	wantErr := errors.New("fatal parse")
 
-	restore := patchStreamDepsForHelpers(t, streamDepsForHelpers{
-		open: func(path string) (io.ReadCloser, error) {
-			return nopReadCloser{Reader: strings.NewReader("")}, nil
-		},
-		csv: func(ctx context.Context, src io.ReadCloser, columns []string, opt config.Options, out chan<- *transformer.Row, onErr func(int, error)) error {
-			return wantErr
-		},
-		// Downstream stages must not block.
-		transform: passthroughTransformLoop,
-		hash:      passthroughHashLoop,
-		validate:  passthroughValidateLoop,
+	// Save originals.
+	oldOpen := openSource
+	oldCSV := streamCSVRows
+	oldTransform := transformLoop
+	oldHash := hashLoop
+	oldValidate := validateLoop
+
+	// Restore on exit.
+	t.Cleanup(func() {
+		openSource = oldOpen
+		streamCSVRows = oldCSV
+		transformLoop = oldTransform
+		hashLoop = oldHash
+		validateLoop = oldValidate
 	})
-	t.Cleanup(restore)
+
+	// Patch open to provide an empty source.
+	openSource = func(path string) (io.ReadCloser, error) {
+		return nopReadCloser{Reader: strings.NewReader("")}, nil
+	}
+
+	// Patch CSV parser to return the fatal error immediately.
+	streamCSVRows = func(
+		ctx context.Context,
+		src io.ReadCloser,
+		columns []string,
+		opt config.Options,
+		out chan<- *transformer.Row,
+		onErr func(int, error),
+	) error {
+		return wantErr
+	}
+
+	// Downstream stages must not block / must be deterministic.
+	transformLoop = passthroughTransformLoop
+	hashLoop = passthroughHashLoop
+	validateLoop = passthroughValidateLoop
 
 	cfg := Pipeline{
+		Job:    "test",
 		Source: Source{Kind: "file", File: &FileSource{Path: "ignored"}},
 		Parser: Parser{Kind: "csv"},
 		Runtime: RuntimeConfig{
@@ -196,9 +224,11 @@ func TestStreamValidatedRows_TerminalParserError(t *testing.T) {
 		t.Fatalf("StreamValidatedRows() err=%v, want nil", err)
 	}
 
+	// Drain rows; should be none, but drain defensively.
 	for r := range stream.Rows {
 		r.Free()
 	}
+
 	err = stream.Wait()
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("Wait() err=%v, want %v", err, wantErr)
