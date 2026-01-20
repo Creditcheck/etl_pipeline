@@ -12,18 +12,16 @@
 cd "$(dirname "$0")"
 
 # 1. Build etl & probe via docker compose build
-# 3. Use probe to generate config from CSV into /configs/pipeline.json
-#DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 docker compose build --no-cache etl
 DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 docker compose build etl
 docker compose run --rm etl -c '
-#  set -eux
 NAME="sample"
-# populate file
+# create sample.csv
+#
 echo -n "id,shape,volume
 1,candycane,301
 2,swallow,940" > sample.csv
-  # Probe: generate JSON config from local CSV.
-  # Adjust flags to match your probe CLI.
+#
+# Generate JSON config from local CSV.
   probe \
     -url="file://sample.csv" \
     -name="$NAME" \
@@ -31,12 +29,11 @@ echo -n "id,shape,volume
     -multitable \
     -backend=sqlite \
     -pretty > /configs/pipeline.json
-  ls /data
 
   cat /configs/pipeline.json
 
 # 5. Run ETL with generated config; SQLite DB will be created in /data/db/etl.db
-output=$(etl_multi -config /configs/pipeline.json | grep summary | grep -o "inserted=.*" | sed "s/ .*//g")
+output=$(etl -config /configs/pipeline.json | grep summary | grep -o "inserted=.*" | sed "s/ .*//g")
 
 
 # 6. Verify name in config
