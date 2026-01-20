@@ -1,0 +1,505 @@
+{
+  "job": "rsv_vypis_vozidel_multi",
+  "source": {
+    "kind": "file",
+    "file": {
+	  "path": "/home/zippy/projects/data/RSV_vypis_vozidel_20251002.csv-1000000"
+    }
+  },
+  "runtime": {
+    "batch_size": 450,
+    "channel_buffer": 400,
+    "loader_workers": 1,
+    "reader_workers": 1,
+    "transform_workers": 6,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": false,
+	"debug_timings": true
+  },
+  "parser": {
+    "kind": "csv",
+    "options": {
+      "comma": ",",
+      "expected_fields": 98,
+      "has_header": true,
+      "lazy_quotes": true,
+      "trim_space": true,
+      "header_map": {
+        "ABS": "abs",
+        "ASR": "asr",
+        "Airbag": "airbag",
+        "Alternativní provedení": "alternativni_provedeni",
+        "Barva": "barva",
+        "Barva doplňková": "barva_doplnkova",
+        "Brzdy nouzová": "brzdy_nouzova",
+        "Brzdy odlehčovací": "brzdy_odlehcovaci",
+        "Brzdy parkovací": "brzdy_parkovaci",
+        "Brzdy provozní": "brzdy_provozni",
+        "CO2 město  mimo město kombinované  g km-1 ": "co2_mesto_mimo_mesto_kombinovane_g_km_1",
+        "Celková délka šířka výška  mm ": "celkova_delka_sirka_vyska_mm",
+        "Další záznamy": "dalsi_zaznamy",
+        "Datum 1  registrace": "datum_1_registrace",
+        "Datum 1  registrace v ČR": "datum_1_registrace_v_cr",
+        "Dojezd ZR  km ": "dojezd_zr_km",
+        "Doplňkový text na TP": "doplnkovy_text_na_tp",
+        "Druh (typ)": "druh_typ",
+        "Druh RZ": "druh_rz",
+        "Druh vozidla": "druh_vozidla",
+        "Druh vozidla 2  ř ": "druh_vozidla_2_r",
+        "Délka do": "delka_do",
+        "ES EU": "es_eu",
+        "Emisní limit  EHKOSN EHSES ": "emisni_limit_ehkosn_ehses",
+        "Faktor odchylky - DE": "faktor_odchylky_de",
+        "Faktor verifikace - Vf": "faktor_verifikace_vf",
+        "Hmotnosti provozní Do": "hmotnosti_provozni_do",
+        "Hmotnosti vozidla při testu WLTP": "hmotnosti_vozidla_pri_testu_wltp",
+        "Hmotnosti zatížení SZ": "hmotnosti_zatizeni_sz",
+        "Hmotnosti zatížení SZ typ": "hmotnosti_zatizeni_sz_typ",
+        "Hybridní vozidlo": "hybridni_vozidlo",
+        "Hydropohon": "hydropohon",
+        "Inovativní technologie": "inovativni_technologie",
+        "Kategorie vozidla": "kategorie_vozidla",
+        "Kola a pneumatiky na nápravě - rozměry montáž  N 1; N 2; N 3; N 4 ": "kola_a_pneumatiky_na_naprave_rozmery_montaz_n_1_n_2_n_3_n_4",
+        "Korigovaný součinitel absorbce  m⁻¹ ": "korigovany_soucinitel_absorbce_m",
+        "Ložná délka": "lozna_delka",
+        "Ložná šířka": "lozna_sirka",
+        "Max  výkon  kW     min⁻¹ ": "max_vykon_kw_min",
+        "Nejvyšší rychlost  km h⁻¹ ": "nejvyssi_rychlost_km_h",
+        "Nejvyšší rychlost omezení": "nejvyssi_rychlost_omezeni",
+        "Největší technicky přípustná povolená hmotnost  kg ": "nejvetsi_technicky_pripustna_povolena_hmotnost_kg",
+        "Největší technicky přípustná povolená hmotnost jízdní soupravy  kg ": "nejvetsi_thnicky_pripustna_povolena_hmotnost_jizdni_soupravy_kg",
+        "Největší technicky přípustná povolená hmotnost na nápravu  kg ": "nejvetsi_technicky_pripustna_povolena_hmotnost_na_napravu_kg",
+        "Největší technicky přípustná povolená hmotnost přípojného vozidla  kg  brzděného": "nejvetsi_ttna_povolena_hmotnost_pripojneho_vozidla_kg_brzdeneho",
+        "Největší technicky přípustná povolená hmotnost přípojného vozidla  kg  nebrzděného": "nejvetsi_ta_povolena_hmotnost_pripojneho_vozidla_kg_nebrzdeneho",
+        "Obchodní označení": "obchodni_oznaceni",
+        "Objem cisterny": "objem_cisterny",
+        "Ovládání brzd SZ": "ovladani_brzd_sz",
+        "Ovládání brzd SZ druh": "ovladani_brzd_sz_druh",
+        "Palivo": "palivo",
+        "Plně elektrické vozidlo": "plne_elektricke_vozidlo",
+        "Poměr Výkon Hmotnost  kW kg⁻¹ ": "pomer_vykon_hmotnost_kw_kg",
+        "Počet míst celkem   k sezení   k stání": "pocet_mist_celkem_k_sezeni_k_stani",
+        "Počet náprav - z toho poháněných": "pocet_naprav_z_toho_pohanenych",
+        "Provozní hmotnost": "provozni_hmotnost",
+        "Průměrná hodnota užitečného zatížení": "prumerna_hodnota_uzitecneho_zatizeni",
+        "PČV": "pcv",
+        "RM zániku": "rm_zaniku",
+        "Retarder": "retarder",
+        "Rok výroby": "rok_vyroby",
+        "Rozchod  mm ": "rozchod_mm",
+        "Rozvor  mm ": "rozvor_mm",
+        "Snížení emisí – NEDC": "snizeni_emisi_nedc",
+        "Snížení emisí – WLTP": "snizeni_emisi_wltp",
+        "Specifické CO2": "specificke_co2",
+        "Spojovací zařízení - druh": "spojovaci_zarizeni_druh",
+        "Spotřeba el  mobil  Wh km  – Z": "spotreba_el_mobil_wh_km_z",
+        "Spotřeba město  mimo město kombinovaná  l 100km⁻¹ ": "spotreba_mesto_mimo_mesto_kombinovana_l_100km",
+        "Spotřeba předpis": "spotreba_predpis",
+        "Spotřeba při rychlosti  l 100 km⁻¹ ": "spotreba_pri_rychlosti_l_100_km",
+        "Status": "status",
+        "Stupeň autonomity vozidla": "stupen_autonomity_vozidla",
+        "Stupeň dokončení": "stupen_dokonceni",
+        "Stupeň plnění emisní úrovně": "stupen_plneni_emisni_urovne",
+        "Tovární značka": "tovarni_znacka",
+        "Typ": "typ",
+        "Typ kód": "typ_kod",
+        "Typ motoru": "typ_motoru",
+        "Třída hybridního vozidla": "trida_hybridniho_vozidla",
+        "VIN": "vin",
+        "Varianta": "varianta",
+        "Verze": "verze",
+        "Vnější hluk vozidla  dB(A)  - stojícího při ot   min⁻¹ ": "vnejsi_hluk_vozidla_dba_stojiciho_pri_ot_min",
+        "Výrobce karoserie": "vyrobce_karoserie",
+        "Výrobce motoru": "vyrobce_motoru",
+        "Výrobce vozidla": "vyrobce_vozidla",
+        "Výrobní číslo karoserie": "vyrobni_cislo_karoserie",
+        "Výška do": "vyska_do",
+        "ZTP": "ztp",
+        "Za jízdy": "za_jizdy",
+        "Zatížení střechy": "zatizeni_strechy",
+        "Zařazení vozidla": "zarazeni_vozidla",
+        "Zdvihový objem  cm³ ": "zdvihovy_objem_cm",
+        "Účel vozidla": "ucel_vozidla",
+        "Číslo ORV": "cislo_orv",
+        "Číslo TP": "cislo_tp",
+        "Číslo motoru": "cislo_motoru"
+      }
+    }
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "02.01.2006",
+        "types": {
+          "datum_1_registrace": "date",
+          "datum_1_registrace_v_cr": "date",
+          "pcv": "bigint"
+        },
+        "use_anchor": {
+          "field": "zarazeni_vozidla",
+          "value": "RSV"
+        }
+      }
+    },
+    {
+      "kind": "hash",
+      "options": {
+        "target_field": "row_hash",
+        "fields": [
+          "pcv",
+          "datum_1_registrace",
+          "datum_1_registrace_v_cr",
+          "ztp",
+          "es_eu",
+          "druh_vozidla",
+          "druh_vozidla_2_r",
+          "kategorie_vozidla",
+          "tovarni_znacka",
+          "typ"
+        ],
+        "include_field_names": true,
+        "trim_space": true,
+        "separator": "\u001f",
+        "algorithm": "sha256",
+        "encoding": "hex",
+        "overwrite": true
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "policy": "lenient",
+        "contract": {
+          "name": "vypisvozidel",
+          "fields": [
+            { "name": "pcv", "type": "bigint", "required": true },
+            { "name": "datum_1_registrace", "type": "date", "layout": "02.01.2006" },
+            { "name": "datum_1_registrace_v_cr", "type": "date", "layout": "02.01.2006" },
+            { "name": "ztp", "type": "text" },
+            { "name": "es_eu", "type": "text" },
+            { "name": "druh_vozidla", "type": "text" },
+            { "name": "druh_vozidla_2_r", "type": "text" },
+            { "name": "kategorie_vozidla", "type": "text" },
+            { "name": "tovarni_znacka", "type": "text" },
+            { "name": "typ", "type": "text" },
+            { "name": "vyrobce_vozidla", "type": "text" },
+            { "name": "vyrobce_motoru", "type": "text" },
+            { "name": "typ_motoru", "type": "text" },
+            { "name": "obchodni_oznaceni", "type": "text" },
+            { "name": "varianta", "type": "text" },
+            { "name": "barva", "type": "text" },
+            { "name": "druh_typ", "type": "text" },
+            { "name": "vin", "type": "text" },
+            { "name": "verze", "type": "text" }
+          ]
+        }
+      }
+    }
+  ],
+  "storage": {
+    "kind": "postgres",
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "mode": "multi_table",
+      "tables": [
+        {
+          "name": "public.vehicles",
+          "auto_create_table": true,
+          "primary_key": { "name": "vehicle_id", "type": "serial" },
+          "columns": [{ "name": "pcv", "type": "bigint", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["pcv"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "pcv", "source_field": "pcv" }],
+            "conflict": { "target_columns": ["pcv"], "action": "do_nothing" },
+            "returning": ["vehicle_id", "pcv"],
+            "cache": { "key_column": "pcv", "value_column": "vehicle_id", "prewarm": false }
+          }
+        },
+
+        {
+          "name": "public.kategorie_vozidla",
+          "auto_create_table": true,
+          "primary_key": { "name": "kategorie_vozidla_id", "type": "serial" },
+          "columns": [{ "name": "name", "type": "text", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["name"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "name", "source_field": "kategorie_vozidla", "transform": [{ "kind": "trim" }] }],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["kategorie_vozidla_id", "name"],
+            "cache": { "key_column": "name", "value_column": "kategorie_vozidla_id", "prewarm": true }
+          }
+        },
+        {
+          "name": "public.tovarni_znacka",
+          "auto_create_table": true,
+          "primary_key": { "name": "tovarni_znacka_id", "type": "serial" },
+          "columns": [{ "name": "name", "type": "text", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["name"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "name", "source_field": "tovarni_znacka", "transform": [{ "kind": "trim" }] }],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["tovarni_znacka_id", "name"],
+            "cache": { "key_column": "name", "value_column": "tovarni_znacka_id", "prewarm": true }
+          }
+        },
+        {
+          "name": "public.typ",
+          "auto_create_table": true,
+          "primary_key": { "name": "typ_id", "type": "serial" },
+          "columns": [{ "name": "name", "type": "text", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["name"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "name", "source_field": "typ", "transform": [{ "kind": "trim" }] }],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["typ_id", "name"],
+            "cache": { "key_column": "name", "value_column": "typ_id", "prewarm": true }
+          }
+        },
+        {
+          "name": "public.vyrobce_vozidla",
+          "auto_create_table": true,
+          "primary_key": { "name": "vyrobce_vozidla_id", "type": "serial" },
+          "columns": [{ "name": "name", "type": "text", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["name"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "name", "source_field": "vyrobce_vozidla", "transform": [{ "kind": "trim" }] }],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["vyrobce_vozidla_id", "name"],
+            "cache": { "key_column": "name", "value_column": "vyrobce_vozidla_id", "prewarm": true }
+          }
+        },
+        {
+          "name": "public.vyrobce_motoru",
+          "auto_create_table": true,
+          "primary_key": { "name": "vyrobce_motoru_id", "type": "serial" },
+          "columns": [{ "name": "name", "type": "text", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["name"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "name", "source_field": "vyrobce_motoru", "transform": [{ "kind": "trim" }] }],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["vyrobce_motoru_id", "name"],
+            "cache": { "key_column": "name", "value_column": "vyrobce_motoru_id", "prewarm": true }
+          }
+        },
+        {
+          "name": "public.typ_motoru",
+          "auto_create_table": true,
+          "primary_key": { "name": "typ_motoru_id", "type": "serial" },
+          "columns": [{ "name": "name", "type": "text", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["name"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "name", "source_field": "typ_motoru", "transform": [{ "kind": "trim" }] }],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["typ_motoru_id", "name"],
+            "cache": { "key_column": "name", "value_column": "typ_motoru_id", "prewarm": true }
+          }
+        },
+        {
+          "name": "public.obchodni_oznaceni",
+          "auto_create_table": true,
+          "primary_key": { "name": "obchodni_oznaceni_id", "type": "serial" },
+          "columns": [{ "name": "name", "type": "text", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["name"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "name", "source_field": "obchodni_oznaceni", "transform": [{ "kind": "trim" }] }],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["obchodni_oznaceni_id", "name"],
+            "cache": { "key_column": "name", "value_column": "obchodni_oznaceni_id", "prewarm": true }
+          }
+        },
+        {
+          "name": "public.varianta",
+          "auto_create_table": true,
+          "primary_key": { "name": "varianta_id", "type": "serial" },
+          "columns": [{ "name": "name", "type": "text", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["name"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "name", "source_field": "varianta", "transform": [{ "kind": "trim" }] }],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["varianta_id", "name"],
+            "cache": { "key_column": "name", "value_column": "varianta_id", "prewarm": true }
+          }
+        },
+        {
+          "name": "public.barva",
+          "auto_create_table": true,
+          "primary_key": { "name": "barva_id", "type": "serial" },
+          "columns": [{ "name": "name", "type": "text", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["name"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "name", "source_field": "barva", "transform": [{ "kind": "trim" }] }],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["barva_id", "name"],
+            "cache": { "key_column": "name", "value_column": "barva_id", "prewarm": true }
+          }
+        },
+        {
+          "name": "public.druh_typ",
+          "auto_create_table": true,
+          "primary_key": { "name": "druh_typ_id", "type": "serial" },
+          "columns": [{ "name": "name", "type": "text", "nullable": false }],
+          "constraints": [{ "kind": "unique", "columns": ["name"] }],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [{ "target_column": "name", "source_field": "druh_typ", "transform": [{ "kind": "trim" }] }],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["druh_typ_id", "name"],
+            "cache": { "key_column": "name", "value_column": "druh_typ_id", "prewarm": true }
+          }
+        },
+
+        {
+          "name": "public.vypisvozidel",
+          "auto_create_table": true,
+          "primary_key": { "name": "vypisvozidel_id", "type": "serial" },
+          "columns": [
+            { "name": "vehicle_id", "type": "int", "nullable": false, "references": "public.vehicles(vehicle_id)" },
+            { "name": "row_hash", "type": "text", "nullable": false },
+
+            { "name": "datum_1_registrace", "type": "date", "nullable": true },
+            { "name": "datum_1_registrace_v_cr", "type": "date", "nullable": true },
+
+            { "name": "kategorie_vozidla_id", "type": "int", "nullable": true, "references": "public.kategorie_vozidla(kategorie_vozidla_id)" },
+            { "name": "tovarni_znacka_id", "type": "int", "nullable": true, "references": "public.tovarni_znacka(tovarni_znacka_id)" },
+            { "name": "typ_id", "type": "int", "nullable": true, "references": "public.typ(typ_id)" },
+            { "name": "vyrobce_vozidla_id", "type": "int", "nullable": true, "references": "public.vyrobce_vozidla(vyrobce_vozidla_id)" },
+            { "name": "vyrobce_motoru_id", "type": "int", "nullable": true, "references": "public.vyrobce_motoru(vyrobce_motoru_id)" },
+            { "name": "typ_motoru_id", "type": "int", "nullable": true, "references": "public.typ_motoru(typ_motoru_id)" },
+            { "name": "obchodni_oznaceni_id", "type": "int", "nullable": true, "references": "public.obchodni_oznaceni(obchodni_oznaceni_id)" },
+            { "name": "varianta_id", "type": "int", "nullable": true, "references": "public.varianta(varianta_id)" },
+            { "name": "barva_id", "type": "int", "nullable": true, "references": "public.barva(barva_id)" },
+            { "name": "druh_typ_id", "type": "int", "nullable": true, "references": "public.druh_typ(druh_typ_id)" }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["vehicle_id", "row_hash"] }
+          ],
+          "load": {
+            "kind": "fact",
+            "dedupe": {
+              "conflict_columns": ["vehicle_id", "row_hash"],
+              "action": "do_nothing"
+            },
+            "from_rows": [
+              {
+                "target_column": "vehicle_id",
+                "lookup": {
+                  "table": "public.vehicles",
+                  "match": { "pcv": "pcv" },
+                  "return": "vehicle_id",
+                  "on_missing": "insert"
+                }
+              },
+              { "target_column": "row_hash", "source_field": "row_hash" },
+
+              { "target_column": "datum_1_registrace", "source_field": "datum_1_registrace" },
+              { "target_column": "datum_1_registrace_v_cr", "source_field": "datum_1_registrace_v_cr" },
+
+              {
+                "target_column": "kategorie_vozidla_id",
+                "lookup": {
+                  "table": "public.kategorie_vozidla",
+                  "match": { "name": "kategorie_vozidla" },
+                  "return": "kategorie_vozidla_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "tovarni_znacka_id",
+                "lookup": {
+                  "table": "public.tovarni_znacka",
+                  "match": { "name": "tovarni_znacka" },
+                  "return": "tovarni_znacka_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "typ_id",
+                "lookup": {
+                  "table": "public.typ",
+                  "match": { "name": "typ" },
+                  "return": "typ_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "vyrobce_vozidla_id",
+                "lookup": {
+                  "table": "public.vyrobce_vozidla",
+                  "match": { "name": "vyrobce_vozidla" },
+                  "return": "vyrobce_vozidla_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "vyrobce_motoru_id",
+                "lookup": {
+                  "table": "public.vyrobce_motoru",
+                  "match": { "name": "vyrobce_motoru" },
+                  "return": "vyrobce_motoru_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "typ_motoru_id",
+                "lookup": {
+                  "table": "public.typ_motoru",
+                  "match": { "name": "typ_motoru" },
+                  "return": "typ_motoru_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "obchodni_oznaceni_id",
+                "lookup": {
+                  "table": "public.obchodni_oznaceni",
+                  "match": { "name": "obchodni_oznaceni" },
+                  "return": "obchodni_oznaceni_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "varianta_id",
+                "lookup": {
+                  "table": "public.varianta",
+                  "match": { "name": "varianta" },
+                  "return": "varianta_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "barva_id",
+                "lookup": {
+                  "table": "public.barva",
+                  "match": { "name": "barva" },
+                  "return": "barva_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                "target_column": "druh_typ_id",
+                "lookup": {
+                  "table": "public.druh_typ",
+                  "match": { "name": "druh_typ" },
+                  "return": "druh_typ_id",
+                  "on_missing": "insert"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+

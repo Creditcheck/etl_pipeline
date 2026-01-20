@@ -1,0 +1,192 @@
+{
+  "job": "rsv_vozidla_doplnkove_vybaveni_multi",
+  "source": {
+    "kind": "file",
+    "file": {
+      "path": "/home/zippy/projects/data/RSV_vozidla_doplnkove_vybaveni_20251101.csv-1000000"
+    }
+  },
+  "runtime": {
+    "reader_workers": 1,
+    "transform_workers": 5,
+    "loader_workers": 1,
+    "batch_size": 13000,
+    "channel_buffer": 32768,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": false
+  },
+  "parser": {
+    "kind": "csv",
+    "options": {
+      "has_header": true,
+      "stream_scrub_likvidaci": true,
+      "lazy_quotes": true,
+      "comma": ",",
+      "trim_space": false,
+      "expected_fields": 4,
+      "header_map": {
+        "PČV": "pcv",
+        "Typ": "typ",
+        "Od": "od",
+        "Do": "do"
+      }
+    }
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "02.01.2006",
+        "types": {
+          "pcv": "bigint",
+          "od": "date",
+          "do": "date",
+          "typ": "text"
+        }
+      }
+    },
+    {
+      "kind": "hash",
+      "options": {
+        "fields": [
+          "pcv",
+          "typ",
+          "od",
+          "do"
+        ],
+        "target_field": "row_hash",
+        "include_field_names": true,
+        "trim_space": true,
+        "separator": "\u001f",
+        "algorithm": "sha256",
+        "encoding": "hex",
+        "overwrite": true
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "policy": "lenient",
+        "contract": {
+          "name": "vozidladoplnkovevybaveni",
+          "fields": [
+            {
+              "name": "pcv",
+              "type": "bigint",
+              "required": true
+            },
+            {
+              "name": "typ",
+              "type": "text"
+            },
+            {
+              "name": "od",
+              "type": "date",
+              "layout": "02.01.2006"
+            },
+            {
+              "name": "do",
+              "type": "date",
+              "layout": "02.01.2006"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "storage": {
+    "kind": "postgres",
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "mode": "multi_table",
+      "tables": [
+        {
+          "name": "public.vehicles",
+          "auto_create_table": true,
+          "primary_key": { "name": "vehicle_id", "type": "serial" },
+          "columns": [
+            { "name": "pcv", "type": "bigint", "nullable": false }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["pcv"] }
+          ],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [
+              { "target_column": "pcv", "source_field": "pcv" }
+            ],
+            "conflict": { "target_columns": ["pcv"], "action": "do_nothing" },
+            "returning": ["vehicle_id", "pcv"],
+            "cache": { "key_column": "pcv", "value_column": "vehicle_id", "prewarm": false }
+          }
+        },
+        {
+          "name": "public.doplnkove_vybaveni_typ",
+          "auto_create_table": true,
+          "primary_key": { "name": "doplnkove_vybaveni_typ_id", "type": "serial" },
+          "columns": [
+            { "name": "name", "type": "text", "nullable": false }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["name"] }
+          ],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [
+              { "target_column": "name", "source_field": "typ", "transform": [{ "kind": "trim" }] }
+            ],
+            "conflict": { "target_columns": ["name"], "action": "do_nothing" },
+            "returning": ["doplnkove_vybaveni_typ_id", "name"],
+            "cache": { "key_column": "name", "value_column": "doplnkove_vybaveni_typ_id", "prewarm": true }
+          }
+        },
+        {
+          "name": "public.vozidla_doplnkove_vybaveni",
+          "auto_create_table": true,
+          "primary_key": { "name": "vozidla_doplnkove_vybaveni_id", "type": "serial" },
+          "columns": [
+            { "name": "vehicle_id", "type": "int", "nullable": false, "references": "public.vehicles(vehicle_id)" },
+            { "name": "row_hash", "type": "text", "nullable": false },
+            { "name": "typ_id", "type": "int", "nullable": true, "references": "public.doplnkove_vybaveni_typ(doplnkove_vybaveni_typ_id)" },
+            { "name": "od", "type": "date", "nullable": true },
+            { "name": "do", "type": "date", "nullable": true }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["vehicle_id", "row_hash"] }
+          ],
+          "load": {
+            "kind": "fact",
+            "dedupe": {
+              "conflict_columns": ["vehicle_id", "row_hash"],
+              "action": "do_nothing"
+            },
+            "from_rows": [
+              {
+                "target_column": "vehicle_id",
+                "lookup": {
+                  "table": "public.vehicles",
+                  "match": { "pcv": "pcv" },
+                  "return": "vehicle_id",
+                  "on_missing": "insert"
+                }
+              },
+              { "target_column": "row_hash", "source_field": "row_hash" },
+              {
+                "target_column": "typ_id",
+                "lookup": {
+                  "table": "public.doplnkove_vybaveni_typ",
+                  "match": { "name": "typ" },
+                  "return": "doplnkove_vybaveni_typ_id",
+                  "on_missing": "insert"
+                }
+              },
+              { "target_column": "od", "source_field": "od" },
+              { "target_column": "do", "source_field": "do" }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+

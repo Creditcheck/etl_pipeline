@@ -11,7 +11,7 @@ RUN set -eu; \
     [ -f "$d/main.go" ] || continue; \
     name="$(basename "$d")"; \
     echo "==> building $name"; \
-    go build -o "/app/bin/$name" "./cmd/$name"; \
+    go build -o "/usr/local/bin/$name" "./cmd/$name"; \
   done
 
 FROM alpine:3
@@ -22,12 +22,14 @@ RUN apk add bash jq
 RUN addgroup -S etl && adduser -S -G etl -h /home/etl etl
 
 WORKDIR /app
-COPY --from=builder /app/bin/ /usr/local/bin/
-COPY --from=builder /app/tests/ /app/tests/
-COPY --from=builder /app/configs/ /app/configs/
+COPY --from=builder /usr/local/bin/ /usr/local/bin/
+COPY tests/ /app/tests/
+COPY configs/ /app/configs/
 
 # directories for generated configs and sqlite DB (owned by non-root)
 RUN mkdir -p /configs /data/db /home/etl && \
     chown -R etl:etl /configs /data/db /home/etl /app
+#### for development ####
+RUN apk add vim
 
-USER etl
+#USER etl

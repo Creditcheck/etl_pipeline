@@ -1,4 +1,19 @@
 services:
+  # ---------------- ETL CLI / E2E Runner ----------------
+  etl-runner:
+    build:
+      context: ./etl
+      dockerfile: ./Dockerfile
+    container_name: etl-runner
+    profiles: ["runner"]
+    working_dir: /app
+    volumes:
+      - ./etl:/work:z
+    environment:
+      TZ: ${TZ:-Europe/Prague}
+    # No entrypoint in the image; command is optional and you can override it.
+#    command: ["/bin/sh", "-lc", "ls -la /usr/local/bin"]
+
   # ---------------- PostgreSQL ----------------
   postgres:
     image: postgres:15

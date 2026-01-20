@@ -1,0 +1,332 @@
+{
+  // ----------------------------
+  // High-level job identification
+  // ----------------------------
+  "job": "vozidla_dovoz_multi",
+
+  // ----------------------------
+  // Source: where the input rows come from
+  // kind=file means read from a local file path.
+  // This is streamed (no full-file buffering) by StreamValidatedRows().
+  // ----------------------------
+  "source": {
+    "kind": "file",
+    "file": {
+      // Path to CSV file with the input dataset:
+      // columns: Datum dovozu, PČV, Stát
+      "path": "/home/zippy/projects/data/file.csv"
+    }
+  },
+
+  // ----------------------------
+  // Parser: how to interpret source bytes into rows
+  // kind=csv => internal/parser/csv streaming parser
+  // options are passed to csv.StreamCSVRows()
+  // ----------------------------
+  "parser": {
+    "kind": "csv",
+    "options": {
+      // CSV delimiter
+      "comma": ",",
+
+      // Guardrail: expect exactly 3 fields per row (after CSV parsing)
+      "expected_fields": 3,
+
+      // First row is a header row (column names)
+      "has_header": true,
+
+      // Map input header labels -> internal canonical field names.
+      // This is what the transforms + storage mappings refer to.
+      "header_map": {
+        "Datum dovozu": "datum_dovozu",
+        "PČV": "pcv",
+        "Stát": "stat"
+      },
+
+      // Trim leading/trailing whitespace in parsed CSV fields.
+      "trim_space": true
+    }
+  },
+
+  // ----------------------------
+  // Transform pipeline (streaming):
+  // Each stage processes pooled rows and forwards them.
+  // No full dataset buffering.
+  // ----------------------------
+  "transform": [
+    {
+      // Coerce stage: parse strings into typed values used downstream.
+      // In your engine: TransformLoopRows() + compiled plan.
+      "kind": "coerce",
+      "options": {
+        // Date layout for parsing "datum_dovozu" (dd.mm.yyyy)
+        "layout": "02.01.2006",
+
+        // Field -> type coercions.
+        // Note: pcv is bigint so it becomes int64 in streaming pipeline.
+        "types": {
+          "datum_dovozu": "date",
+          "pcv": "bigint",
+          "stat": "text"
+        }
+      }
+    },
+    {
+      // Validate stage: enforces contract + drops invalid rows (lenient).
+      "kind": "validate",
+      "options": {
+        // Contract schema name (informational)
+        "contract": {
+          "name": "vozidla_dovoz",
+          "fields": [
+            // pcv must exist and be parseable as bigint
+            { "name": "pcv", "type": "bigint", "required": true },
+
+            // stat must exist and be parseable as text
+            { "name": "stat", "type": "text", "required": true },
+
+            // datum_dovozu is optional date
+            { "name": "datum_dovozu", "type": "date", "layout": "02.01.2006" }
+          ]
+        },
+
+        // lenient => invalid rows are dropped, run continues.
+        "policy": "lenient"
+      }
+    }
+  ],
+
+  // ----------------------------
+  // Storage backend configuration (multi-table mode):
+  // This must match Runner.validateMultiConfig():
+  //   storage.db.mode == "multi_table"
+  // and tables must not be empty.
+  // ----------------------------
+  "storage": {
+    "kind": "postgres",
+    "db": {
+      // DSN can include env vars; Runner expands them via os.ExpandEnv().
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+
+      // REQUIRED for cmd/etl_multi multi-table runner.
+      "mode": "multi_table",
+
+      // ----------------------------
+      // "tables" describes ALL destination tables + how to load them.
+      //
+      // In Engine2Pass:
+      // - Pass 1 streams input and calls EnsureDimensionKeys() for each dimension table.
+      // - Pass 2 streams again, resolves lookup IDs via SelectKeyValueByKeys(),
+      //   then inserts facts via InsertFactRows().
+      // ----------------------------
+      "tables": [
+
+        // ============================================================
+        // DIMENSION TABLE #1: public.vehicles
+        // ============================================================
+        {
+          // Fully-qualified table name.
+          "name": "public.vehicles",
+
+          // If true, backend will auto-create the table if missing.
+          "auto_create_table": true,
+
+          // Primary key definition (serial integer surrogate id).
+          "primary_key": { "name": "vehicle_id", "type": "serial" },
+
+          // Non-PK columns.
+          "columns": [
+            // Dimension key column: PCV must not be null.
+            { "name": "pcv", "type": "bigint", "nullable": false }
+          ],
+
+          // Enforce uniqueness of the natural key (pcv).
+          "constraints": [
+            { "kind": "unique", "columns": ["pcv"] }
+          ],
+
+          "load": {
+            // "dimension" means: ensure keys exist (idempotent insert).
+            // This table is filled during Pass 1.
+            "kind": "dimension",
+
+            // Which input field populates which table column.
+            "from_rows": [
+              { "target_column": "pcv", "source_field": "pcv" }
+            ],
+
+            // Conflict handling for idempotent inserts:
+            // insert pcv, do nothing if pcv already exists.
+            "conflict": {
+              "target_columns": ["pcv"],
+              "action": "do_nothing"
+            },
+
+            // Which columns the backend should return after insert/select.
+            // (Used for building key->id mapping.)
+            "returning": ["vehicle_id", "pcv"],
+
+            // Cache behavior for lookups during Pass 2.
+            "cache": {
+              // Lookup key column
+              "key_column": "pcv",
+              // Lookup value column (surrogate id)
+              "value_column": "vehicle_id",
+              // prewarm=false: do not pre-load all vehicles.
+              // (Good: vehicles is high-cardinality.)
+              "prewarm": false
+            }
+          }
+        },
+
+        // ============================================================
+        // DIMENSION TABLE #2: public.countries
+        // ============================================================
+        {
+          "name": "public.countries",
+          "auto_create_table": true,
+          "primary_key": { "name": "country_id", "type": "serial" },
+
+          "columns": [
+            // Country name; varchar(100) to limit size.
+            { "name": "name", "type": "varchar(100)", "nullable": false }
+          ],
+
+          // Unique by name (dimension natural key).
+          "constraints": [
+            { "kind": "unique", "columns": ["name"] }
+          ],
+
+          "load": {
+            "kind": "dimension",
+
+            "from_rows": [
+              {
+                // Map input "stat" to "name"
+                "target_column": "name",
+                "source_field": "stat",
+
+                // Per-field transform at load mapping level.
+                // Here: trim whitespace (useful for "Czech Republic " vs "Czech Republic").
+                "transform": [{ "kind": "trim" }]
+              }
+            ],
+
+            // Idempotent insert on country name.
+            "conflict": {
+              "target_columns": ["name"],
+              "action": "do_nothing"
+            },
+
+            "returning": ["country_id", "name"],
+
+            "cache": {
+              "key_column": "name",
+              "value_column": "country_id",
+
+              // prewarm=true: countries is low-cardinality so prewarming is cheap,
+              // and helps reduce repeated lookups during Pass 2.
+              "prewarm": true
+            }
+          }
+        },
+
+        // ============================================================
+        // FACT TABLE: public.imports
+        // ============================================================
+        {
+          "name": "public.imports",
+          "auto_create_table": true,
+          "primary_key": { "name": "import_id", "type": "serial" },
+
+          // Fact table stores foreign keys to dimensions + fact attributes.
+          "columns": [
+            // FK to vehicles
+            { "name": "vehicle_id", "type": "int", "nullable": false, "references": "public.vehicles(vehicle_id)" },
+            // FK to countries
+            { "name": "country_id", "type": "int", "nullable": false, "references": "public.countries(country_id)" },
+            // Fact attribute
+            { "name": "import_date", "type": "date", "nullable": true }
+          ],
+
+          // A natural uniqueness rule for facts:
+          // a given vehicle imported from a given country should be unique.
+          "constraints": [
+            { "kind": "unique", "columns": ["vehicle_id", "country_id"] }
+          ],
+
+          "load": {
+            // "fact" means: loaded in Pass 2 after lookups are resolved.
+            "kind": "fact",
+
+            // Deduplication policy for fact inserts:
+            // ON CONFLICT(vehicle_id,country_id) DO NOTHING
+            "dedupe": {
+              "conflict_columns": ["vehicle_id", "country_id"],
+              "action": "do_nothing"
+            },
+
+            "from_rows": [
+              {
+                // Fill vehicle_id by looking up vehicles(pcv)->vehicle_id
+                "target_column": "vehicle_id",
+                "lookup": {
+                  "table": "public.vehicles",
+                  "match": { "pcv": "pcv" },
+                  "return": "vehicle_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                // Fill country_id by looking up countries(name)->country_id
+                "target_column": "country_id",
+                "lookup": {
+                  "table": "public.countries",
+                  "match": { "name": "stat" },
+                  "return": "country_id",
+                  "on_missing": "insert"
+                }
+              },
+              {
+                // Fill import_date directly from input date field.
+                "target_column": "import_date",
+                "source_field": "datum_dovozu"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  },
+
+  // ----------------------------
+  // Runtime / concurrency knobs (streaming pipeline)
+  // These affect bounded channels and worker counts.
+  // ----------------------------
+  "runtime": {
+    // Parser stage concurrency (currently csv.StreamCSVRows runs as a streamer;
+    // your wiring uses a goroutine and bounded channel; reader_workers is reserved/future-friendly).
+    "reader_workers": 1,
+
+    // TransformLoopRows workers (coerce stage).
+    "transform_workers": 5,
+
+    // Fact loader worker pool for Pass 2 insert throughput.
+    "loader_workers": 4,
+
+    // Batch size for dimension ensures and fact inserts.
+    "batch_size": 4096,
+
+    // Channel buffer size between stages.
+    "channel_buffer": 2048,
+
+    // Global dimension dedupe:
+    // false is recommended for high-cardinality keys (pcv nearly unique).
+    "dedupe_dimension_keys": false,
+
+    // Optional within-batch dedupe:
+    // false means pass1 sends whatever keys appear; DB conflict handling makes it idempotent.
+    "dedupe_dimension_keys_within_batch": false
+  }
+}
+

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"etl/internal/config"
+	csvparser "etl/internal/parser/csv"
 )
 
 // TestNormalizeBackendKind verifies backend normalization behavior as implemented.
@@ -217,5 +218,122 @@ func BenchmarkAutoSelectBreakouts(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = autoSelectBreakouts(stats)
+	}
+}
+
+// TestStripHeaderBOM verifies that UTF-8 BOM is removed from the first header
+// cell and that other headers are left unchanged.
+//
+// This matters because some real-world CSV exports (Excel, some CMS tools) emit
+// UTF-8 BOMs, which would otherwise pollute the first column name and cause
+// header_map mismatches.
+func TestStripHeaderBOM(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "empty",
+			in:   nil,
+			want: nil,
+		},
+		{
+			name: "no_bom",
+			in:   []string{"A", "B"},
+			want: []string{"A", "B"},
+		},
+		{
+			name: "bom_in_first_cell",
+			in:   []string{"\uFEFFPČV", "Stát"},
+			want: []string{"PČV", "Stát"},
+		},
+		{
+			name: "bom_not_in_first_cell_only_first_stripped",
+			in:   []string{"\uFEFFA", "\uFEFFB"},
+			want: []string{"A", "\uFEFFB"},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt // capture
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := append([]string(nil), tt.in...) // avoid mutating test vectors
+			got = csvparser.StripHeaderBOM(got)
+
+			if len(got) != len(tt.want) {
+				t.Fatalf("len mismatch: got=%d want=%d got=%v want=%v", len(got), len(tt.want), got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("mismatch at %d: got=%q want=%q full got=%v want=%v", i, got[i], tt.want[i], got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// TestNormalizeFieldName_TransliteratesDiacritics verifies that field name
+// normalization removes diacritics rather than dropping the entire character.
+//
+// This is required for Czech/Slovak datasets where headers may contain
+// characters like Č, Ř, Á, etc. Without transliteration, normalization becomes
+// lossy ("pčv" -> "pv"), which breaks stable schema naming.
+func TestNormalizeFieldName_TransliteratesDiacritics(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "PČV", want: "pcv"},
+		{in: "pčv", want: "pcv"},
+		{in: "Stát", want: "stat"},
+		{in: "Číslo-smlouvy", want: "cislo_smlouvy"},
+		{in: "  Řízení / Test  ", want: "rizeni_test"},
+	}
+
+	for _, tt := range tests {
+		tt := tt // capture
+		t.Run(tt.in, func(t *testing.T) {
+			t.Parallel()
+
+			got := normalizeFieldName(tt.in)
+			if got != tt.want {
+				t.Fatalf("normalizeFieldName(%q)=%q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBOMPlusNormalization verifies the real-world problematic case where a CSV
+// header begins with a BOM and contains diacritics.
+//
+// Example: Excel UTF-8 BOM + Czech header "PČV" yields "\uFEFFPČV".
+func TestBOMPlusNormalization(t *testing.T) {
+	t.Parallel()
+
+	headers := []string{"\uFEFFPČV", "Stát"}
+
+	// Ensure probe follows parser behavior for BOM stripping.
+	headers = csvparser.StripHeaderBOM(headers)
+
+	if headers[0] != "PČV" {
+		t.Fatalf("StripHeaderBOM did not strip BOM: got %q", headers[0])
+	}
+
+	// Ensure normalization produces stable ASCII identifiers.
+	n0 := normalizeFieldName(headers[0])
+	n1 := normalizeFieldName(headers[1])
+
+	if n0 != "pcv" {
+		t.Fatalf("normalized header[0]=%q want %q", n0, "pcv")
+	}
+	if n1 != "stat" {
+		t.Fatalf("normalized header[1]=%q want %q", n1, "stat")
 	}
 }
