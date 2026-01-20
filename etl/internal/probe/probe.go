@@ -1764,6 +1764,8 @@ func defaultDBConfigForBackend(backend, name string, columns []string) config.DB
 // truncateFieldName enforces backend identifier length limits while
 // preserving UTF-8 validity.
 func truncateFieldName(s string) string {
+	return EnforceStringLength(s, maxDBFieldLength)
+
 	const maxLen = 63
 	if len(s) <= maxLen {
 		return s
@@ -1781,6 +1783,110 @@ func truncateFieldName(s string) string {
 		return s[:maxLen]
 	}
 	return string(b[:cut])
+}
+
+const maxDBFieldLength = 63
+
+// EnforceStringLength truncates s to ensure it is no longer than length bytes,
+// while preserving both a meaningful prefix and suffix.
+//
+// This helper is designed for database identifier constraints (for example,
+// PostgreSQL limits identifiers to 63 bytes). Naively truncating identifiers
+// from the right can cause collisions when many columns share a long prefix
+// (e.g., nested JSON paths, verbose CSV headers). To reduce collisions while
+// retaining readability, this function keeps both the start and end of the
+// input string and inserts an underscore separator:
+//
+//   - If len(s) <= length: s is returned unchanged.
+//   - Otherwise:
+//     prefix := first (length/2 - 1) bytes (UTF-8 safe)
+//     suffix := last  (length/2 - 1) bytes (UTF-8 safe)
+//     result := prefix + "_" + suffix
+//
+// The output is guaranteed to be <= length bytes and UTF-8 valid.
+//
+// Notes:
+//   - length is interpreted in bytes, matching how most SQL engines enforce
+//     identifier length limits.
+//   - The function is conservative: if length is too small to hold a useful
+//     "prefix_suffix" form, it falls back to a simple UTF-8 safe truncation.
+func EnforceStringLength(s string, length int) string {
+	if length <= 0 {
+		return ""
+	}
+	if len(s) <= length {
+		return s
+	}
+
+	// Need at least 3 bytes to form "a_b" minimally.
+	if length < 3 {
+		return utf8SafePrefix(s, length)
+	}
+
+	// Keep both ends: (50% - 1) + "_" + (50% - 1)
+	half := length / 2
+	prefixLen := half - 1
+	suffixLen := half - 1
+
+	// If length is odd, give the extra byte to the suffix (stable choice).
+	// Example: length=63 => half=31 => prefix=30, suffix=30, plus "_" => 61.
+	// We then add 2 bytes to suffix by recomputing remainder below.
+	remainder := length - (prefixLen + 1 + suffixLen)
+	suffixLen += remainder
+
+	prefix := utf8SafePrefix(s, prefixLen)
+	suffix := utf8SafeSuffix(s, suffixLen)
+
+	out := prefix + "_" + suffix
+	if len(out) <= length {
+		return out
+	}
+
+	// Defensive fallback (should not happen, but keep invariant).
+	return utf8SafePrefix(out, length)
+}
+
+// utf8SafePrefix returns the first n bytes of s without splitting UTF-8 runes.
+func utf8SafePrefix(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	b := []byte(s)
+	cut := n
+	for cut > 0 && !utf8.Valid(b[:cut]) {
+		cut--
+	}
+	if cut <= 0 {
+		return ""
+	}
+	return string(b[:cut])
+}
+
+// utf8SafeSuffix returns the last n bytes of s without splitting UTF-8 runes.
+func utf8SafeSuffix(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	b := []byte(s)
+	start := len(b) - n
+	if start < 0 {
+		start = 0
+	}
+
+	// Move start forward until the slice is valid UTF-8.
+	for start < len(b) && !utf8.Valid(b[start:]) {
+		start++
+	}
+	if start >= len(b) {
+		return ""
+	}
+	return string(b[start:])
 }
 
 // normalizeFieldName converts an arbitrary input string into a safe,
