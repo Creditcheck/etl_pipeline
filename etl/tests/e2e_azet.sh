@@ -12,11 +12,16 @@ err() {
   exit 1
 }
 
+#### config / knobs ####
 mappings_dir="/app/configs/mappings/azet.sk"
 URL="https://www.azet.sk/katalog/"
 
+JGET_CONCURRENCY=1
+TIMEOUT="120s"
+MAX_SUBCATEGORY_URLS=3
+MAX_DETAIL_URLS=2
+
 export E2E=1
-START_DIR="$(pwd)"
 
 # Create a single-use temp working directory and run everything inside it.
 TMPDIR="$(mktemp -d -t azet_e2e.XXXXXXXX)" || err "failed to create temp dir"
@@ -28,106 +33,138 @@ trap cleanup_tmpdir EXIT INT TERM
 cd "$TMPDIR" || err "failed to cd into temp dir: $TMPDIR"
 
 get_category_urls() {
+  local tmpdir="$1"
+  local url="$2"
+  local mappings="$3"
+
   log "extract category urls"
   #### get URLs of top-level categories ####
-  wget -q -O index.html "$URL"
-  extract_html -mappings "${mappings_dir}/category.json" -dir . | jq -r '.[].href' > category-urls
+  wget -q -O "${tmpdir}/index.html" "$url"
+  extract_html -mappings "${mappings}/category.json" -dir "$tmpdir" | jq -r '.[].href' > "${tmpdir}/category-urls"
 }
 
 generate_subcategory_urls() {
+  local tmpdir="$1"
+  local mappings="$2"
+  local limit="$3"
+
   log "generate subcategory urls"
-  head -1 category-urls | while read -r line; do
-    extract_html -mappings "${mappings_dir}/subcategory-url-builder.json" -timeout 120s -url "$line" | expand_hrefs
-  done | sort | uniq | head -3 > subcategory-urls
+  head -1 "${tmpdir}/category-urls" | while read -r line; do
+    extract_html -mappings "${mappings}/subcategory-url-builder.json" -timeout "$TIMEOUT" -url "$line" | expand_hrefs
+  done | sort | uniq | head -"$limit" > "${tmpdir}/subcategory-urls"
 }
 
-get_subcategory_pages() {
+fetch_subcategory_pages() {
+  local tmpdir="$1"
+
   log "get subcategory pages"
-  jget -o subcategory -i subcategory-urls -n 1 -name azet.sk -t 120s > /dev/null
+  jget -o "${tmpdir}/subcategory" -i "${tmpdir}/subcategory-urls" -n "$JGET_CONCURRENCY" -name azet.sk -t "$TIMEOUT" > /dev/null
 }
 
-do_subcategory_mappings() {
+transform_subcategory_pages() {
+  local tmpdir="$1"
+  local mappings="$2"
+
   log "make subcategory.json from subcategory files"
-  extract_html -mappings "${mappings_dir}/subcategory.json" -dir subcategory | jq > subcategory.json
-}
-
-prepare_detail_pages() {
-  generate_detail_urls
-  get_detail_pages
-  do_detail_mappings
-}
-
-prepare_subcategory_pages() {
-  generate_subcategory_urls
-  get_subcategory_pages
-  do_subcategory_mappings
-}
-
-validate() {
-  #cd /app || return 1
-  validate_subcategory
-  validate_detail
+  extract_html -mappings "${mappings}/subcategory.json" -dir "${tmpdir}/subcategory" | jq > "${tmpdir}/subcategory.json"
 }
 
 generate_detail_urls() {
+  local tmpdir="$1"
+  local limit="$2"
+
   log "output detail urls"
-  jq -r '.[].href' subcategory.json | sort | uniq | head -2 > detail-urls
+  jq -r '.[].href' "${tmpdir}/subcategory.json" | sort | uniq | head -"$limit" > "${tmpdir}/detail-urls"
 }
 
-get_detail_pages() {
+fetch_detail_pages() {
+  local tmpdir="$1"
+
   log "get detail pages"
-  jget -n 1 -i detail-urls -o detail -t 120s > /dev/null
+  jget -n "$JGET_CONCURRENCY" -i "${tmpdir}/detail-urls" -o "${tmpdir}/detail" -t "$TIMEOUT" > /dev/null
 }
 
-do_detail_mappings() {
+transform_detail_pages() {
+  local tmpdir="$1"
+  local mappings="$2"
+
   log "transform detail files' html to JSON"
-  extract_html -mappings "${mappings_dir}/detail.json" -dir detail | jq > "${TMPDIR}/detail.json"
+  extract_html -mappings "${mappings}/detail.json" -dir "${tmpdir}/detail" | jq > "${tmpdir}/detail.json"
+}
+
+prepare_subcategory_pages() {
+  local tmpdir="$1"
+  local mappings="$2"
+
+  generate_subcategory_urls "$tmpdir" "$mappings" "$MAX_SUBCATEGORY_URLS"
+  fetch_subcategory_pages "$tmpdir"
+  transform_subcategory_pages "$tmpdir" "$mappings"
+}
+
+prepare_detail_pages() {
+  local tmpdir="$1"
+  local mappings="$2"
+
+  generate_detail_urls "$tmpdir" "$MAX_DETAIL_URLS"
+  fetch_detail_pages "$tmpdir"
+  transform_detail_pages "$tmpdir" "$mappings"
 }
 
 validate_subcategory() {
+  local tmpdir="$1"
+  local mappings="$2"
+
   log "validate mappings of subcategory pages are valid"
   export E2E_TARGET_URLS
-  E2E_TARGET_URLS="$(paste -sd, "${TMPDIR}/subcategory-urls")"
-  export E2E_MAPPINGS_PATH="${mappings_dir}/subcategory.json"
-  go test -run '^TestE2E_Strict_MappingsPopulateAcrossMultiplePages$' -tags=e2e -count=1 ./... | grep -E -v 'no test'
+  E2E_TARGET_URLS="$(paste -sd, "${tmpdir}/subcategory-urls")"
+  export E2E_MAPPINGS_PATH="${mappings}/subcategory.json"
+  (cd /app && go test -run '^TestE2E_Strict_MappingsPopulateAcrossMultiplePages$' -tags=e2e -count=1 ./...) | grep -E -v 'no test'
 }
 
 validate_detail() {
+  local tmpdir="$1"
+  local mappings="$2"
+
   log "validate mappings of detail pages are valid"
   export E2E_TARGET_URLS
-  E2E_TARGET_URLS="$(paste -sd, "${TMPDIR}/detail-urls")"
+  E2E_TARGET_URLS="$(paste -sd, "${tmpdir}/detail-urls")"
   E2E_TARGET_URLS="${E2E_TARGET_URLS},https://www.azet.sk/firma/2074/mr-real-s-r-o_1/,https://www.azet.sk/firma/1193737/brands-alliance-service-s-r-o/,https://www.azet.sk/firma/1247928/ivmo-real-s-r-o/,https://www.azet.sk/firma/1229449/stavega-s-r-o/"
-  export E2E_MAPPINGS_PATH="${mappings_dir}/detail.json"
-  go test -run '^TestE2E_Strict_MappingsPopulateAcrossMultiplePages$' -tags=e2e -count=1 ./... | grep -v 'no test'
+  export E2E_MAPPINGS_PATH="${mappings}/detail.json"
+  (cd /app && go test -run '^TestE2E_Strict_MappingsPopulateAcrossMultiplePages$' -tags=e2e -count=1 ./...) | grep -v 'no test'
+}
+
+validate() {
+  local tmpdir="$1"
+  local mappings="$2"
+
+  validate_subcategory "$tmpdir" "$mappings"
+  validate_detail "$tmpdir" "$mappings"
 }
 
 generate_config() {
+  local tmpdir="$1"
+
   log "generate etl config file"
-  #cd "$START_DIR" || return 1
-  probe -backend sqlite -bytes 1000000 -job detail -name detail -url "file://${TMPDIR}/detail.json" -pretty -multitable > "${TMPDIR}/config.json"
+  probe -backend sqlite -bytes 1000000 -job detail -name detail -url "file://${tmpdir}/detail.json" -pretty -multitable > "${tmpdir}/config.json"
 }
 
 run_etl() {
+  local tmpdir="$1"
+
   log "run ETL"
-  # this is a hack until paths and env are settled
-  if ! etl -config "${TMPDIR}/config.json"; then
+  if ! etl -metrics-backend none -config "${tmpdir}/config.json"; then
     err "etl failed"
   fi
 }
 
 main() {
-  get_category_urls
-  prepare_subcategory_pages
-  prepare_detail_pages
+  get_category_urls "$TMPDIR" "$URL" "$mappings_dir"
+  prepare_subcategory_pages "$TMPDIR" "$mappings_dir"
+  prepare_detail_pages "$TMPDIR" "$mappings_dir"
 
-  # Keep these alongside other temp outputs for validation.
-  cp detail-urls "${TMPDIR}/"
-  cp subcategory-urls "${TMPDIR}/"
+  generate_config "$TMPDIR"
+  validate "$TMPDIR" "$mappings_dir"
 
-  generate_config
-  validate
-
-  run_etl
+  run_etl "$TMPDIR"
 }
 main
-

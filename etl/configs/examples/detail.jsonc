@@ -1,0 +1,139 @@
+{
+  "mappings": [
+
+    // ------------------------------------------------------------
+    // Breadcrumb navigation
+    // ------------------------------------------------------------
+    // Extracts all breadcrumb labels as plain text.
+    //
+    // Example HTML:
+    // <nav id="breadcrumb">
+    //   <a href="/"><span>Home</span></a>
+    //   <a href="/shops"><span>Shops</span></a>
+    //   <a href="/shops/abc"><span>ABC Store</span></a>
+    // </nav>
+    //
+    // Result:
+    // breadcrumbs = ["Home", "Shops", "ABC Store"]
+    {
+      "selector": "#breadcrumb a span",
+      "extract": "text",
+      "json_path": "breadcrumbs",
+      "all": true
+    },
+
+    // ------------------------------------------------------------
+    // Rating count
+    // ------------------------------------------------------------
+    // Extracts the number of ratings from link text using regex.
+    //
+    // Example HTML:
+    // <a class="ratingCount">23 ratings</a>
+    //
+    // Regex capture group ([0-9]+) extracts "23"
+    {
+      "selector": "a.ratingCount",
+      "match": ".*?([0-9]+).*",
+      "extract": "text",
+      "json_path": "rating_count"
+    },
+
+    // ------------------------------------------------------------
+    // Company / product logo image
+    // ------------------------------------------------------------
+    // Extracts the "src" attribute from an image marked with itemprop="image".
+    //
+    // Example HTML:
+    // <img itemprop="image" src="https://example.com/logo.png" />
+    {
+      "selector": "img[itemprop=\"image\"]",
+      "extract": "attr",
+      "attr": "src",
+      "json_path": "logo_src"
+    },
+
+    // ------------------------------------------------------------
+    // Name field (label-value pattern)
+    // ------------------------------------------------------------
+    // Finds a <div> that contains:
+    //   <b>Názov</b>
+    // and then extracts the text from the corresponding value span.
+    //
+    // This is a robust selector because it anchors on visible label text,
+    // not on DOM position.
+    //
+    // Example HTML:
+    // <div class="foo">
+    //   <b>Názov</b>
+    //   <span class="value">ABC Store</span>
+    // </div>
+    {
+      "selector": "div.foo:has(b:contains(\"Názov\")) span.value",
+      "extract": "text",
+      "json_path": "name"
+    },
+
+    // ------------------------------------------------------------
+    // ❌ BAD / BRITTLE SELECTOR EXAMPLE
+    // ------------------------------------------------------------
+    // This selector relies on :nth-of-type(), which depends on exact
+    // DOM ordering and will break if:
+    //  - a new sibling element is inserted
+    //  - markup changes slightly
+    //
+    // We should generally AVOID :nth-child() and :nth-of-type()
+    // in scraping selectors unless there is no alternative.
+    //
+    // Example HTML (fragile):
+    // <td class="contactValueCell">
+    //   <a href="https://example.com">example.com</a>
+    // </td>
+    {
+      "selector": ".contactValueCell:nth-of-type(1) a",
+      "extract": "text",
+      "json_path": "website",
+      "all": true
+    },
+
+    // ------------------------------------------------------------
+    // Phone number
+    // ------------------------------------------------------------
+    // Selects a <div class="contact"> that immediately follows
+    // a <span> containing <span class="phone">.
+    //
+    // This uses structural + semantic cues instead of position.
+    //
+    // Example HTML:
+    // <span>
+    //   <span class="phone">Phone</span>
+    // </span>
+    // <div class="contact">+421 123 456 789</div>
+    {
+      "selector": "span:has(span.phone) + div.contact",
+      "extract": "text",
+      "json_path": "phone",
+      "all": true
+    },
+
+    // ------------------------------------------------------------
+    // Email address (obfuscated in JavaScript)
+    // ------------------------------------------------------------
+    // Extracts email addresses embedded in <script> tags.
+    // Typically used when emails are constructed via JS to avoid scraping.
+    //
+    // Example HTML:
+    // <script>
+    //   document.write("info" + "@" + "example.com");
+    // </script>
+    //
+    // The custom extractor "js_email" is expected to parse
+    // and reconstruct the email address.
+    {
+      "selector": "div script",
+      "extract": "js_email",
+      "json_path": "email",
+      "all": true
+    }
+  ]
+}
+

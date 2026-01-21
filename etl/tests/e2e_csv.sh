@@ -1,154 +1,157 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 INPUT_FILE="${1:-}"
-NAME="honza"
-CONFIG="${NAME}.json"
+JOBS="${JOBS:-11}"              # or pass -j N
+BASE_NAME="honza"
 BYTES=10000
 SLEEP_BETWEEN=0.25
 
-# Global run-scoped state (set per input line).
-URL=""
-DESCRIPTION=""
-counter=0
-WORKDIR=""
-RUNID="$$"
-LOCKDIR="/tmp/e2e_csv.lock"
-
 ts() { date +'%Y-%m-%dT%H:%M:%S.%3N'; }
 
-log(){
-  entry="$*"
-  counter=$((counter + 1))
-  local wd=""
-  if [ -n "${WORKDIR:-}" ]; then
-    wd="$(basename "$WORKDIR")"
-  fi
-  echo "[$(ts)]: INFO: (pid=${RUNID} wd=${wd} desc=${DESCRIPTION} step ${counter}) ${entry}" >&2
+usage() {
+  echo "USAGE: $0 <file> [-j N]" >&2
+  echo "FILE FORMAT: each line must be: url,\"description\"" >&2
+  echo "EXAMPLE LINE: https://example.com/data.csv,\"Aktivní osoby v ROS\"" >&2
+  exit 2
 }
 
 err() {
-  echo "[$(ts)]: ERROR: (pid=${RUNID} desc=${DESCRIPTION}) $*" >&2
+  echo "[$(ts)]: ERROR: $*" >&2
   exit 1
 }
 
-usage() {
-  echo "USAGE: $0 <file>" >&2
-  echo "FILE FORMAT: each line must be: url,\"description\"" >&2
-  echo "EXAMPLE LINE: https://example.com/data.csv,\"Aktivní osoby v ROS\"" >&2
-  err "missing input file argument"
+# Parse args: first positional is file, optional -j
+parse_args() {
+  local file="${1:-}"
+  shift || true
+  INPUT_FILE="$file"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -j|--jobs)
+        shift
+        JOBS="${1:-}"
+        [ -n "${JOBS}" ] || err "missing value for -j/--jobs"
+        ;;
+      *)
+        err "unknown argument: $1"
+        ;;
+    esac
+    shift || true
+  done
 }
 
-cleanup() {
-  log "cleanup"
-
-  # Remove workdir if created.
-  if [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR" ]; then
-    rm -rf "$WORKDIR"
-  fi
-
-  # Release lock (best-effort).
-  if [ -d "$LOCKDIR" ]; then
-    rmdir "$LOCKDIR" 2>/dev/null || true
-  fi
-}
-
-lock_acquire() {
-  if ! mkdir "$LOCKDIR" 2>/dev/null; then
-    err "lock held ($LOCKDIR). Another run is active, or a stale lock exists."
-  fi
-}
-
-setup_workdir() {
-  log "setup workdir"
-  WORKDIR="$(mktemp -d -t etl_probe_run.XXXXXXXX)"
-  cd "$WORKDIR" || err "failed to cd into temp workdir: $WORKDIR"
-}
-
+# Parse `url,"description"` line
 parse_line() {
   local line="$1"
-
-  URL=""
-  DESCRIPTION=""
-
+  local url="" desc=""
   while IFS=, read -r col1 col2; do
     [[ -z "${col1// /}" ]] && continue
-
     col2="${col2%\"}"
     col2="${col2#\"}"
-
-    URL="$col1"
-    DESCRIPTION="$col2"
+    url="$col1"
+    desc="$col2"
   done <<< "$line"
 
-  if [[ -z "${URL// /}" ]]; then
-    err "parsed URL is empty; expected format: url,\"description\""
-  fi
-}
-
-generate_etl_config() {
-  log "generating ETL config into ${WORKDIR}/${CONFIG}"
-  if ! probe \
-    -backend sqlite \
-    -save \
-    -bytes "$BYTES" \
-    -name "$NAME" \
-    -url "$URL" \
-    -breakout ico \
-    > "$CONFIG"; then
-    err "failed to run generate_etl_config"
-  fi
-}
-
-run_etl() {
-  log "running ETL with config ${WORKDIR}/${CONFIG}"
-  if ! etl -config "$CONFIG"; then
-    err "failed to run etl"
-  fi
+  [[ -n "${url// /}" ]] || err "parsed URL is empty; expected: url,\"description\""
+  printf '%s\n' "$url|$desc"
 }
 
 run_one() {
-  local line="$1"
+  local job_id="$1"
+  local line="$2"
 
-  # Reset per-run counters/state.
+  local parsed url desc
+  parsed="$(parse_line "$line")"
+  url="${parsed%%|*}"
+  desc="${parsed#*|}"
+
+  local workdir config name runid counter
+  runid="$$"
   counter=0
-  WORKDIR=""
 
-  parse_line "$line"
-  lock_acquire
+  log() {
+    counter=$((counter + 1))
+    local wd
+    wd="$(basename "$workdir" 2>/dev/null || true)"
+    echo "[$(ts)]: INFO: (pid=${runid} job=${job_id} wd=${wd} desc=${desc} step ${counter}) $*" >&2
+  }
+
+  cleanup() {
+    # best-effort cleanup
+    if [ -n "${workdir:-}" ] && [ -d "$workdir" ]; then
+      rm -rf "$workdir"
+    fi
+  }
+
   trap cleanup EXIT INT TERM
 
-  setup_workdir
-  generate_etl_config
-  run_etl
+  workdir="$(mktemp -d -t etl_probe_run."${job_id}".XXXXXXXX)"
+  cd "$workdir" || err "failed to cd into temp workdir: $workdir"
 
-  log "done (temp dir will be removed): $WORKDIR"
+  # Unique per-job name/config to avoid collisions (sqlite files, outputs, etc.)
+  name="${BASE_NAME}-${job_id}"
+  config="${name}.json"
 
-  # Run cleanup now (and disable trap) so the next run can acquire lock.
-  trap - EXIT INT TERM
-  cleanup
+  log "setup workdir"
+  log "generating ETL config into ${workdir}/${config}"
+  probe \
+    -backend sqlite \
+    -save \
+    -bytes "$BYTES" \
+    -name "$name" \
+    -url "$url" \
+    -breakout ico \
+    > "$config"
+
+  log "running ETL with config ${workdir}/${config}"
+  etl -metrics-backend none -config "$config"
+
+  log "done (temp dir will be removed): $workdir"
+
+  # throttle a bit per job to avoid hammering endpoints
+  sleep "$SLEEP_BETWEEN"
 }
 
 main() {
-  if [ -z "${INPUT_FILE:-}" ]; then
-    usage
-  fi
-  if [ ! -f "$INPUT_FILE" ]; then
-    err "file not found: $INPUT_FILE"
-  fi
+  parse_args "$@"
 
-  # Read file line-by-line without using a pipe (avoids subshell surprises).
-  while IFS= read -r line || [ -n "$line" ]; do
-    # Skip empty lines and comment lines
-    [[ -z "${line// /}" ]] && continue
-    [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+  [ -n "${INPUT_FILE:-}" ] || usage
+  [ -f "$INPUT_FILE" ] || err "file not found: $INPUT_FILE"
+  [[ "$JOBS" =~ ^[0-9]+$ ]] || err "JOBS must be an integer, got: $JOBS"
+  [ "$JOBS" -ge 1 ] || err "JOBS must be >= 1"
 
-    run_one "$line"
+  # Read all non-empty, non-comment lines into an array.
+  mapfile -t LINES < <(grep -vE '^[[:space:]]*(#|$)' "$INPUT_FILE" || true)
+  [ "${#LINES[@]}" -gt 0 ] || err "no runnable lines found in: $INPUT_FILE"
 
-    # Small delay between runs to avoid hammering endpoints and logs.
-    sleep "$SLEEP_BETWEEN"
-  done < "$INPUT_FILE"
+  # Simple job queue with bash builtins (no xargs/parallel dependency).
+  local i=0
+  local active=0
+  local job_id=0
+
+  while [ $i -lt "${#LINES[@]}" ]; do
+    # If at concurrency limit, wait for any job to finish.
+    if [ "$active" -ge "$JOBS" ]; then
+      wait -n
+      active=$((active - 1))
+      continue
+    fi
+
+    job_id=$((job_id + 1))
+    run_one "$job_id" "${LINES[$i]}" &
+    active=$((active + 1))
+    i=$((i + 1))
+  done
+
+  # Wait for remaining jobs
+  while [ "$active" -gt 0 ]; do
+    wait -n
+    active=$((active - 1))
+  done
 }
 
-main
+main "$@"
+
 

@@ -1,0 +1,50 @@
+{
+  // loops over each 'item' in 'list'
+  // for example:
+  // <div class="list">
+  //   <div class="item"></div>
+  //   <div class="item"></div>
+  // </div>
+  
+  "record_selector": "div.list div.item",
+  "mappings": [
+    {
+	  // this example outputs:
+	  // {"bar": "https://root.cz/"}
+	  
+	  // <div class="list">
+	  //   <div class="item">
+	  //     <div class="foo">
+	  //       <h2><a href="https://root.cz/">candy
+
+      "selector": "div.foo > h2 a",
+	  /* specify which part to extract. 
+	     options are:
+	     'text' == <a>gets value inside the tag</a>
+	     'attr' == <a href="gets_value_from_tag's_attribute">
+	     'js_email' == I this option to handle jarbled email on azet.sk
+	     here we want the url, from the <a> element's "href" attribute.
+	     so we extract 'attr', and specify attr=="href".
+	  */
+      "extract": "attr",
+      "attr": "href",
+	  // key name in json will be "bar"
+      "json_path": "bar"
+    },
+    {
+	  // this example outputs:
+	  // {"category": "[a,b,c]"}
+	  /* <ul>
+	       <li>a</li>
+	       <li>b</li>
+	       <li>c</li>
+		 </ul>
+	  */
+      "selector": "ul li",
+      "extract": "text",
+      "json_path": "category",
+	  "all": "true" 
+    }
+  ]
+}
+

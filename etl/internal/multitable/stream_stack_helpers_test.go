@@ -14,9 +14,10 @@ import (
 // TestValidateStreamConfig verifies streaming config validation is deterministic
 // and does not start goroutines or touch I/O.
 //
-// When to use:
-//   - Ensuring error messages remain stable for CLI users.
-//   - Preventing regressions where invalid configs leak goroutines.
+// Concurrency:
+//   - Subtests run in parallel. Pipeline contains pointer fields (Source.File),
+//     so each subtest must start from a fresh baseline config to avoid sharing
+//     mutable pointers.
 //
 // Errors:
 //   - Validates required source.kind/file.path.
@@ -24,9 +25,11 @@ import (
 func TestValidateStreamConfig(t *testing.T) {
 	t.Parallel()
 
-	base := Pipeline{
-		Source: Source{Kind: "file", File: &FileSource{Path: "x"}},
-		Parser: Parser{Kind: "csv"},
+	newBase := func() Pipeline {
+		return Pipeline{
+			Source: Source{Kind: "file", File: &FileSource{Path: "x"}},
+			Parser: Parser{Kind: "csv"},
+		}
 	}
 
 	tests := []struct {
@@ -72,7 +75,7 @@ func TestValidateStreamConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := validateStreamConfig(tt.mutate(base))
+			err := validateStreamConfig(tt.mutate(newBase()))
 			if tt.wantErr == "" {
 				if err != nil {
 					t.Fatalf("validateStreamConfig() err=%v, want nil", err)

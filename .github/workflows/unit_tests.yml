@@ -31,7 +31,7 @@ jobs:
       - name: E2E tests
         run: |
           cd etl
-          docker build -t etl:test .
+          docker build --target builder -t etl:test .
           docker run -i --rm etl:test tests/e2e_csv.sh tests/csv-urls
-          #docker run -i --rm etl:test tests/e2e_azet.sh
+          docker run -i --rm etl:test tests/e2e_azet.sh
 

@@ -167,16 +167,19 @@ func deepCopyRows(in [][]any) [][]any {
 	return out
 }
 
-// makeRow returns a pooled *transformer.Row with the provided positional values.
-// The returned row is owned by the caller.
+// makeRow returns a *transformer.Row with the provided positional values.
 //
-// When to use:
-//   - Building deterministic streams for Engine2Pass tests.
+// It intentionally does NOT allocate from the global transformer row pool.
+// Engine tests run in parallel and cancellation paths may concurrently Free/Drop
+// rows while other goroutines are still producing new rows. Using the shared
+// pool in tests can therefore trigger -race reports due to reuse handoff timing.
+//
+// Ownership:
+//   - The returned row is owned by the caller.
+//   - The engine must call r.Free() or r.Drop() exactly once when done.
 func makeRow(values ...any) *transformer.Row {
-	r := transformer.GetRow(len(values))
-	for i := range values {
-		r.V[i] = values[i]
-	}
+	r := &transformer.Row{V: make([]any, len(values))}
+	copy(r.V, values)
 	return r
 }
 

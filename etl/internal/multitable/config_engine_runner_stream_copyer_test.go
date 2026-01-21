@@ -20,6 +20,12 @@ func boolPtr(b bool) *bool { return &b }
 // TestValidateMultiConfig verifies that validateMultiConfig enforces the minimum
 // required shape for a multi-table pipeline.
 //
+// Important:
+//   - Subtests run in parallel. The Pipeline config includes pointer fields
+//     (for example Source.File), so a shallow copy can accidentally share state
+//     across subtests and cause flaky failures. This test constructs a fresh
+//     baseline config for each subtest to avoid shared mutable pointers.
+//
 // When to use:
 //   - Use this test as a safety net when evolving the JSON schema.
 //   - It protects runtime from failing deep inside the engine due to misconfig.
@@ -36,18 +42,20 @@ func boolPtr(b bool) *bool { return &b }
 func TestValidateMultiConfig(t *testing.T) {
 	t.Parallel()
 
-	base := Pipeline{
-		Source: Source{Kind: "file", File: &FileSource{Path: "in.csv"}},
-		Parser: Parser{Kind: "csv"},
-		Storage: Storage{
-			Kind: "sqlite",
-			DB: MultiDB{
-				Mode: "multi_table",
-				Tables: []storage.TableSpec{
-					{Name: "t1"},
+	newBase := func() Pipeline {
+		return Pipeline{
+			Source: Source{Kind: "file", File: &FileSource{Path: "in.csv"}},
+			Parser: Parser{Kind: "csv"},
+			Storage: Storage{
+				Kind: "sqlite",
+				DB: MultiDB{
+					Mode: "multi_table",
+					Tables: []storage.TableSpec{
+						{Name: "t1"},
+					},
 				},
 			},
-		},
+		}
 	}
 
 	tests := []struct {
@@ -109,8 +117,9 @@ func TestValidateMultiConfig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			cfg := tt.mutate(base)
+			cfg := tt.mutate(newBase())
 			err := validateMultiConfig(cfg)
+
 			if tt.wantErr == "" && err != nil {
 				t.Fatalf("validateMultiConfig() err=%v, want nil", err)
 			}
