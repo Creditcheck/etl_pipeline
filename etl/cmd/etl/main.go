@@ -11,19 +11,16 @@ import (
 
 	"etl/internal/metrics"
 	"etl/internal/metrics/datadog"
-	"etl/internal/metrics/prompush"
 	"etl/internal/multitable"
 	_ "etl/internal/storage/all"
 )
 
 func main() {
 	var cfgPath string
-	var metricsBackend string
 	var pushgatewayURL string
+	var metricsBackend string
 	flag.StringVar(&cfgPath, "config", "", "path to multi-table pipeline config JSON")
-	//flag.StringVar(&metricsBackend, "metrics-backend", os.Getenv("METRICS_BACKEND"), "metrics backend: none|pushgateway|datadog (or set METRICS_BACKEND)")
-	flag.StringVar(&metricsBackend, "metrics-backend", "datadog", "metrics backend: none|pushgateway|datadog (or set METRICS_BACKEND)")
-	flag.StringVar(&pushgatewayURL, "pushgateway-url", "http://localhost:9091", "Prometheus Pushgateway base URL (or set PUSHGATEWAY_URL)")
+	flag.StringVar(&metricsBackend, "metrics-backend", "datadog", "metrics backend: none|datadog (or set METRICS_BACKEND)")
 	flag.Parse()
 
 	if cfgPath == "" {
@@ -97,21 +94,6 @@ func initMetrics(ctx context.Context, jobName, backendName, pushgatewayURL strin
 	case "none", "noop":
 		// No-op backend is the default in internal/metrics.
 		return func() {}, nil
-
-	case "pushgateway", "prom", "prometheus":
-		b, err := prompush.NewBackend(jobName, pushgatewayURL)
-		if err != nil {
-			return func() {}, err
-		}
-		metrics.SetBackend(b)
-
-		// Pushgateway backends require an explicit flush at process end.
-		// We also log flush errors so operators can detect networking/auth issues.
-		return func() {
-			if err := metrics.Flush(); err != nil {
-				log.Printf("metrics: pushgateway flush error: %v", err)
-			}
-		}, nil
 
 	case "datadog", "dd":
 		// Datadog backend flushes periodically while the process runs and then once
