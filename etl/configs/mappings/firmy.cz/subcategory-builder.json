@@ -1,0 +1,20 @@
+{
+  "mappings": [
+	{
+      "selector": "div.paging a.pagingBtn",
+      "match": "(.*)",
+      "extract": "attr",
+	  "attr":"href",
+      "json_path": "href"
+    },
+    {
+      "selector": "div.paging a.pagingBtn",
+      "match": ".*?all\":([0-9]+).*",
+      "extract": "attr",
+	  "attr":"data-dot-data",
+      "json_path": "count"
+    }
+
+  ]
+}
+

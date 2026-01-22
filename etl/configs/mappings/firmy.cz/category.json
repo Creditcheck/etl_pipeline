@@ -1,0 +1,12 @@
+{
+  "record_selector": "div.homeMainCategories",
+  "mappings": [
+    {
+      "selector": "a.homeMainCategoryButton",
+      "extract": "attr",
+      "attr": "href",
+      "json_path": "href",
+      "all": true
+    }
+  ]
+}
