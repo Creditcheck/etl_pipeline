@@ -26,7 +26,7 @@ MAX_DETAIL_URLS=2
 export E2E=1
 
 # Create a single-use temp working directory and run everything inside it.
-TMPDIR="$(mktemp -d -t "${NAME}_e2e.XXXXXXXX}")" || err "failed to create temp dir"
+TMPDIR="$(mktemp -d -t "${NAME}_e2e.XXXXXXXX")" || err "failed to create temp dir"
 cleanup_tmpdir() {
   rm -rf "$TMPDIR"
 }
