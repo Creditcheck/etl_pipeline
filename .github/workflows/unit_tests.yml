@@ -32,6 +32,16 @@ jobs:
         run: |
           cd etl
           docker build --target builder -t etl:test .
+          echo "======================== start tests/e2e_csv.sh tests/csv-urls ======================"
+          echo "======================== start tests/e2e_csv.sh tests/csv-urls ======================"
+          echo "======================== start tests/e2e_csv.sh tests/csv-urls ======================"
           docker run -i --rm etl:test tests/e2e_csv.sh tests/csv-urls
+          echo "======================== start tests/e2e_azet.sh ======================"
+          echo "======================== start tests/e2e_azet.sh ======================"
+          echo "======================== start tests/e2e_azet.sh ======================"
           docker run -i --rm etl:test tests/e2e_azet.sh
+          echo "======================== start tests/firmycz.sh ======================"
+          echo "======================== start tests/firmycz.sh ======================"
+          echo "======================== start tests/firmycz.sh ======================"
+          docker run -i --rm etl:test tests/firmycz.sh
 
