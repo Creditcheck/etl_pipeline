@@ -12,6 +12,18 @@ err() {
   exit 1
 }
 
+require_command() {
+    local cmd="$1"
+    if ! command -v "$cmd" &> /dev/null; then
+        echo "Error: Required command '$cmd' not found in PATH." >&2
+        exit 1
+    fi
+}
+
+for program in get-subcategory-urls etl extract_html jget probe; do
+  require_command "$program"
+done
+
 # Create a single-use temp working directory
 TMPDIR="$(mktemp -d -t "${NAME}_e2e.XXXXXXXX")" || err "failed to create temp dir"
 
