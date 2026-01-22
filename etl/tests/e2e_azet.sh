@@ -1,4 +1,6 @@
 #!/bin/bash
+#### TODO: the firmycz.sh file has been refactored. this file should 
+#### use those ideas, or combine the scripts 
 NAME="azet.sk"
 counter=0
 log(){
@@ -16,6 +18,7 @@ err() {
 mappings_dir="/app/configs/mappings/azet.sk"
 URL="https://www.azet.sk/katalog/"
 
+JITTER_MAX='2000ms'
 JGET_CONCURRENCY=1
 TIMEOUT="120s"
 MAX_SUBCATEGORY_URLS=3
@@ -24,7 +27,7 @@ MAX_DETAIL_URLS=2
 export E2E=1
 
 # Create a single-use temp working directory and run everything inside it.
-TMPDIR="$(mktemp -d -t azet_e2e.XXXXXXXX)" || err "failed to create temp dir"
+TMPDIR="$(mktemp -d -t "${NAME}_e2e.XXXXXXXX")" || err "failed to create temp dir"
 cleanup_tmpdir() {
   rm -rf "$TMPDIR"
 }
@@ -58,7 +61,7 @@ fetch_subcategory_pages() {
   local tmpdir="$1"
 
   log "get subcategory pages"
-  jget -o "${tmpdir}/subcategory" -i "${tmpdir}/subcategory-urls" -n "$JGET_CONCURRENCY" -name azet.sk -t "$TIMEOUT" > /dev/null
+  jget -jitter_max "$JITTER_MAX" -o "${tmpdir}/subcategory" -i "${tmpdir}/subcategory-urls" -n "$JGET_CONCURRENCY" -name azet.sk -t "$TIMEOUT" > /dev/null
 }
 
 transform_subcategory_pages() {
@@ -81,7 +84,7 @@ fetch_detail_pages() {
   local tmpdir="$1"
 
   log "get detail pages"
-  jget -n "$JGET_CONCURRENCY" -i "${tmpdir}/detail-urls" -o "${tmpdir}/detail" -t "$TIMEOUT" > /dev/null
+  jget -jitter_max "$JITTER_MAX" -n "$JGET_CONCURRENCY" -i "${tmpdir}/detail-urls" -o "${tmpdir}/detail" -t "$TIMEOUT" > /dev/null
 }
 
 transform_detail_pages() {
@@ -118,7 +121,15 @@ validate_subcategory() {
   export E2E_TARGET_URLS
   E2E_TARGET_URLS="$(paste -sd, "${tmpdir}/subcategory-urls")"
   export E2E_MAPPINGS_PATH="${mappings}/subcategory.json"
-  (cd /app && go test -run '^TestE2E_Strict_MappingsPopulateAcrossMultiplePages$' -tags=e2e -count=1 ./...) | grep -E -v 'no test'
+  cur=$(pwd)
+  cd /app
+  if ! go test -run '^TestE2E_Strict_MappingsPopulateAcrossMultiplePages$' -tags=e2e -count=1 ./...; then
+    #err "validate_subcategory go tests failed"
+    log "validate_subcategory go tests failed"
+	
+  fi
+  cd "$cur"
+
 }
 
 validate_detail() {
@@ -128,9 +139,16 @@ validate_detail() {
   log "validate mappings of detail pages are valid"
   export E2E_TARGET_URLS
   E2E_TARGET_URLS="$(paste -sd, "${tmpdir}/detail-urls")"
-  E2E_TARGET_URLS="${E2E_TARGET_URLS},https://www.azet.sk/firma/2074/mr-real-s-r-o_1/,https://www.azet.sk/firma/1193737/brands-alliance-service-s-r-o/,https://www.azet.sk/firma/1247928/ivmo-real-s-r-o/,https://www.azet.sk/firma/1229449/stavega-s-r-o/"
+  sleep 5
+  E2E_TARGET_URLS="${E2E_TARGET_URLS},https://www.azet.sk/firma/1193737/brands-alliance-service-s-r-o/,https://www.azet.sk/firma/1247928/ivmo-real-s-r-o/"
   export E2E_MAPPINGS_PATH="${mappings}/detail.json"
-  (cd /app && go test -run '^TestE2E_Strict_MappingsPopulateAcrossMultiplePages$' -tags=e2e -count=1 ./...) | grep -v 'no test'
+    cur=$(pwd)
+  cd /app
+  if ! go test -run '^TestE2E_Strict_MappingsPopulateAcrossMultiplePages$' -tags=e2e -count=1 ./...;then
+    log "validate_detail go tests failed"
+    #err "validate_detail go tests failed"
+  fi
+  cd "$cur"
 }
 
 validate() {

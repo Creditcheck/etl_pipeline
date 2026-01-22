@@ -74,8 +74,9 @@ run_one() {
   log() {
     counter=$((counter + 1))
     local wd
-    wd="$(basename "$workdir" 2>/dev/null || true)"
-    echo "[$(ts)]: INFO: (pid=${runid} job=${job_id} wd=${wd} desc=${desc} step ${counter}) $*" >&2
+#    wd="$(basename "$workdir" 2>/dev/null || true)"
+    #echo "[$(ts)]: INFO: (pid=${runid} job=${job_id} wd=${wd} desc=${desc} step ${counter}) $*" >&2
+    echo "[$(ts)]: INFO: ${desc}, $*" >&2
   }
 
   cleanup() {
@@ -108,7 +109,7 @@ run_one() {
   log "running ETL with config ${workdir}/${config}"
   etl -metrics-backend none -config "$config"
 
-  log "done (temp dir will be removed): $workdir"
+  log "done!"
 
   # throttle a bit per job to avoid hammering endpoints
   sleep "$SLEEP_BETWEEN"
