@@ -21,7 +21,7 @@ mappings_dir="/app/configs/mappings/firmy.cz"
 URL="https://www.firmy.cz/?hp=1"
 JGET_CONCURRENCY=3
 TIMEOUT="120s"
-MAX_SUBCATEGORY_URLS=1
+MAX_SUBCATEGORY_URLS=4
 MAX_DETAIL_URLS=2
 E2E=1 # enables end to end go tests
 export E2E
