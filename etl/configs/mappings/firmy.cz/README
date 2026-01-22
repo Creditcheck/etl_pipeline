@@ -1,15 +1,24 @@
+
+#### NOTE: this documentation has been refactored into ./tests/firmycz.sh
+
 #### Get top-level category urls ###
 # input: url of landing page 
 # output: links, one per line
 # first expand all categories, using the '?hp=1' parameter
 # links are assumed in format <a href class='homeMainCategoryButton' ...> ####
-go run get-subcategory-urls.go -url "https://www.firmy.cz/?hp=1" -class "homeMainCategoryButton" -single -depth 1 -n 1 > categories
+#go run get-subcategory-urls.go -url "https://www.firmy.cz/?hp=1" -class "homeMainCategoryButton" -single -depth 1 -n 1 > categories
+
+URL="https://www.firmy.cz/?hp=1"
+CATEGORY_URLS="category-urls"
+extract_html -mappings category.json -url "$URL" | jq -r '.[].href[]' > "$CATEGORY_URLS"
 
 #### Get subcategory urls ####
 # input: text file with a list of top-level category url's
 # output: list of links
 # description: crawls around looking for <a class="[class]"
-go run get-subcategory-urls.go -depth 20 -i categories -n 7 -class category > subcategory-urls
+get-subcategory-urls -depth 20 -i "$CATEGORY_URLS" -n 7 -class category > subcategory-urls
+
+
 
 #### Generate links to subcategory pages ###
 # description: figures out how many subpages are in each category, and outputs them all as a list
