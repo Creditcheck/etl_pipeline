@@ -16,7 +16,6 @@ import (
 //
 // This test patches dependencies to avoid real I/O and parsing.
 func TestStreamValidatedRows_ConfigValidation(t *testing.T) {
-	t.Parallel()
 
 	restore := patchStreamDeps(t, streamDeps{
 		open: func(path string) (io.ReadCloser, error) {
@@ -85,7 +84,7 @@ func TestStreamValidatedRows_ConfigValidation(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+			//t.Parallel()
 
 			_, err := StreamValidatedRows(context.Background(), tt.mutate(base), []string{"a"})
 			if err == nil {

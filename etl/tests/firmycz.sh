@@ -66,6 +66,7 @@ get_category_urls() {
   local mapping_file="${mappings}/category.json"
   local max=1
 
+  log "create list of category urls"
   extract_html -mappings "$mapping_file" -url "$url" | jq -r '.[].href[]' | head -"$max" > "$category_urls"
 }
 
@@ -84,13 +85,14 @@ remove_lines() {
   awk 'NR==FNR { seen[$0]; next } !($0 in seen)' "$fileA" "$fileB"
 }
 
-pagniate_subcategory() {
+paginate_subcategory() {
 	# input: url (string), count (int)
 	# output: list of strings in format
 	# url
 	# url?page=2
 	# url?page=3
 
+	log "generate paginated subcategory urls"
 	url="$1"
 	mapping_file="$2"
 	extract_html -mappings "$mapping_file" -url "$url" | jq -r '.href as $u | (.count|tonumber) as $n | $u, (range(2; $n+1) | "\($u)?page=\(.)")'
@@ -121,7 +123,7 @@ generate_subcategory_urls() {
   # 
   # its results are paginated. for each url, we output its paginated urls:
   cat "${subcategory_urls}.tmp" | while read -r url; do 
-    pagniate_subcategory "$url" "$builder_mappings"
+    paginate_subcategory "$url" "$builder_mappings"
   done | head -"$max" > "$subcategory_urls"
 
 }

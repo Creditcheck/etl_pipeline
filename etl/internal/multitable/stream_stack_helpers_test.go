@@ -23,7 +23,7 @@ import (
 //   - Validates required source.kind/file.path.
 //   - Validates parser.kind is "csv" or "json".
 func TestValidateStreamConfig(t *testing.T) {
-	t.Parallel()
+	//t.Parallel()
 
 	newBase := func() Pipeline {
 		return Pipeline{
@@ -73,7 +73,7 @@ func TestValidateStreamConfig(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+			//t.Parallel()
 
 			err := validateStreamConfig(tt.mutate(newBase()))
 			if tt.wantErr == "" {
@@ -97,7 +97,7 @@ func TestValidateStreamConfig(t *testing.T) {
 // Edge cases:
 //   - Non-positive values are replaced by defaults.
 func TestNormalizeRuntime(t *testing.T) {
-	t.Parallel()
+	//t.Parallel()
 
 	tests := []struct {
 		name string
@@ -144,7 +144,7 @@ func TestNormalizeRuntime(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
+			//t.Parallel()
 
 			got := normalizeRuntime(tt.in)
 			if got.ChannelBuffer != tt.want.ChannelBuffer ||
