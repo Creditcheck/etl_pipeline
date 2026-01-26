@@ -1,5 +1,6 @@
 #!/bin/bash
 #### DESCRIPTION: runs end to end tests for firmy.cz
+NAME="firmy.cz" 
 counter=0
 log(){
   entry="$*"
@@ -28,7 +29,6 @@ done
 TMPDIR="$(mktemp -d -t "${NAME}_e2e.XXXXXXXX")" || err "failed to create temp dir"
 
 #### config / knobs ####
-NAME="firmy.cz" 
 mappings_dir="/app/configs/mappings/firmy.cz"
 URL="https://www.firmy.cz/?hp=1"
 JGET_CONCURRENCY=3
