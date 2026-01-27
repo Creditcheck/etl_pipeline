@@ -2,7 +2,7 @@
   "job": "vozidla_dovoz_multi",
   "source": {
     "kind": "file",
-    "file": { "path": "/home/zippy/projects/data/RSV_vozidla_dovoz_20251201.csv" }
+    "file": { "path": "/home/zippy/projects/data/RSV_vozidla_dovoz.csv" }
   },
   "parser": {
     "kind": "csv",

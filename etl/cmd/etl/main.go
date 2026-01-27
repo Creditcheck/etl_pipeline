@@ -107,7 +107,7 @@ func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps 
 	fs.SetOutput(stderr)
 
 	fs.StringVar(&cfgPath, "config", "", "path to multi-table pipeline config JSON")
-	fs.StringVar(&metricsBackend, "metrics-backend", "datadog", "metrics backend: none|datadog (or set METRICS_BACKEND)")
+	fs.StringVar(&metricsBackend, "metrics-backend", "none", "metrics backend: none|datadog (or set METRICS_BACKEND)")
 	if err := fs.Parse(args); err != nil {
 		// flag package prints a message to stderr for us; treat it as a usage error.
 		return 2

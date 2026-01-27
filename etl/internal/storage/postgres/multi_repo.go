@@ -56,19 +56,55 @@ func (r *MultiRepo) InsertFactRows(
 	if spec.Load.Kind != "fact" ||
 		spec.Load.History == nil ||
 		!spec.Load.History.Enabled {
-		return r.insertPlain(ctx, table, columns, rows)
+
+		// Non-SCD2 fact loads still require idempotency.
+		//
+		// The pipeline supports "dedupe.conflict_columns" for fact tables. That
+		// must translate to INSERT ... ON CONFLICT (...) DO NOTHING in Postgres.
+		// Without it, duplicate rows in the same input (or in reprocessing) cause
+		// unique constraint violations and fail the run.
+		return r.insertPlain(ctx, table, columns, rows, dedupeColumns)
 	}
 
 	return r.insertSCD2(ctx, spec, table, columns, rows)
 }
 
 // insertPlain performs a bulk INSERT.
+//
+// If dedupeColumns is non-empty, the INSERT is made idempotent using:
+//
+//	ON CONFLICT (<dedupeColumns...>) DO NOTHING
+//
+// This is intentionally conservative: the engine currently passes only the
+// conflict columns, not a full "action" enum, so Postgres implements the only
+// action supported by config today: "do_nothing".
 func (r *MultiRepo) insertPlain(
 	ctx context.Context,
 	table string,
 	columns []string,
 	rows [][]any,
+	dedupeColumns []string,
+
 ) (int64, error) {
+	sql, args := buildInsertSQL(table, columns, rows, dedupeColumns)
+
+	cmd, err := r.pool.Exec(ctx, sql, args...)
+	if err != nil {
+		return 0, err
+	}
+	return cmd.RowsAffected(), nil
+}
+
+// buildInsertSQL constructs a single INSERT statement and its args for Postgres.
+//
+// Why this exists:
+//   - It is pure and deterministic, so we can unit test correctness (especially
+//     ON CONFLICT behavior and placeholder numbering) without a database.
+//
+// Constraints:
+//   - rows must have the same length as columns for every row.
+//   - columns must be non-empty.
+func buildInsertSQL(table string, columns []string, rows [][]any, dedupeColumns []string) (string, []any) {
 	var b strings.Builder
 	b.WriteString("INSERT INTO ")
 	b.WriteString(table)
@@ -100,11 +136,24 @@ func (r *MultiRepo) insertPlain(
 		b.WriteString(")")
 	}
 
-	cmd, err := r.pool.Exec(ctx, b.String(), args...)
-	if err != nil {
-		return 0, err
+	// If the caller requested dedupe behavior, enforce it at the SQL layer.
+	//
+	// This makes the pipeline:
+	//   - tolerant of duplicate rows within the same batch
+	//   - idempotent across reprocessing the same file/batch
+	if len(dedupeColumns) > 0 {
+		b.WriteString(" ON CONFLICT (")
+		for i, c := range dedupeColumns {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(pgIdent(c))
+		}
+		b.WriteString(") DO NOTHING")
 	}
-	return cmd.RowsAffected(), nil
+
+	b.WriteString(";")
+	return b.String(), args
 }
 
 // insertSCD2 performs SCD2 merging row-by-row inside a transaction.
@@ -128,6 +177,11 @@ func (r *MultiRepo) insertSCD2(
 	colIdx := indexColumns(columns)
 	keyIdx := indicesFor(h.BusinessKey, colIdx)
 
+	// row_hash is an optional but strongly recommended optimization for SCD2.
+	// If present, it lets us detect changes using a single field compare
+	// instead of comparing every column value.
+	rowHashIdx, hasRowHash := indexOfColumn(columns, "row_hash")
+
 	for _, row := range rows {
 		curr, validFrom, err := r.fetchCurrentRowTx(
 			ctx, tx, table, h, columns, keyIdx, row,
@@ -146,7 +200,27 @@ func (r *MultiRepo) insertSCD2(
 			continue
 		}
 
-		if rowsEqual(curr, row) {
+		// Change detection:
+		//
+		// If a row_hash column exists, we treat it as the authoritative
+		// "did anything change?" signal. This is the standard SCD2 pattern:
+		//   - BusinessKey identifies the entity (one current row).
+		//   - row_hash summarizes the full content of the entity row.
+		//
+		// Why we don't always use rowsEqual():
+		//   - It's O(N) per row across all columns.
+		//   - It is brittle across type round-trips (e.g. TEXT scanned as []byte).
+		//
+		// IMPORTANT:
+		//   - When row_hash exists, it must be computed deterministically
+		//     upstream (transformer "hash") and written into the fact row.
+		changed := true
+		if hasRowHash {
+			changed = !equalScalar(curr[rowHashIdx], row[rowHashIdx])
+		} else {
+			changed = !rowsEqual(curr, row)
+		}
+		if !changed {
 			continue
 		}
 
@@ -221,9 +295,33 @@ func (r *MultiRepo) fetchCurrentRowTx(
 		return nil, time.Time{}, nil
 	}
 
+	// IMPORTANT: pgx requires that Scan destinations are pointers.
+	//
+	// The previous implementation incorrectly passed a slice of `any` values
+	// (all nil interfaces) directly to Scan. Since those are not pointers,
+	// pgx cannot populate them reliably, and the returned row can contain nils.
+	//
+	// That bug is catastrophic for SCD2:
+	//   1) We read the current row, but values (e.g. vehicle_id) remain nil.
+	//   2) We then INSERT the "current" row into the history table.
+	//   3) The history insert fails with NOT NULL violations (vehicle_id, etc.).
+	//
+	// Fix:
+	//   - Allocate a values slice (out)
+	//   - Build a parallel destinations slice containing &out[i]
+	//   - Scan into those pointers
+	//
+	// This is the standard pgx pattern for scanning a dynamic column list.
 	out := make([]any, len(columns))
+	dests := make([]any, len(columns))
+	for i := range out {
+		dests[i] = &out[i]
+	}
+
 	var validFrom time.Time
-	if err := rows.Scan(append(out, &validFrom)...); err != nil {
+
+	// Append the SCD2 valid_from value after the fact columns.
+	if err := rows.Scan(append(dests, &validFrom)...); err != nil {
 		return nil, time.Time{}, err
 	}
 	return out, validFrom, nil
@@ -394,10 +492,25 @@ func (r *MultiRepo) EnsureTables(ctx context.Context, tables []storage.TableSpec
 		if !t.AutoCreateTable {
 			continue
 		}
-
-		baseSQL, histSQL, err := buildSCD2CreateSQL(t)
+		// NOTE: Table creation must *not* depend on SCD2 being enabled.
+		//
+		// Regression background:
+		//   The original SCD2 implementation introduced buildSCD2CreateSQL which
+		//   returned empty strings when history was disabled. EnsureTables then
+		//   executed nothing for the common case (history disabled), causing the
+		//   pipeline to proceed to inserts against non-existent tables.
+		//
+		// Fix:
+		//   Always build and execute DDL for the base table. Optionally add a
+		//   history table when History.Enabled.
+		schemaSQL, baseSQL, histSQL, err := buildCreateSQL(t)
 		if err != nil {
 			return err
+		}
+		if schemaSQL != "" {
+			if _, err := r.pool.Exec(ctx, schemaSQL); err != nil {
+				return fmt.Errorf("create schema for %s: %w", t.Name, err)
+			}
 		}
 
 		if baseSQL != "" {
@@ -412,31 +525,6 @@ func (r *MultiRepo) EnsureTables(ctx context.Context, tables []storage.TableSpec
 		}
 	}
 	return nil
-}
-
-func buildSCD2CreateSQL(t storage.TableSpec) (baseSQL, histSQL string, err error) {
-	if t.Load.History == nil || !t.Load.History.Enabled {
-		return "", "", nil
-	}
-	h := t.Load.History
-
-	var cols []string
-	for _, c := range t.Columns {
-		cols = append(cols, fmt.Sprintf(`"%s" %s`, c.Name, c.Type))
-	}
-	cols = append(cols,
-		fmt.Sprintf(`"%s" TIMESTAMPTZ NOT NULL`, h.ValidFromColumn),
-		fmt.Sprintf(`"%s" TIMESTAMPTZ`, h.ValidToColumn),
-		fmt.Sprintf(`"%s" TIMESTAMPTZ NOT NULL`, h.ChangedAtColumn),
-	)
-
-	baseSQL = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (%s);`,
-		t.Name, strings.Join(cols, ", "))
-
-	histSQL = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s_history (%s);`,
-		t.Name, strings.Join(cols, ", "))
-
-	return
 }
 
 // insertCurrentRowTx inserts a new *current* version of a fact row under SCD2.
@@ -726,4 +814,376 @@ func (r *MultiRepo) SelectKeyValueByKeys(
 	}
 
 	return out, nil
+}
+
+// buildCreateSQL generates DDL for the base table and (optionally) the SCD2
+// history table.
+//
+// Outputs:
+//   - schemaSQL: optional CREATE SCHEMA statement when t.Name is schema-qualified.
+//   - baseSQL:   CREATE TABLE IF NOT EXISTS for the base table.
+//   - histSQL:   CREATE TABLE IF NOT EXISTS for <table>_history when SCD2 is enabled.
+//
+// Design notes:
+//   - The base table must be created regardless of SCD2 settings.
+//   - For SCD2 tables, the base table includes metadata columns.
+//   - The history table intentionally omits unique constraints so multiple
+//     historical versions can coexist.
+//   - The history table also omits the PrimaryKeySpec column because the SCD2
+//     insert logic never writes that column into history rows.
+//func buildCreateSQL(t storage.TableSpec) (schemaSQL, baseSQL, histSQL string, err error) {
+//	if strings.TrimSpace(t.Name) == "" {
+//		return "", "", "", fmt.Errorf("buildCreateSQL: table name is empty")
+//	}
+//
+//	// If the table is schema-qualified (e.g. "public.countries"), ensure the
+//	// schema exists. This makes auto_create_table more robust in environments
+//	// where non-default schemas are used.
+//	if schema, _ := splitQualifiedName(t.Name); schema != "" {
+//		schemaSQL = fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s;`, pgIdent(schema))
+//	}
+//
+//	// Build base table column definitions.
+//	baseCols, err := buildColumnDefsForBase(t)
+//	if err != nil {
+//		return "", "", "", err
+//	}
+//
+//	// Append metadata columns for SCD2-enabled fact tables.
+//	var history *storage.HistorySpec
+//	if t.Load.History != nil && t.Load.History.Enabled {
+//		history = t.Load.History
+//
+//		// NOTE: Users may choose to declare the SCD2 metadata columns explicitly in
+//		// config (for clarity, or to control type/nullability), OR rely on the
+//		// loader to add them automatically.
+//		//
+//		// We must support both without generating invalid DDL. If we blindly append
+//		// metadata columns here, we can produce a "column specified more than once"
+//		// error when the config already includes e.g. "valid_from".
+//		//
+//		// Approach:
+//		//   - Compute the set of configured column names (case-insensitive).
+//		//   - Only append metadata columns that aren't already present.
+//		//
+//		// This makes SCD2 DDL idempotent and robust across configuration styles.
+//		configured := configuredColumnSet(t)
+//
+//		if !configured[strings.ToLower(strings.TrimSpace(history.ValidFromColumn))] {
+//			baseCols = append(baseCols, fmt.Sprintf(`%s TIMESTAMPTZ NOT NULL`, pgIdent(history.ValidFromColumn)))
+//		}
+//		if !configured[strings.ToLower(strings.TrimSpace(history.ValidToColumn))] {
+//			baseCols = append(baseCols, fmt.Sprintf(`%s TIMESTAMPTZ`, pgIdent(history.ValidToColumn)))
+//		}
+//		if !configured[strings.ToLower(strings.TrimSpace(history.ChangedAtColumn))] {
+//			baseCols = append(baseCols, fmt.Sprintf(`%s TIMESTAMPTZ NOT NULL`, pgIdent(history.ChangedAtColumn)))
+//		}
+//	}
+//
+//	// Constraints are applied only to the base table.
+//	constraints, err := buildBaseConstraints(t)
+//	if err != nil {
+//		return "", "", "", err
+//	}
+//	baseCols = append(baseCols, constraints...)
+//
+//	baseSQL = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (%s);`,
+//		t.Name, strings.Join(baseCols, ", "))
+//
+//	// Optional history table.
+//	if history != nil {
+//		histCols, err := buildColumnDefsForHistory(t)
+//		if err != nil {
+//			return "", "", "", err
+//		}
+//		histCols = append(histCols,
+//			fmt.Sprintf(`%s TIMESTAMPTZ NOT NULL`, pgIdent(history.ValidFromColumn)),
+//			fmt.Sprintf(`%s TIMESTAMPTZ`, pgIdent(history.ValidToColumn)),
+//			fmt.Sprintf(`%s TIMESTAMPTZ NOT NULL`, pgIdent(history.ChangedAtColumn)),
+//		)
+//		histSQL = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s_history (%s);`,
+//			t.Name, strings.Join(histCols, ", "))
+//	}
+//
+//	return schemaSQL, baseSQL, histSQL, nil
+//}
+
+// buildColumnDefsForBase returns the list of "<col> <type> ..." definitions for
+// the base table.
+//
+// Primary key handling:
+//   - If PrimaryKeySpec is provided, we create it as the first column.
+//   - The primary key column is not expected to be present in t.Columns.
+func buildColumnDefsForBase(t storage.TableSpec) ([]string, error) {
+	cols := make([]string, 0, len(t.Columns)+1)
+
+	if t.PrimaryKey != nil {
+		pk := strings.TrimSpace(t.PrimaryKey.Name)
+		pkType := strings.TrimSpace(t.PrimaryKey.Type)
+		if pk == "" || pkType == "" {
+			return nil, fmt.Errorf("buildColumnDefsForBase: table %s: primary_key.name and primary_key.type are required", t.Name)
+		}
+		// Postgres supports inline PRIMARY KEY constraints.
+		cols = append(cols, fmt.Sprintf(`%s %s PRIMARY KEY`, pgIdent(pk), pkType))
+	}
+
+	for _, c := range t.Columns {
+		def, err := buildColumnDef(c)
+		if err != nil {
+			return nil, fmt.Errorf("buildColumnDefsForBase: table %s: %w", t.Name, err)
+		}
+		cols = append(cols, def)
+	}
+
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("buildColumnDefsForBase: table %s: no columns", t.Name)
+	}
+	return cols, nil
+}
+
+// buildColumnDefsForHistory returns the list of column definitions for the
+// history table.
+//
+// Important:
+//   - The history table intentionally omits PrimaryKeySpec, because history
+//     inserts do not write that column.
+func buildColumnDefsForHistory(t storage.TableSpec) ([]string, error) {
+	cols := make([]string, 0, len(t.Columns))
+	for _, c := range t.Columns {
+		def, err := buildColumnDef(c)
+		if err != nil {
+			return nil, fmt.Errorf("buildColumnDefsForHistory: table %s: %w", t.Name, err)
+		}
+		cols = append(cols, def)
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf("buildColumnDefsForHistory: table %s: no columns", t.Name)
+	}
+	return cols, nil
+}
+
+// buildColumnDef renders a single column definition.
+//
+// Nullable semantics:
+//   - nullable == nil  => NOT NULL (conservative default; matches existing engine expectations).
+//   - nullable == true => NULL (no NOT NULL clause).
+//   - nullable == false=> NOT NULL.
+func buildColumnDef(c storage.ColumnSpec) (string, error) {
+	name := strings.TrimSpace(c.Name)
+	typ := strings.TrimSpace(c.Type)
+	if name == "" || typ == "" {
+		return "", fmt.Errorf("column name/type must be set")
+	}
+
+	var b strings.Builder
+	b.WriteString(pgIdent(name))
+	b.WriteString(" ")
+	b.WriteString(typ)
+
+	nullable := false
+	if c.Nullable != nil {
+		nullable = *c.Nullable
+	}
+	if !nullable {
+		b.WriteString(" NOT NULL")
+	}
+
+	// Foreign key references are expressed inline in the column definition.
+	// This keeps CreateTable DDL self-contained and matches typical Postgres style.
+	if ref := strings.TrimSpace(c.References); ref != "" {
+		b.WriteString(" REFERENCES ")
+		b.WriteString(ref)
+	}
+
+	return b.String(), nil
+}
+
+// buildBaseConstraints generates table-level constraints for the base table.
+//
+// Today we only support UNIQUE constraints because that's the only constraint
+// type exposed by storage.ConstraintSpec.
+func buildBaseConstraints(t storage.TableSpec) ([]string, error) {
+	if len(t.Constraints) == 0 {
+		return nil, nil
+	}
+
+	out := make([]string, 0, len(t.Constraints))
+	for _, c := range t.Constraints {
+		kind := strings.ToLower(strings.TrimSpace(c.Kind))
+		switch kind {
+		case "unique":
+			if len(c.Columns) == 0 {
+				return nil, fmt.Errorf("table %s: unique constraint requires columns", t.Name)
+			}
+			var b strings.Builder
+			b.WriteString("UNIQUE (")
+			for i, col := range c.Columns {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(pgIdent(strings.TrimSpace(col)))
+			}
+			b.WriteString(")")
+			out = append(out, b.String())
+		default:
+			return nil, fmt.Errorf("table %s: unsupported constraint kind %q", t.Name, c.Kind)
+		}
+	}
+	return out, nil
+}
+
+// splitQualifiedName splits a schema-qualified name into (schema, table).
+//
+// Examples:
+//   - "public.countries" => ("public", "countries")
+//   - "countries"        => ("", "countries")
+//
+// This helper is intentionally conservative: it only handles a single dot.
+// If callers pass a more complex expression, we treat it as unqualified.
+func splitQualifiedName(name string) (schema string, table string) {
+	name = strings.TrimSpace(name)
+	parts := strings.Split(name, ".")
+	if len(parts) != 2 {
+		return "", name
+	}
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+}
+
+// buildCreateSQL builds DDL for:
+//   - Base table
+//   - Optional SCD2 history table
+//
+// It avoids duplicating metadata columns if user already defined them.
+func buildCreateSQL(t storage.TableSpec) (schemaSQL, baseSQL, histSQL string, err error) {
+	if strings.TrimSpace(t.Name) == "" {
+		return "", "", "", fmt.Errorf("table name is empty")
+	}
+
+	if schema, _ := splitQualifiedName(t.Name); schema != "" {
+		schemaSQL = fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s;`, pgIdent(schema))
+	}
+
+	baseCols, err := buildColumnDefsForBase(t)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	var history *storage.HistorySpec
+	if t.Load.History != nil && t.Load.History.Enabled {
+		history = t.Load.History
+		configured := configuredColumnSet(t)
+
+		if !configured[strings.ToLower(history.ValidFromColumn)] {
+			baseCols = append(baseCols, fmt.Sprintf(`%s TIMESTAMPTZ NOT NULL`, pgIdent(history.ValidFromColumn)))
+		}
+		if !configured[strings.ToLower(history.ValidToColumn)] {
+			baseCols = append(baseCols, fmt.Sprintf(`%s TIMESTAMPTZ`, pgIdent(history.ValidToColumn)))
+		}
+		if !configured[strings.ToLower(history.ChangedAtColumn)] {
+			baseCols = append(baseCols, fmt.Sprintf(`%s TIMESTAMPTZ NOT NULL`, pgIdent(history.ChangedAtColumn)))
+		}
+	}
+
+	constraints, err := buildBaseConstraints(t)
+	if err != nil {
+		return "", "", "", err
+	}
+	baseCols = append(baseCols, constraints...)
+
+	baseSQL = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (%s);`,
+		t.Name, strings.Join(baseCols, ", "))
+
+	if history != nil {
+		histCols, err := buildColumnDefsForHistory(t)
+		if err != nil {
+			return "", "", "", err
+		}
+
+		configured := configuredColumnSet(t)
+		if !configured[strings.ToLower(history.ValidFromColumn)] {
+			histCols = append(histCols, fmt.Sprintf(`%s TIMESTAMPTZ NOT NULL`, pgIdent(history.ValidFromColumn)))
+		}
+		if !configured[strings.ToLower(history.ValidToColumn)] {
+			histCols = append(histCols, fmt.Sprintf(`%s TIMESTAMPTZ`, pgIdent(history.ValidToColumn)))
+		}
+		if !configured[strings.ToLower(history.ChangedAtColumn)] {
+			histCols = append(histCols, fmt.Sprintf(`%s TIMESTAMPTZ NOT NULL`, pgIdent(history.ChangedAtColumn)))
+		}
+
+		histSQL = fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s_history (%s);`,
+			t.Name, strings.Join(histCols, ", "))
+	}
+
+	return
+}
+
+// configuredColumnSet returns lowercase column names defined in config.
+
+func configuredColumnSet(t storage.TableSpec) map[string]bool {
+	out := make(map[string]bool, len(t.Columns))
+	for _, c := range t.Columns {
+		out[strings.ToLower(strings.TrimSpace(c.Name))] = true
+	}
+	return out
+}
+
+// indexOfColumn returns the index of name in columns and whether it was found.
+//
+// This is intentionally case-sensitive because:
+//   - columns are generated from config (which is case-sensitive in practice)
+//   - pgIdent quoting depends on exact spelling
+//
+// If you later decide to normalize column names, do it consistently across:
+//   - config validation
+//   - SQL generation
+//   - row materialization
+func indexOfColumn(columns []string, name string) (int, bool) {
+	for i, c := range columns {
+		if c == name {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// equalScalar compares a pair of values that logically represent a single
+// scalar field (like row_hash).
+//
+// Why this exists:
+//   - When scanning from Postgres via pgx, TEXT values can appear as:
+//   - string
+//   - []byte
+//   - Direct interface comparisons can incorrectly report "not equal" even
+//     when the textual content is identical.
+//
+// Behavior:
+//   - nil equals nil
+//   - []byte is compared by bytes, and can equal a string if UTF-8 content matches
+//   - otherwise falls back to string formatting (stable enough for hashes)
+func equalScalar(a any, b any) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+
+	// Normalize common Postgres text representations.
+	switch av := a.(type) {
+	case []byte:
+		switch bv := b.(type) {
+		case []byte:
+			return string(av) == string(bv)
+		case string:
+			return string(av) == bv
+		}
+	case string:
+		switch bv := b.(type) {
+		case []byte:
+			return av == string(bv)
+		case string:
+			return av == bv
+		}
+	}
+
+	// For hashes, fmt.Sprint is acceptable as a final fallback since the
+	// upstream hash transformer should produce stable, deterministic values.
+	return fmt.Sprint(a) == fmt.Sprint(b)
 }
