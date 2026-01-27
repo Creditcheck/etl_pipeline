@@ -3,62 +3,121 @@ package mssql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	_ "github.com/microsoft/go-mssqldb"
-
 	"etl/internal/storage"
 )
 
-/*
-MultiRepo implements storage.MultiRepository for Microsoft SQL Server.
-
-This backend supports:
-  - Dimension key management
-  - Fact inserts
-  - Fully transactional SCD2 (Slowly Changing Dimension Type 2) history for facts
-
-SCD2 behavior:
-  - Matching is done by History.BusinessKey
-  - Current rows are those with valid_to IS NULL
-  - On change:
-  - The previous current row is copied into <table>_history
-  - Its valid_to is set to now()
-  - A new current row is written with valid_from = now()
-  - If incoming values match the current row exactly, the operation is a no-op
-
-Locking:
-  - Uses UPDLOCK + ROWLOCK to serialize updates per business key
-*/
+// MultiRepo implements storage.MultiRepository for Microsoft SQL Server.
+//
+// This implementation supports:
+//   - Dimension key management (idempotent inserts).
+//   - Fact inserts:
+//   - Plain bulk insert.
+//   - Optional "dedupe insert" using NOT EXISTS (for idempotent reprocessing).
+//   - SCD2 (Slowly Changing Dimension Type 2) for fact tables via a
+//     current + history table model:
+//   - <table>          contains exactly one current row per business key
+//   - <table>_history  contains all previous versions
+//
+// SCD2 semantics:
+//   - Business key is configured by spec.Load.History.BusinessKey.
+//   - Current rows are those with ValidToColumn IS NULL.
+//   - If incoming matches current (by row_hash if present, otherwise by full row),
+//     the operation is a no-op (idempotent).
+//   - If incoming differs:
+//     1) Copy prior current row into <table>_history (preserving valid_from)
+//     2) Close that history row by setting valid_to=now and changed_at=now
+//     3) Update the base row in place (valid_from=now, valid_to=NULL, changed_at=now)
+//
+// Concurrency:
+//   - fetchCurrentRowTx uses UPDLOCK + ROWLOCK so multiple writers for the same
+//     business key serialize cleanly without table-wide locks.
+//
+// Note on driver registration (Behavior change):
+//   - This package intentionally does NOT blank-import a SQL Server driver.
+//     The application must register the "sqlserver" driver elsewhere.
+//     See the "Behavior changes" section in the response.
 type MultiRepo struct {
-	db *sql.DB
+	db dbConn
 }
 
-// NewMulti creates a new MSSQL-backed MultiRepo.
+// NewMulti constructs a MultiRepo using database/sql and the "sqlserver" driver.
+//
+// The caller must ensure a SQL Server driver is registered with database/sql under
+// the name "sqlserver" before calling NewMulti. If not, sql.Open will fail.
+//
+// This method validates connectivity via PingContext.
 func NewMulti(ctx context.Context, cfg storage.MultiConfig) (storage.MultiRepository, error) {
-	db, err := sql.Open("sqlserver", cfg.DSN)
+	raw, err := sql.Open("sqlserver", cfg.DSN)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(64)
-	db.SetMaxIdleConns(64)
 
-	if err := db.PingContext(ctx); err != nil {
-		_ = db.Close()
+	// Conservative defaults for ETL-style bursty loads.
+	raw.SetMaxOpenConns(64)
+	raw.SetMaxIdleConns(64)
+
+	if err := raw.PingContext(ctx); err != nil {
+		_ = raw.Close()
 		return nil, err
 	}
-	return &MultiRepo{db: db}, nil
+	return &MultiRepo{db: &sqlDB{db: raw}}, nil
 }
 
-// Close closes the database connection pool.
+// Close releases database resources held by this repository.
 func (r *MultiRepo) Close() {
+	if r == nil || r.db == nil {
+		return
+	}
 	_ = r.db.Close()
 }
 
-// InsertFactRows inserts fact rows with optional SCD2 semantics.
+// EnsureTables creates base tables and (when SCD2 is enabled) their history tables.
+//
+// Behavior:
+//   - If AutoCreateTable is false: no-op.
+//   - Base tables are always created when AutoCreateTable is true.
+//   - History tables are created only when Load.Kind == "fact" and History.Enabled == true.
+//   - History tables do NOT inherit UNIQUE constraints from the base table.
+//
+// This method is idempotent and safe to run on every ETL invocation.
+func (r *MultiRepo) EnsureTables(ctx context.Context, tables []storage.TableSpec) error {
+	for _, t := range tables {
+		if !t.AutoCreateTable {
+			continue
+		}
+
+		baseSQL, histSQL, err := buildCreateSQL(t)
+		if err != nil {
+			return err
+		}
+
+		if _, err := r.db.ExecContext(ctx, baseSQL); err != nil {
+			return fmt.Errorf("mssql: create base table %s: %w", t.Name, err)
+		}
+		if histSQL != "" {
+			if _, err := r.db.ExecContext(ctx, histSQL); err != nil {
+				return fmt.Errorf("mssql: create history table %s_history: %w", t.Name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// InsertFactRows inserts fact rows into table using either plain inserts, dedupe inserts,
+// or SCD2 merges depending on the TableSpec.
+//
+// Rules:
+//   - If spec.Load.Kind != "fact": treated as plain insert.
+//   - If spec.Load.History is nil or disabled: plain insert; if dedupeColumns is non-empty,
+//     uses an "insert where not exists" pattern for idempotency.
+//   - If spec.Load.History.Enabled: applies transactional SCD2 row-by-row logic.
 func (r *MultiRepo) InsertFactRows(
 	ctx context.Context,
 	spec storage.TableSpec,
@@ -70,349 +129,27 @@ func (r *MultiRepo) InsertFactRows(
 	if len(rows) == 0 {
 		return 0, nil
 	}
+	if table == "" {
+		return 0, fmt.Errorf("InsertFactRows: table is empty")
+	}
+	if len(columns) == 0 {
+		return 0, fmt.Errorf("InsertFactRows: columns is empty")
+	}
 
-	if spec.Load.Kind != "fact" ||
-		spec.Load.History == nil ||
-		!spec.Load.History.Enabled {
-		return r.insertPlain(ctx, table, columns, rows)
+	if spec.Load.Kind != "fact" || spec.Load.History == nil || !spec.Load.History.Enabled {
+		return r.insertPlain(ctx, table, columns, rows, dedupeColumns)
 	}
 
 	return r.insertSCD2(ctx, spec, table, columns, rows)
 }
 
-// insertPlain performs a simple multi-row INSERT.
-func (r *MultiRepo) insertPlain(
-	ctx context.Context,
-	table string,
-	columns []string,
-	rows [][]any,
-) (int64, error) {
-	var b strings.Builder
-	b.WriteString("INSERT INTO ")
-	b.WriteString(table)
-	b.WriteString(" (")
-
-	for i, c := range columns {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString("[" + c + "]")
-	}
-	b.WriteString(") VALUES ")
-
-	args := make([]any, 0, len(rows)*len(columns))
-	p := 1
-	for i, row := range rows {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString("(")
-		for j := range columns {
-			if j > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(fmt.Sprintf("@p%d", p))
-			p++
-			args = append(args, row[j])
-		}
-		b.WriteString(")")
-	}
-
-	res, err := r.db.ExecContext(ctx, b.String(), args...)
-	if err != nil {
-		return 0, err
-	}
-	n, _ := res.RowsAffected()
-	return n, nil
-}
-
-// insertSCD2 performs a full SCD2 merge for each row.
-func (r *MultiRepo) insertSCD2(
-	ctx context.Context,
-	spec storage.TableSpec,
-	table string,
-	columns []string,
-	rows [][]any,
-) (int64, error) {
-	h := spec.Load.History
-	now := time.Now().UTC()
-	total := int64(0)
-
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	colIdx := make(map[string]int, len(columns))
-	for i, c := range columns {
-		colIdx[c] = i
-	}
-
-	keyIdx := make([]int, len(h.BusinessKey))
-	for i, k := range h.BusinessKey {
-		keyIdx[i] = colIdx[k]
-	}
-
-	for _, row := range rows {
-		curr, validFrom, err := r.fetchCurrentRowTx(
-			ctx, tx, table, h, columns, keyIdx, row,
-		)
-		if err != nil {
-			return total, err
-		}
-
-		if curr == nil {
-			if err := r.insertCurrentRowTx(
-				ctx, tx, table, columns, row, h, now,
-			); err != nil {
-				return total, err
-			}
-			total++
-			continue
-		}
-
-		if rowsEqual(curr, row, columns) {
-			continue
-		}
-
-		if err := r.insertHistoryRowTx(
-			ctx, tx, table, columns, curr, validFrom, h, now,
-		); err != nil {
-			return total, err
-		}
-
-		if err := r.updateCurrentRowTx(
-			ctx, tx, table, columns, row, h, keyIdx, now,
-		); err != nil {
-			return total, err
-		}
-
-		total++
-	}
-
-	if err := tx.Commit(); err != nil {
-		return total, err
-	}
-	return total, nil
-}
-
-// fetchCurrentRowTx fetches the current row for a business key.
-func (r *MultiRepo) fetchCurrentRowTx(
-	ctx context.Context,
-	tx *sql.Tx,
-	table string,
-	h *storage.HistorySpec,
-	columns []string,
-	keyIdx []int,
-	row []any,
-) ([]any, time.Time, error) {
-	var b strings.Builder
-	b.WriteString("SELECT ")
-
-	for i, c := range columns {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString("[" + c + "]")
-	}
-	b.WriteString(", [" + h.ValidFromColumn + "] FROM ")
-	b.WriteString(table)
-	b.WriteString(" WITH (UPDLOCK, ROWLOCK) WHERE ")
-	b.WriteString("[" + h.ValidToColumn + "] IS NULL AND ")
-
-	args := make([]any, 0, len(keyIdx))
-	for i, idx := range keyIdx {
-		if i > 0 {
-			b.WriteString(" AND ")
-		}
-		b.WriteString("[" + h.BusinessKey[i] + "] = @p" + strconv.Itoa(i+1))
-		args = append(args, row[idx])
-	}
-
-	rowDB := tx.QueryRowContext(ctx, b.String(), args...)
-
-	out := make([]any, len(columns))
-	var validFrom time.Time
-	err := rowDB.Scan(append(out, &validFrom)...)
-	if err == sql.ErrNoRows {
-		return nil, time.Time{}, nil
-	}
-	if err != nil {
-		return nil, time.Time{}, err
-	}
-	return out, validFrom, nil
-}
-
-// insertHistoryRowTx inserts a closed historical version.
-func (r *MultiRepo) insertHistoryRowTx(
-	ctx context.Context,
-	tx *sql.Tx,
-	table string,
-	columns []string,
-	curr []any,
-	oldValidFrom time.Time,
-	h *storage.HistorySpec,
-	now time.Time,
-) error {
-	hist := table + "_history"
-
-	var b strings.Builder
-	b.WriteString("INSERT INTO ")
-	b.WriteString(hist)
-	b.WriteString(" (")
-
-	for i, c := range columns {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString("[" + c + "]")
-	}
-	b.WriteString(", [" + h.ValidFromColumn + "], [" + h.ValidToColumn + "], [" + h.ChangedAtColumn + "]) VALUES (")
-
-	args := make([]any, 0, len(curr)+3)
-	p := 1
-	for _, v := range curr {
-		b.WriteString("@p" + strconv.Itoa(p) + ", ")
-		args = append(args, v)
-		p++
-	}
-	b.WriteString("@p" + strconv.Itoa(p) + ", @p" + strconv.Itoa(p+1) + ", @p" + strconv.Itoa(p+2) + ")")
-	args = append(args, oldValidFrom, now, now)
-
-	_, err := tx.ExecContext(ctx, b.String(), args...)
-	return err
-}
-
-// updateCurrentRowTx updates the current row in place.
-func (r *MultiRepo) updateCurrentRowTx(
-	ctx context.Context,
-	tx *sql.Tx,
-	table string,
-	columns []string,
-	row []any,
-	h *storage.HistorySpec,
-	keyIdx []int,
-	now time.Time,
-) error {
-	var b strings.Builder
-	b.WriteString("UPDATE ")
-	b.WriteString(table)
-	b.WriteString(" SET ")
-
-	args := make([]any, 0, len(columns)+1)
-	p := 1
-	for i, c := range columns {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString("[" + c + "] = @p" + strconv.Itoa(p))
-		args = append(args, row[i])
-		p++
-	}
-	b.WriteString(", [" + h.ValidFromColumn + "] = @p" + strconv.Itoa(p))
-	args = append(args, now)
-	p++
-
-	b.WriteString(", [" + h.ValidToColumn + "] = NULL")
-	b.WriteString(", [" + h.ChangedAtColumn + "] = @p" + strconv.Itoa(p))
-	args = append(args, now)
-	p++
-
-	b.WriteString(" WHERE [" + h.ValidToColumn + "] IS NULL AND ")
-
-	for i, idx := range keyIdx {
-		if i > 0 {
-			b.WriteString(" AND ")
-		}
-		b.WriteString("[" + h.BusinessKey[i] + "] = @p" + strconv.Itoa(p))
-		args = append(args, row[idx])
-		p++
-	}
-
-	_, err := tx.ExecContext(ctx, b.String(), args...)
-	return err
-}
-
-// EnsureTables creates base and history tables when AutoCreateTable is enabled.
+// EnsureDimensionKeys idempotently inserts missing keys into a dimension table.
 //
-// History tables are named <table>_history and include metadata columns.
-// This method is idempotent.
-func (r *MultiRepo) EnsureTables(ctx context.Context, tables []storage.TableSpec) error {
-	for _, t := range tables {
-		if !t.AutoCreateTable {
-			continue
-		}
-		if t.Load.History == nil || !t.Load.History.Enabled {
-			continue
-		}
-		h := t.Load.History
-
-		var cols []string
-		for _, c := range t.Columns {
-			cols = append(cols, fmt.Sprintf("[%s] %s", c.Name, c.Type))
-		}
-		cols = append(cols,
-			fmt.Sprintf("[%s] DATETIME2 NOT NULL", h.ValidFromColumn),
-			fmt.Sprintf("[%s] DATETIME2 NULL", h.ValidToColumn),
-			fmt.Sprintf("[%s] DATETIME2 NOT NULL", h.ChangedAtColumn),
-		)
-
-		baseSQL := fmt.Sprintf(`
-IF OBJECT_ID(N'%s', N'U') IS NULL
-CREATE TABLE %s (%s);`,
-			t.Name, t.Name, strings.Join(cols, ", "))
-
-		histSQL := fmt.Sprintf(`
-IF OBJECT_ID(N'%s_history', N'U') IS NULL
-CREATE TABLE %s_history (%s);`,
-			t.Name, t.Name, strings.Join(cols, ", "))
-
-		if _, err := r.db.ExecContext(ctx, baseSQL); err != nil {
-			return err
-		}
-		if _, err := r.db.ExecContext(ctx, histSQL); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// rowsEqual compares rows using the "row_hash" column if present.
-// Falls back to full comparison only if the column is missing.
-func rowsEqual(a, b []any, columns []string) bool {
-	hashIdx := -1
-	for i, c := range columns {
-		if c == "row_hash" {
-			hashIdx = i
-			break
-		}
-	}
-
-	if hashIdx >= 0 {
-		return fmt.Sprint(a[hashIdx]) == fmt.Sprint(b[hashIdx])
-	}
-
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if fmt.Sprint(a[i]) != fmt.Sprint(b[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-// EnsureDimensionKeys inserts missing dimension keys into a dimension table.
-//
-// The operation is idempotent: existing keys are ignored.
-//
-// SQL Server implementation notes:
-//   - MERGE is intentionally avoided due to correctness and performance issues.
-//   - Keys are inserted using INSERT ... SELECT with a LEFT JOIN anti-semi-join.
-//   - Keys are chunked to stay within SQL Server parameter limits.
-//   - ConflictColumns must be empty or contain only keyColumn.
+// Implementation details:
+//   - Avoids MERGE.
+//   - Uses INSERT ... SELECT over a VALUES table and LEFT JOIN anti-semi join.
+//   - Chunks keys to stay well within SQL Server's 2100 parameter limit.
+//   - Deduplicates keys deterministically (stable ordering) to avoid nondeterminism.
 func (r *MultiRepo) EnsureDimensionKeys(
 	ctx context.Context,
 	table string,
@@ -434,33 +171,39 @@ func (r *MultiRepo) EnsureDimensionKeys(
 		)
 	}
 
-	// Deduplicate keys in-memory to avoid multiple insert attempts
-	// for the same value in a single batch.
+	// Deterministic dedupe:
+	//   - keep the first encountered value for a normalized key
+	//   - sort by normalized key string
 	uniq := make(map[string]any, len(keys))
+	order := make([]string, 0, len(keys))
 	for _, k := range keys {
 		nk := storage.NormalizeKey(k)
-		if nk != "" {
-			uniq[nk] = k
+		if nk == "" {
+			continue
 		}
+		if _, exists := uniq[nk]; exists {
+			continue
+		}
+		uniq[nk] = k
+		order = append(order, nk)
 	}
-	if len(uniq) == 0 {
+	if len(order) == 0 {
 		return nil
 	}
+	sort.Strings(order)
 
-	// SQL Server has a hard limit of 2100 parameters.
-	// We stay comfortably below that.
+	// SQL Server has a hard limit of 2100 parameters. We stay comfortably below that.
 	const chunkSize = 1000
 
-	// Use a single transaction for performance.
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("EnsureDimensionKeys: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	uniqKeys := make([]any, 0, len(uniq))
-	for _, v := range uniq {
-		uniqKeys = append(uniqKeys, v)
+	uniqKeys := make([]any, 0, len(order))
+	for _, nk := range order {
+		uniqKeys = append(uniqKeys, uniq[nk])
 	}
 
 	for start := 0; start < len(uniqKeys); start += chunkSize {
@@ -470,31 +213,8 @@ func (r *MultiRepo) EnsureDimensionKeys(
 		}
 		part := uniqKeys[start:end]
 
-		var b strings.Builder
-		b.WriteString("INSERT INTO ")
-		b.WriteString(table)
-		b.WriteString(" ([")
-		b.WriteString(keyColumn)
-		b.WriteString("]) SELECT v.[key] FROM (VALUES ")
-
-		args := make([]any, 0, len(part))
-		for i, k := range part {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(fmt.Sprintf("(@p%d)", i+1))
-			args = append(args, k)
-		}
-
-		b.WriteString(") AS v([key]) LEFT JOIN ")
-		b.WriteString(table)
-		b.WriteString(" t ON t.[")
-		b.WriteString(keyColumn)
-		b.WriteString("] = v.[key] WHERE t.[")
-		b.WriteString(keyColumn)
-		b.WriteString("] IS NULL")
-
-		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+		q, args := buildEnsureDimensionKeysSQL(table, keyColumn, part)
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 			return fmt.Errorf("EnsureDimensionKeys: insert %s: %w", table, err)
 		}
 	}
@@ -505,30 +225,333 @@ func (r *MultiRepo) EnsureDimensionKeys(
 	return nil
 }
 
-// insertCurrentRowTx inserts a new *current* version of a fact row under SCD2.
+// SelectAllKeyValue returns a mapping from normalized key -> surrogate id for the entire table.
 //
-// This is used when History is enabled for a fact table and there is no existing
-// current row for the incoming business key.
-//
-// The inserted row becomes the current version by setting:
-//   - valid_from = now
-//   - valid_to   = NULL
-//   - changed_at = now
-//
-// Parameters:
-//   - tx must be an open transaction that the caller controls.
-//   - table is the base table name (not the "_history" table).
-//   - columns are the non-metadata fact columns provided by the engine (must align with row).
-//   - row contains values aligned with columns.
-//   - h supplies the history metadata column names.
-//   - now is the timestamp used for valid_from/changed_at.
-//
-// Requirements:
-//   - The base table must contain the metadata columns named in h
-//     (ValidFromColumn, ValidToColumn, ChangedAtColumn).
-func (r *MultiRepo) insertCurrentRowTx(
+// It is used to prewarm in-memory caches for dimensions.
+func (r *MultiRepo) SelectAllKeyValue(
 	ctx context.Context,
-	tx *sql.Tx,
+	table string,
+	keyColumn string,
+	valueColumn string,
+) (map[string]int64, error) {
+	if table == "" || keyColumn == "" || valueColumn == "" {
+		return nil, fmt.Errorf("SelectAllKeyValue: table, keyColumn, valueColumn required")
+	}
+
+	q := fmt.Sprintf(
+		"SELECT %s, %s FROM %s",
+		mssqlIdent(keyColumn),
+		mssqlIdent(valueColumn),
+		mssqlTableIdent(table),
+	)
+
+	rows, err := r.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]int64)
+	for rows.Next() {
+		var k any
+		var id int64
+		if err := rows.Scan(&k, &id); err != nil {
+			return nil, err
+		}
+		out[storage.NormalizeKey(k)] = id
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SelectKeyValueByKeys returns mapping from normalized key -> id for the provided keys.
+//
+// This method chunks the IN() list to avoid SQL Server parameter limits.
+func (r *MultiRepo) SelectKeyValueByKeys(
+	ctx context.Context,
+	table string,
+	keyColumn string,
+	valueColumn string,
+	keys []any,
+) (map[string]int64, error) {
+	if len(keys) == 0 {
+		return map[string]int64{}, nil
+	}
+	if table == "" || keyColumn == "" || valueColumn == "" {
+		return nil, fmt.Errorf("SelectKeyValueByKeys: table, keyColumn, valueColumn required")
+	}
+
+	const chunk = 1000
+	out := make(map[string]int64, len(keys))
+
+	for start := 0; start < len(keys); start += chunk {
+		end := start + chunk
+		if end > len(keys) {
+			end = len(keys)
+		}
+		part := keys[start:end]
+
+		q, args := buildSelectKeyValueByKeysSQL(table, keyColumn, valueColumn, part)
+
+		rows, err := r.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+
+		for rows.Next() {
+			var k any
+			var id int64
+			if err := rows.Scan(&k, &id); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			out[storage.NormalizeKey(k)] = id
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		_ = rows.Close()
+	}
+
+	return out, nil
+}
+
+// insertPlain inserts rows into the table with optional dedupe behavior.
+//
+// If dedupeColumns is empty, it performs a standard bulk INSERT.
+// If dedupeColumns is set, it inserts only rows that do not already exist, using NOT EXISTS.
+// This makes reruns idempotent for the specified dedupe columns.
+func (r *MultiRepo) insertPlain(
+	ctx context.Context,
+	table string,
+	columns []string,
+	rows [][]any,
+	dedupeColumns []string,
+) (int64, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	if len(dedupeColumns) == 0 {
+		return r.insertPlainNoDedupe(ctx, table, columns, rows)
+	}
+
+	return r.insertPlainWithDedupe(ctx, table, columns, rows, dedupeColumns)
+}
+
+// insertPlainNoDedupe inserts all rows using a single INSERT ... VALUES statement.
+func (r *MultiRepo) insertPlainNoDedupe(
+	ctx context.Context,
+	table string,
+	columns []string,
+	rows [][]any,
+) (int64, error) {
+	q, args := buildBulkInsertSQL(table, columns, rows)
+
+	res, err := r.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// insertPlainWithDedupe inserts rows only if they do not already exist per dedupeColumns.
+//
+// The statement is chunked to avoid SQL Server's parameter limit (2100).
+func (r *MultiRepo) insertPlainWithDedupe(
+	ctx context.Context,
+	table string,
+	columns []string,
+	rows [][]any,
+	dedupeColumns []string,
+) (int64, error) {
+	// Validate dedupe columns exist in the columns list.
+	colPos := indexColumns(columns)
+	for _, dc := range dedupeColumns {
+		if _, ok := colPos[dc]; !ok {
+			return 0, fmt.Errorf("insertPlainWithDedupe: dedupe column %q not present in columns", dc)
+		}
+	}
+
+	// SQL Server parameter limit is 2100. Each row uses len(columns) parameters.
+	// We compute a conservative maximum rows per statement.
+	maxRows := 2000 / max(1, len(columns))
+	if maxRows < 1 {
+		maxRows = 1
+	}
+
+	var total int64
+	for start := 0; start < len(rows); start += maxRows {
+		end := start + maxRows
+		if end > len(rows) {
+			end = len(rows)
+		}
+		part := rows[start:end]
+
+		q, args := buildInsertNotExistsSQL(table, columns, part, dedupeColumns)
+
+		res, err := r.db.ExecContext(ctx, q, args...)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+
+	return total, nil
+}
+
+// insertSCD2 applies SCD2 semantics row-by-row in a single transaction.
+//
+// This ensures atomicity for each row version transition.
+func (r *MultiRepo) insertSCD2(
+	ctx context.Context,
+	spec storage.TableSpec,
+	table string,
+	columns []string,
+	rows [][]any,
+) (int64, error) {
+	h := spec.Load.History
+	if h == nil || !h.Enabled {
+		return 0, fmt.Errorf("insertSCD2: history spec is nil/disabled")
+	}
+	if len(h.BusinessKey) == 0 {
+		return 0, fmt.Errorf("insertSCD2: business_key must not be empty")
+	}
+
+	now := time.Now().UTC()
+	var total int64
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	colIdx := indexColumns(columns)
+	keyIdx, err := indicesFor(h.BusinessKey, colIdx)
+	if err != nil {
+		return 0, err
+	}
+
+	rowHashIdx, hasRowHash := indexOfColumn(columns, "row_hash")
+
+	for _, row := range rows {
+		curr, validFrom, err := fetchCurrentRowTx(ctx, tx, table, h, columns, keyIdx, row)
+		if err != nil {
+			return total, err
+		}
+
+		if curr == nil {
+			if err := insertCurrentRowTx(ctx, tx, table, columns, row, h, now); err != nil {
+				return total, err
+			}
+			total++
+			continue
+		}
+
+		changed := true
+		if hasRowHash {
+			changed = !equalScalar(curr[rowHashIdx], row[rowHashIdx])
+		} else {
+			changed = !rowsEqualAll(curr, row)
+		}
+		if !changed {
+			continue
+		}
+
+		if err := insertHistoryRowTx(ctx, tx, table, columns, curr, validFrom, h, now); err != nil {
+			return total, err
+		}
+		if err := updateCurrentRowTx(ctx, tx, table, columns, row, h, keyIdx, now); err != nil {
+			return total, err
+		}
+
+		total++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return total, err
+	}
+	return total, nil
+}
+
+// fetchCurrentRowTx loads and locks the current row for a given business key.
+//
+// It uses UPDLOCK + ROWLOCK to serialize writers for the same business key.
+//
+// Returns:
+//   - (nil, zero, nil) if there is no current row.
+//   - (rowValues, validFrom, nil) if found.
+func fetchCurrentRowTx(
+	ctx context.Context,
+	tx txConn,
+	table string,
+	h *storage.HistorySpec,
+	columns []string,
+	keyIdx []int,
+	row []any,
+) ([]any, time.Time, error) {
+	var b strings.Builder
+	b.WriteString("SELECT ")
+
+	for i, c := range columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(mssqlIdent(c))
+	}
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(h.ValidFromColumn))
+	b.WriteString(" FROM ")
+	b.WriteString(mssqlTableIdent(table))
+	b.WriteString(" WITH (UPDLOCK, ROWLOCK) WHERE ")
+	b.WriteString(mssqlIdent(h.ValidToColumn))
+	b.WriteString(" IS NULL AND ")
+
+	args := make([]any, 0, len(keyIdx))
+	for i, idx := range keyIdx {
+		if i > 0 {
+			b.WriteString(" AND ")
+		}
+		b.WriteString(mssqlIdent(h.BusinessKey[i]))
+		b.WriteString(" = @p")
+		b.WriteString(strconv.Itoa(i + 1))
+		args = append(args, row[idx])
+	}
+
+	rowDB := tx.QueryRowContext(ctx, b.String(), args...)
+
+	// IMPORTANT: Scan destinations must be pointers. We build a parallel slice of &out[i].
+	out := make([]any, len(columns))
+	dests := make([]any, len(columns))
+	for i := range out {
+		dests[i] = &out[i]
+	}
+
+	var validFrom time.Time
+	if err := rowDB.Scan(append(dests, &validFrom)...); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, time.Time{}, nil
+		}
+		return nil, time.Time{}, err
+	}
+	return out, validFrom, nil
+}
+
+// insertCurrentRowTx inserts a new current version of a fact row under SCD2.
+//
+// It sets:
+//   - valid_from = now
+//   - valid_to = NULL
+//   - changed_at = now
+func insertCurrentRowTx(
+	ctx context.Context,
+	tx txConn,
 	table string,
 	columns []string,
 	row []any,
@@ -553,24 +576,24 @@ func (r *MultiRepo) insertCurrentRowTx(
 
 	var b strings.Builder
 	b.WriteString("INSERT INTO ")
-	b.WriteString(table)
+	b.WriteString(mssqlTableIdent(table))
 	b.WriteString(" (")
 
-	// business/value columns
 	for i, c := range columns {
 		if i > 0 {
 			b.WriteString(", ")
 		}
-		b.WriteString("[" + c + "]")
+		b.WriteString(mssqlIdent(c))
 	}
-
-	// metadata columns
-	b.WriteString(", [" + h.ValidFromColumn + "]")
-	b.WriteString(", [" + h.ValidToColumn + "]")
-	b.WriteString(", [" + h.ChangedAtColumn + "]")
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(h.ValidFromColumn))
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(h.ValidToColumn))
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(h.ChangedAtColumn))
 	b.WriteString(") VALUES (")
 
-	args := make([]any, 0, len(columns)+3)
+	args := make([]any, 0, len(columns)+2)
 	p := 1
 
 	for i := range columns {
@@ -582,14 +605,13 @@ func (r *MultiRepo) insertCurrentRowTx(
 		p++
 	}
 
-	// Append metadata placeholders.
 	// valid_from
 	b.WriteString(", ")
 	b.WriteString(fmt.Sprintf("@p%d", p))
 	args = append(args, now)
 	p++
 
-	// valid_to (NULL)
+	// valid_to
 	b.WriteString(", NULL")
 
 	// changed_at
@@ -603,100 +625,669 @@ func (r *MultiRepo) insertCurrentRowTx(
 	return err
 }
 
-// SelectAllKeyValue returns a mapping from normalized key -> surrogate id
-// for the entire dimension table.
-func (r *MultiRepo) SelectAllKeyValue(
+// insertHistoryRowTx inserts a closed version row into <table>_history.
+//
+// It preserves oldValidFrom, and sets valid_to and changed_at to now.
+func insertHistoryRowTx(
 	ctx context.Context,
+	tx txConn,
 	table string,
-	keyColumn string,
-	valueColumn string,
-) (map[string]int64, error) {
-	if table == "" || keyColumn == "" || valueColumn == "" {
-		return nil, fmt.Errorf("SelectAllKeyValue: table, keyColumn, valueColumn required")
+	columns []string,
+	curr []any,
+	oldValidFrom time.Time,
+	h *storage.HistorySpec,
+	now time.Time,
+) error {
+	hist := table + "_history"
+
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(mssqlTableIdent(hist))
+	b.WriteString(" (")
+
+	for i, c := range columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(mssqlIdent(c))
+	}
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(h.ValidFromColumn))
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(h.ValidToColumn))
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(h.ChangedAtColumn))
+	b.WriteString(") VALUES (")
+
+	args := make([]any, 0, len(curr)+3)
+	p := 1
+	for i := range curr {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("@p")
+		b.WriteString(strconv.Itoa(p))
+		args = append(args, curr[i])
+		p++
 	}
 
-	q := fmt.Sprintf(
-		"SELECT [%s], [%s] FROM %s",
-		keyColumn, valueColumn, table,
-	)
+	b.WriteString(", @p")
+	b.WriteString(strconv.Itoa(p))
+	b.WriteString(", @p")
+	b.WriteString(strconv.Itoa(p + 1))
+	b.WriteString(", @p")
+	b.WriteString(strconv.Itoa(p + 2))
+	b.WriteString(")")
 
-	rows, err := r.db.QueryContext(ctx, q)
+	args = append(args, oldValidFrom, now, now)
+
+	_, err := tx.ExecContext(ctx, b.String(), args...)
+	return err
+}
+
+// updateCurrentRowTx updates the current row in place, matching by business key and valid_to IS NULL.
+//
+// It sets:
+//   - all fact columns
+//   - valid_from = now
+//   - valid_to = NULL
+//   - changed_at = now
+func updateCurrentRowTx(
+	ctx context.Context,
+	tx txConn,
+	table string,
+	columns []string,
+	row []any,
+	h *storage.HistorySpec,
+	keyIdx []int,
+	now time.Time,
+) error {
+	var b strings.Builder
+	b.WriteString("UPDATE ")
+	b.WriteString(mssqlTableIdent(table))
+	b.WriteString(" SET ")
+
+	args := make([]any, 0, len(columns)+2+len(keyIdx))
+	p := 1
+
+	for i, c := range columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(mssqlIdent(c))
+		b.WriteString(" = @p")
+		b.WriteString(strconv.Itoa(p))
+		args = append(args, row[i])
+		p++
+	}
+
+	// valid_from
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(h.ValidFromColumn))
+	b.WriteString(" = @p")
+	b.WriteString(strconv.Itoa(p))
+	args = append(args, now)
+	p++
+
+	// valid_to
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(h.ValidToColumn))
+	b.WriteString(" = NULL")
+
+	// changed_at
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(h.ChangedAtColumn))
+	b.WriteString(" = @p")
+	b.WriteString(strconv.Itoa(p))
+	args = append(args, now)
+	p++
+
+	b.WriteString(" WHERE ")
+	b.WriteString(mssqlIdent(h.ValidToColumn))
+	b.WriteString(" IS NULL AND ")
+
+	for i, idx := range keyIdx {
+		if i > 0 {
+			b.WriteString(" AND ")
+		}
+		b.WriteString(mssqlIdent(h.BusinessKey[i]))
+		b.WriteString(" = @p")
+		b.WriteString(strconv.Itoa(p))
+		args = append(args, row[idx])
+		p++
+	}
+
+	_, err := tx.ExecContext(ctx, b.String(), args...)
+	return err
+}
+
+// buildCreateSQL builds idempotent CREATE TABLE SQL for base and history tables.
+//
+// The history table is only generated when:
+//   - Load.Kind == "fact"
+//   - History.Enabled == true
+//
+// The history table deliberately excludes UNIQUE constraints to allow multiple versions per business key.
+func buildCreateSQL(t storage.TableSpec) (baseSQL, histSQL string, err error) {
+	if strings.TrimSpace(t.Name) == "" {
+		return "", "", fmt.Errorf("mssql: table name is empty")
+	}
+
+	baseDefs, err := buildCreateTableDefs(t, true, true)
+	if err != nil {
+		return "", "", err
+	}
+	baseSQL = wrapCreateIfMissing(t.Name, baseDefs)
+
+	if t.Load.Kind == "fact" && t.Load.History != nil && t.Load.History.Enabled {
+		histName := t.Name + "_history"
+
+		// History must NOT carry unique constraints.
+		histDefs, err := buildCreateTableDefs(t, false, false)
+		if err != nil {
+			return "", "", err
+		}
+		histSQL = wrapCreateIfMissing(histName, histDefs)
+	}
+
+	return baseSQL, histSQL, nil
+}
+
+// buildCreateTableDefs produces the "(...)" inner content for CREATE TABLE.
+//
+// includePrimaryKey controls whether to include TableSpec.PrimaryKey.
+// includeUniqueConstraints controls whether to include TableSpec.Constraints of kind "unique".
+//
+// If History is enabled, this method appends the SCD2 metadata columns if they are not
+// already present in TableSpec.Columns.
+func buildCreateTableDefs(t storage.TableSpec, includePrimaryKey bool, includeUniqueConstraints bool) (string, error) {
+	var parts []string
+
+	if includePrimaryKey && t.PrimaryKey != nil {
+		pkDef, err := mssqlPrimaryKeyDef(*t.PrimaryKey)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, pkDef)
+	}
+
+	configured := configuredColumnSet(t)
+
+	for _, c := range t.Columns {
+		def, err := mssqlColumnDef(c)
+		if err != nil {
+			return "", err
+		}
+		parts = append(parts, def)
+	}
+
+	if t.Load.History != nil && t.Load.History.Enabled {
+		h := t.Load.History
+		if strings.TrimSpace(h.ValidFromColumn) == "" ||
+			strings.TrimSpace(h.ValidToColumn) == "" ||
+			strings.TrimSpace(h.ChangedAtColumn) == "" {
+			return "", fmt.Errorf("mssql: history enabled but metadata column names are empty")
+		}
+
+		if !configured[strings.ToLower(strings.TrimSpace(h.ValidFromColumn))] {
+			parts = append(parts, fmt.Sprintf("%s DATETIME2 NOT NULL", mssqlIdent(h.ValidFromColumn)))
+		}
+		if !configured[strings.ToLower(strings.TrimSpace(h.ValidToColumn))] {
+			parts = append(parts, fmt.Sprintf("%s DATETIME2 NULL", mssqlIdent(h.ValidToColumn)))
+		}
+		if !configured[strings.ToLower(strings.TrimSpace(h.ChangedAtColumn))] {
+			parts = append(parts, fmt.Sprintf("%s DATETIME2 NOT NULL", mssqlIdent(h.ChangedAtColumn)))
+		}
+	}
+
+	if includeUniqueConstraints {
+		for _, con := range t.Constraints {
+			if !strings.EqualFold(con.Kind, "unique") {
+				return "", fmt.Errorf("%s unsupported constraint kind: %s", t.Name, con.Kind)
+			}
+			if len(con.Columns) == 0 {
+				return "", fmt.Errorf("%s unique constraint has no columns", t.Name)
+			}
+			var cols []string
+			for _, c := range con.Columns {
+				cols = append(cols, mssqlIdent(c))
+			}
+			parts = append(parts, fmt.Sprintf("UNIQUE (%s)", strings.Join(cols, ", ")))
+		}
+	}
+
+	return strings.Join(parts, ", "), nil
+}
+
+// wrapCreateIfMissing wraps a CREATE TABLE statement in an OBJECT_ID guard.
+//
+// This keeps EnsureTables idempotent without requiring IF NOT EXISTS syntax.
+func wrapCreateIfMissing(tableName string, innerDefs string) string {
+	return fmt.Sprintf(
+		"IF OBJECT_ID(N'%s', N'U') IS NULL BEGIN CREATE TABLE %s (%s); END;",
+		tableName,
+		mssqlTableIdent(tableName),
+		innerDefs,
+	)
+}
+
+// mssqlPrimaryKeyDef returns a column definition for an identity primary key.
+//
+// Supported types (case-insensitive):
+//   - "serial", "identity" variants -> INT IDENTITY(1,1) PRIMARY KEY
+//   - "bigserial" -> BIGINT IDENTITY(1,1) PRIMARY KEY
+//   - otherwise uses pk.Type verbatim with PRIMARY KEY.
+func mssqlPrimaryKeyDef(pk storage.PrimaryKeySpec) (string, error) {
+	if strings.TrimSpace(pk.Name) == "" {
+		return "", fmt.Errorf("mssql: primary key name is empty")
+	}
+	typ := strings.ToLower(strings.TrimSpace(pk.Type))
+	switch typ {
+	case "serial", "int identity", "integer identity", "identity":
+		return fmt.Sprintf("%s INT IDENTITY(1,1) PRIMARY KEY", mssqlIdent(pk.Name)), nil
+	case "bigserial":
+		return fmt.Sprintf("%s BIGINT IDENTITY(1,1) PRIMARY KEY", mssqlIdent(pk.Name)), nil
+	default:
+		return fmt.Sprintf("%s %s PRIMARY KEY", mssqlIdent(pk.Name), pk.Type), nil
+	}
+}
+
+// mssqlColumnDef builds a SQL Server column definition from storage.ColumnSpec.
+//
+// It respects nullability and attaches a raw REFERENCES clause if provided.
+func mssqlColumnDef(c storage.ColumnSpec) (string, error) {
+	if strings.TrimSpace(c.Name) == "" {
+		return "", fmt.Errorf("mssql: column name is empty")
+	}
+	if strings.TrimSpace(c.Type) == "" {
+		return "", fmt.Errorf("mssql: column %s type is empty", c.Name)
+	}
+
+	var b strings.Builder
+	b.WriteString(mssqlIdent(c.Name))
+	b.WriteString(" ")
+	b.WriteString(c.Type)
+
+	nullable := true
+	if c.Nullable != nil {
+		nullable = *c.Nullable
+	}
+	if !nullable {
+		b.WriteString(" NOT NULL")
+	}
+	if strings.TrimSpace(c.References) != "" {
+		b.WriteString(" REFERENCES ")
+		b.WriteString(c.References)
+	}
+
+	return b.String(), nil
+}
+
+// configuredColumnSet returns a lowercase set of configured column names, used to prevent duplicates.
+func configuredColumnSet(t storage.TableSpec) map[string]bool {
+	out := make(map[string]bool, len(t.Columns))
+	for _, c := range t.Columns {
+		n := strings.ToLower(strings.TrimSpace(c.Name))
+		if n == "" {
+			continue
+		}
+		out[n] = true
+	}
+	return out
+}
+
+// buildEnsureDimensionKeysSQL returns the INSERT...SELECT SQL and args for a key chunk.
+//
+// This is split out purely for testability and clarity.
+func buildEnsureDimensionKeysSQL(table, keyColumn string, keys []any) (string, []any) {
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(mssqlTableIdent(table))
+	b.WriteString(" (")
+	b.WriteString(mssqlIdent(keyColumn))
+	b.WriteString(") SELECT v.[key] FROM (VALUES ")
+
+	args := make([]any, 0, len(keys))
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(fmt.Sprintf("(@p%d)", i+1))
+		args = append(args, k)
+	}
+
+	b.WriteString(") AS v([key]) LEFT JOIN ")
+	b.WriteString(mssqlTableIdent(table))
+	b.WriteString(" t ON t.")
+	b.WriteString(mssqlIdent(keyColumn))
+	b.WriteString(" = v.[key] WHERE t.")
+	b.WriteString(mssqlIdent(keyColumn))
+	b.WriteString(" IS NULL")
+
+	return b.String(), args
+}
+
+// buildSelectKeyValueByKeysSQL returns the SELECT ... IN (...) query and args.
+func buildSelectKeyValueByKeysSQL(table, keyColumn, valueColumn string, keys []any) (string, []any) {
+	var b strings.Builder
+	b.WriteString("SELECT ")
+	b.WriteString(mssqlIdent(keyColumn))
+	b.WriteString(", ")
+	b.WriteString(mssqlIdent(valueColumn))
+	b.WriteString(" FROM ")
+	b.WriteString(mssqlTableIdent(table))
+	b.WriteString(" WHERE ")
+	b.WriteString(mssqlIdent(keyColumn))
+	b.WriteString(" IN (")
+
+	args := make([]any, 0, len(keys))
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(fmt.Sprintf("@p%d", i+1))
+		args = append(args, k)
+	}
+	b.WriteString(")")
+
+	return b.String(), args
+}
+
+// buildBulkInsertSQL builds a single INSERT ... VALUES statement for all rows.
+func buildBulkInsertSQL(table string, columns []string, rows [][]any) (string, []any) {
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(mssqlTableIdent(table))
+	b.WriteString(" (")
+
+	for i, c := range columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(mssqlIdent(c))
+	}
+	b.WriteString(") VALUES ")
+
+	args := make([]any, 0, len(rows)*len(columns))
+	p := 1
+	for i, row := range rows {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("(")
+		for j := range columns {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(fmt.Sprintf("@p%d", p))
+			args = append(args, row[j])
+			p++
+		}
+		b.WriteString(")")
+	}
+
+	return b.String(), args
+}
+
+// buildInsertNotExistsSQL constructs a single INSERT...SELECT...WHERE NOT EXISTS for a chunk of rows.
+//
+// It materializes incoming rows as a derived table V via VALUES, then inserts only those
+// rows that do not match existing rows per dedupeColumns.
+//
+// The returned SQL is deterministic for a given input.
+func buildInsertNotExistsSQL(table string, columns []string, rows [][]any, dedupeColumns []string) (string, []any) {
+	var b strings.Builder
+
+	b.WriteString("INSERT INTO ")
+	b.WriteString(mssqlTableIdent(table))
+	b.WriteString(" (")
+
+	for i, c := range columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(mssqlIdent(c))
+	}
+
+	b.WriteString(") SELECT ")
+
+	for i, c := range columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("v.")
+		b.WriteString(mssqlIdent(c))
+	}
+
+	b.WriteString(" FROM (VALUES ")
+
+	args := make([]any, 0, len(rows)*len(columns))
+	p := 1
+	for i, row := range rows {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString("(")
+		for j := range columns {
+			if j > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(fmt.Sprintf("@p%d", p))
+			args = append(args, row[j])
+			p++
+		}
+		b.WriteString(")")
+	}
+
+	b.WriteString(") AS v(")
+	for i, c := range columns {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(mssqlIdent(c))
+	}
+	b.WriteString(") WHERE NOT EXISTS (SELECT 1 FROM ")
+	b.WriteString(mssqlTableIdent(table))
+	b.WriteString(" t WHERE ")
+
+	for i, dc := range dedupeColumns {
+		if i > 0 {
+			b.WriteString(" AND ")
+		}
+		b.WriteString("t.")
+		b.WriteString(mssqlIdent(dc))
+		b.WriteString(" = v.")
+		b.WriteString(mssqlIdent(dc))
+	}
+	b.WriteString(")")
+
+	return b.String(), args
+}
+
+// indexColumns returns a mapping of column name -> index.
+//
+// This helper is intentionally tiny and allocation-light; it is used on hot paths.
+func indexColumns(columns []string) map[string]int {
+	m := make(map[string]int, len(columns))
+	for i, c := range columns {
+		m[c] = i
+	}
+	return m
+}
+
+// indicesFor returns the indices for required columns based on colIdx.
+//
+// This helper returns a friendly error if a required column is missing.
+func indicesFor(required []string, colIdx map[string]int) ([]int, error) {
+	out := make([]int, len(required))
+	for i, c := range required {
+		idx, ok := colIdx[c]
+		if !ok {
+			return nil, fmt.Errorf("column %q not found in columns", c)
+		}
+		out[i] = idx
+	}
+	return out, nil
+}
+
+// indexOfColumn returns the index of a column and whether it exists.
+func indexOfColumn(columns []string, name string) (int, bool) {
+	for i, c := range columns {
+		if c == name {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// rowsEqualAll compares two slices by stringified scalar values.
+//
+// This is a pragmatic fallback for cases where row_hash is not available.
+func rowsEqualAll(a, b []any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if fmt.Sprint(a[i]) != fmt.Sprint(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// equalScalar compares values in a driver-tolerant way, especially for row_hash.
+//
+// Drivers commonly return []byte for textual columns; this function ensures that
+// string vs []byte compare correctly.
+func equalScalar(a any, b any) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	switch av := a.(type) {
+	case []byte:
+		switch bv := b.(type) {
+		case []byte:
+			return string(av) == string(bv)
+		case string:
+			return string(av) == bv
+		}
+	case string:
+		switch bv := b.(type) {
+		case []byte:
+			return av == string(bv)
+		case string:
+			return av == bv
+		}
+	}
+	return fmt.Sprint(a) == fmt.Sprint(b)
+}
+
+// mssqlIdent returns a bracket-quoted identifier, escaping ']' as ']]'.
+func mssqlIdent(name string) string {
+	return "[" + strings.ReplaceAll(name, "]", "]]") + "]"
+}
+
+// mssqlTableIdent returns a bracket-quoted identifier for schema-qualified names.
+//
+// Example:
+//
+//	"dbo.imports" -> [dbo].[imports]
+func mssqlTableIdent(name string) string {
+	parts := strings.Split(name, ".")
+	for i := range parts {
+		parts[i] = mssqlIdent(strings.TrimSpace(parts[i]))
+	}
+	return strings.Join(parts, ".")
+}
+
+// max returns the maximum of a and b.
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// ---- database/sql seam types ----
+
+// dbConn is a small interface over *sql.DB used to make this package testable.
+//
+// It intentionally includes only the methods this file needs.
+type dbConn interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (txConn, error)
+	Close() error
+}
+
+// txConn is a small interface over *sql.Tx used for testability.
+//
+// It models the minimal transactional methods required by the SCD2 code path.
+type txConn interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) rowScanner
+	Commit() error
+	Rollback() error
+}
+
+// rowScanner is a narrow adapter over *sql.Row.Scan.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// sqlDB wraps *sql.DB to implement dbConn.
+type sqlDB struct {
+	db *sql.DB
+}
+
+// ExecContext executes a non-query statement.
+func (s *sqlDB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return s.db.ExecContext(ctx, query, args...)
+}
+
+// QueryContext executes a query statement and returns rows.
+func (s *sqlDB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return s.db.QueryContext(ctx, query, args...)
+}
+
+// BeginTx begins a transaction and returns a txConn wrapper.
+func (s *sqlDB) BeginTx(ctx context.Context, opts *sql.TxOptions) (txConn, error) {
+	tx, err := s.db.BeginTx(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	out := make(map[string]int64)
-	for rows.Next() {
-		var k any
-		var id int64
-		if err := rows.Scan(&k, &id); err != nil {
-			return nil, err
-		}
-		out[storage.NormalizeKey(k)] = id
-	}
-	return out, rows.Err()
+	return &sqlTx{tx: tx}, nil
 }
 
-// SelectKeyValueByKeys returns mapping from normalized key -> id for a set of keys.
-func (r *MultiRepo) SelectKeyValueByKeys(
-	ctx context.Context,
-	table string,
-	keyColumn string,
-	valueColumn string,
-	keys []any,
-) (map[string]int64, error) {
-	if len(keys) == 0 {
-		return map[string]int64{}, nil
-	}
+// Close closes the underlying database handle.
+func (s *sqlDB) Close() error { return s.db.Close() }
 
-	const chunk = 1000 // safe for SQL Server parameter limits
-	out := make(map[string]int64, len(keys))
-
-	for start := 0; start < len(keys); start += chunk {
-		end := start + chunk
-		if end > len(keys) {
-			end = len(keys)
-		}
-		part := keys[start:end]
-
-		var b strings.Builder
-		b.WriteString("SELECT [")
-		b.WriteString(keyColumn)
-		b.WriteString("], [")
-		b.WriteString(valueColumn)
-		b.WriteString("] FROM ")
-		b.WriteString(table)
-		b.WriteString(" WHERE [")
-		b.WriteString(keyColumn)
-		b.WriteString("] IN (")
-
-		args := make([]any, 0, len(part))
-		for i, k := range part {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(fmt.Sprintf("@p%d", i+1))
-			args = append(args, k)
-		}
-		b.WriteString(")")
-
-		rows, err := r.db.QueryContext(ctx, b.String(), args...)
-		if err != nil {
-			return nil, err
-		}
-
-		for rows.Next() {
-			var k any
-			var id int64
-			if err := rows.Scan(&k, &id); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			out[storage.NormalizeKey(k)] = id
-		}
-		rows.Close()
-	}
-
-	return out, nil
+// sqlTx wraps *sql.Tx to implement txConn.
+type sqlTx struct {
+	tx *sql.Tx
 }
+
+// ExecContext executes a statement within this transaction.
+func (s *sqlTx) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return s.tx.ExecContext(ctx, query, args...)
+}
+
+// QueryRowContext executes a query expected to return at most one row.
+func (s *sqlTx) QueryRowContext(ctx context.Context, query string, args ...any) rowScanner {
+	return s.tx.QueryRowContext(ctx, query, args...)
+}
+
+// Commit commits the transaction.
+func (s *sqlTx) Commit() error { return s.tx.Commit() }
+
+// Rollback rolls back the transaction.
+func (s *sqlTx) Rollback() error { return s.tx.Rollback() }
+
+// compile-time sanity checks (no runtime cost).
+var (
+	_ dbConn = (*sqlDB)(nil)
+	_ txConn = (*sqlTx)(nil)
+
+	// Silence unused import risk if future edits remove errors usage.
+	_ = errors.Is
+)
