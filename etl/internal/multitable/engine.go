@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"hash"
 	"log"
 	"sort"
 	"strconv"
@@ -140,7 +141,6 @@ func (e *Engine2Pass) logger() func(format string, v ...any) {
 // Engine2Pass.Stream may be provided to inject a deterministic stream.
 //
 // Errors:
-//
 //   - Returns any fatal initialization error from the stream provider.
 //   - Row-level parse/transform/validation issues are reflected via stream counters
 //     and/or stream.Wait (consistent with StreamValidatedRows).
@@ -344,6 +344,11 @@ func (e *Engine2Pass) loadFactsStreaming(
 	jobs := make(chan batchJob, loaderWorkers*2)
 
 	// Producer: read validated rows and bundle into batches.
+	//
+	// IMPORTANT: Even after cancellation (typically triggered by a loader worker error),
+	// the producer must continue draining stream.Rows until it is closed. If it returns
+	// early, upstream stages can block trying to send into stream.Rows, and stream.Wait()
+	// can hang forever.
 	var producerWG sync.WaitGroup
 	producerWG.Add(1)
 	go func() {
@@ -351,38 +356,48 @@ func (e *Engine2Pass) loadFactsStreaming(
 		defer close(jobs)
 
 		batch := make([]*transformer.Row, 0, batchSize)
+		canceled := false
 
-		flush := func() bool {
-			if len(batch) == 0 {
-				return true
+		dropBatch := func() {
+			for _, r := range batch {
+				r.Drop()
 			}
-			job := batchJob{rows: batch}
+			batch = batch[:0]
+		}
+
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			if canceled {
+				dropBatch()
+				return
+			}
+
 			select {
-			case jobs <- job:
+			case jobs <- batchJob{rows: batch}:
 				batch = make([]*transformer.Row, 0, batchSize)
-				return true
 			case <-ctx.Done():
-				// On cancellation: do not re-pool
-				for _, r := range batch {
-					r.Drop()
-				}
-				return false
+				// Switch into drain-only mode: do not enqueue more work, but keep
+				// reading stream.Rows so the upstream pipeline can finish.
+				canceled = true
+				dropBatch()
 			}
 		}
 
 		for r := range stream.Rows {
-			if ctx.Err() != nil {
+			if canceled || ctx.Err() != nil {
+				canceled = true
 				r.Drop()
 				continue
 			}
+
 			batch = append(batch, r)
 			if len(batch) >= batchSize {
-				if ok := flush(); !ok {
-					return
-				}
+				flush()
 			}
 		}
-		_ = flush()
+		flush()
 	}()
 
 	// workerFn consumes fact batch jobs, prewarms dimension lookups for the batch,
@@ -439,7 +454,7 @@ func (e *Engine2Pass) loadFactsStreaming(
 				}
 			}
 
-			// Normal path: return to pool
+			// Normal path: return to pool.
 			if ctx.Err() != nil {
 				for _, r := range job.rows {
 					r.Drop()
@@ -455,73 +470,6 @@ func (e *Engine2Pass) loadFactsStreaming(
 			}
 		}
 	}
-
-	// START
-	//workerFn := func(workerID int) {
-	//	cache := make(map[string]map[string]int64, len(plan.Dimensions))
-
-	//	for job := range jobs {
-	//		if ctx.Err() != nil {
-	//			for _, r := range job.rows {
-	//				r.Drop()
-	//			}
-	//			continue
-	//		}
-
-	//		startBatch := time.Now()
-
-	//		if err := e.prewarmBatchLookups(ctx, plan, job.rows, cache); err != nil {
-	//			for _, r := range job.rows {
-	//				if ctx.Err() != nil {
-	//					r.Drop()
-	//				} else {
-	//					r.Free()
-	//				}
-	//			}
-	//			setErr(err)
-	//			continue
-	//		}
-
-	//		for _, fact := range plan.Facts {
-	//			inserted, dropped, err := e.insertFactBatch(ctx, fact, job.rows, cache, lenient)
-	//			if err != nil {
-	//				for _, r := range job.rows {
-	//					if ctx.Err() != nil {
-	//						r.Drop()
-	//					} else {
-	//						r.Free()
-	//					}
-	//				}
-	//				setErr(err)
-	//				break
-	//			}
-
-	//			if inserted > 0 {
-	//				insertedTotal.Add(uint64(inserted))
-	//			}
-	//			// Count batches that did any work (inserted or dropped)
-	//			if inserted > 0 || dropped > 0 {
-	//				batchesTotal.Add(1)
-	//			}
-	//		}
-
-	//		// Release rows
-	//		if ctx.Err() != nil {
-	//			for _, r := range job.rows {
-	//				r.Drop()
-	//			}
-	//		} else {
-	//			for _, r := range job.rows {
-	//				r.Free()
-	//			}
-	//		}
-
-	//		if debug {
-	//			logf("debug: worker=%d batch=%d duration=%s", workerID, len(job.rows), time.Since(startBatch).Truncate(time.Millisecond))
-	//		}
-	//	}
-	//}
-	// END
 
 	var workersWG sync.WaitGroup
 	workersWG.Add(loaderWorkers)
@@ -1143,4 +1091,20 @@ func fmtRowForCols(cols []string, row []any) string {
 	}
 	b.WriteByte(']')
 	return b.String()
+}
+
+// writeHashByte writes a single byte into h.
+//
+// Why this helper exists:
+//   - Some hash implementations expose WriteByte, but hash.Hash does not.
+//   - Using Write([]byte{b}) inline allocates; this helper uses a stack buffer.
+//
+// Errors:
+//   - hash.Hash.Write returns an error by interface, but standard hashes never do.
+//     If an error occurs, it is ignored because the engine treats hashing as a
+//     deterministic shard hint, not a correctness boundary.
+func writeHashByte(h hash.Hash, b byte) {
+	var buf [1]byte
+	buf[0] = b
+	_, _ = h.Write(buf[:])
 }
