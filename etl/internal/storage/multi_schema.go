@@ -10,6 +10,14 @@ type TableSpec struct {
 	Load            LoadSpec         `json:"load"`
 }
 
+type HistorySpec struct {
+	Enabled         bool     `json:"enabled"`
+	BusinessKey     []string `json:"business_key"`
+	ValidFromColumn string   `json:"valid_from_column"`
+	ValidToColumn   string   `json:"valid_to_column"`
+	ChangedAtColumn string   `json:"changed_at_column"`
+}
+
 type PrimaryKeySpec struct {
 	Name string `json:"name"`
 	Type string `json:"type"` // e.g. serial / int identity, etc
@@ -37,6 +45,8 @@ type LoadSpec struct {
 
 	// fact
 	Dedupe *DedupeSpec `json:"dedupe,omitempty"`
+
+	History *HistorySpec `json:"history,omitempty"`
 }
 
 type DedupeSpec struct {

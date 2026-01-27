@@ -50,7 +50,12 @@ type MultiRepository interface {
 	SelectAllKeyValue(ctx context.Context, table string, keyColumn string, valueColumn string) (map[string]int64, error)
 
 	// Fact insert. Must be able to behave idempotently if dedupeColumns is provided.
-	InsertFactRows(ctx context.Context, table string, columns []string, rows [][]any, dedupeColumns []string) (int64, error)
+	InsertFactRows(ctx context.Context,
+		spec TableSpec,
+		table string,
+		columns []string,
+		rows [][]any,
+		dedupeColumns []string) (int64, error)
 }
 
 // ---- multi factories (mirrors storage.New for single-table) ----
