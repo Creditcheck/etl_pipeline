@@ -1,0 +1,228 @@
+ {
+   "job": "vozidla_dovoz_multi",
+   "source": {
+     "kind": "file",
+     "file": { "path": "/home/zippy/projects/data/RSV_vozidla_dovoz.csv" }
+   },
+   "parser": {
+     "kind": "csv",
+     "options": {
+       "comma": ",",
+       "expected_fields": 3,
+       "has_header": true,
+       "header_map": {
+         "Datum dovozu": "datum_dovozu",
+         "PČV": "pcv",
+         "Stát": "stat"
+       },
+       "trim_space": true
+     }
+   },
+   "transform": [
+     {
+       "kind": "coerce",
+       "options": {
+         "layout": "02.01.2006",
+         "types": {
+           "datum_dovozu": "date",
+           "pcv": "bigint",
+           "stat": "text"
+         }
+       }
+     },
+
+	 {
+      // Compute a deterministic fingerprint of the "business attributes" of the row.
+      //
+      // Why:
+      //   - SCD2 logic should be able to quickly decide whether the incoming row
+      //     represents a change vs. the existing current row.
+      //   - Using a stable row_hash makes change detection O(1) without comparing
+      //     every attribute.
+      //
+      // IMPORTANT:
+      //   - Do NOT include surrogate keys (vehicle_id/country_id) here because
+      //     they do not exist yet during transform.
+      //   - Hashing source fields (after coercion) is fine as long as the mapping
+      //     is stable. We include field names to avoid accidental collisions.
+      "kind": "hash",
+      "options": {
+        "fields": ["pcv", "stat", "datum_dovozu"],
+        "target_field": "row_hash",
+        "include_field_names": true,
+        "trim_space": true,
+        "separator": "\u001f",
+        "algorithm": "sha256",
+        "encoding": "hex",
+        "overwrite": true
+      }
+    },
+
+
+
+     {
+       "kind": "validate",
+       "options": {
+         "contract": {
+           "name": "vozidla_dovoz",
+           "fields": [
+             { "name": "pcv", "type": "bigint", "required": true },
+             { "name": "stat", "type": "text", "required": true },
+             { "name": "datum_dovozu", "type": "date", "layout": "02.01.2006" }
+           ]
+         },
+         "policy": "lenient"
+       }
+     }
+   ],
+   "storage": {
+     "kind": "postgres",
+     "db": {
+       "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+       "mode": "multi_table",
+       "tables": [
+         {
+           "name": "public.vehicles",
+           "auto_create_table": true,
+           "primary_key": { "name": "vehicle_id", "type": "serial" },
+           "columns": [
+             { "name": "pcv", "type": "bigint", "nullable": false }
+           ],
+           "constraints": [
+             { "kind": "unique", "columns": ["pcv"] }
+           ],
+           "load": {
+             "kind": "dimension",
+             "from_rows": [
+               { "target_column": "pcv", "source_field": "pcv" }
+             ],
+             "conflict": {
+               "target_columns": ["pcv"],
+               "action": "do_nothing"
+             },
+             "returning": ["vehicle_id", "pcv"],
+             "cache": {
+               "key_column": "pcv",
+               "value_column": "vehicle_id",
+               "prewarm": false
+             }
+           }
+         },
+         {
+           "name": "public.countries",
+           "auto_create_table": true,
+           "primary_key": { "name": "country_id", "type": "serial" },
+           "columns": [
+             { "name": "name", "type": "varchar(100)", "nullable": false }
+           ],
+           "constraints": [
+             { "kind": "unique", "columns": ["name"] }
+           ],
+           "load": {
+             "kind": "dimension",
+             "from_rows": [
+               {
+                 "target_column": "name",
+                 "source_field": "stat",
+                 "transform": [{ "kind": "trim" }]
+               }
+             ],
+             "conflict": {
+               "target_columns": ["name"],
+               "action": "do_nothing"
+             },
+             "returning": ["country_id", "name"],
+             "cache": {
+               "key_column": "name",
+               "value_column": "country_id",
+               "prewarm": true
+             }
+           }
+         },
+         {
+           "name": "public.imports",
+           "auto_create_table": true,
+           "primary_key": { "name": "import_id", "type": "serial" },
+           "columns": [
+             { "name": "vehicle_id", "type": "int", "nullable": false, "references": "public.vehicles(vehicle_id)" },
+             { "name": "country_id", "type": "int", "nullable": false, "references": "public.countries(country_id)" },
+            { "name": "import_date", "type": "date", "nullable": true },
+
+            // SCD2 metadata columns (required when history.enabled=true).
+            //
+            // Semantics:
+            //   - valid_from: when this version became the current row
+            //   - valid_to:   when this version stopped being current (NULL = current)
+            //   - changed_at: when the system wrote this version
+            //
+            // IMPORTANT: These columns must exist in BOTH:
+            //   - public.imports (current table)
+            //   - public.imports_history (created automatically by the loader)
+            //
+            // The Postgres backend auto-creates the history table, but the base table
+            // must include these columns up-front because the SCD2 writer will insert
+            // them on every write.
+            { "name": "valid_from", "type": "timestamptz", "nullable": false },
+            { "name": "valid_to", "type": "timestamptz", "nullable": true },
+            { "name": "changed_at", "type": "timestamptz", "nullable": false }
+           ],
+          "constraints": [
+            // This unique constraint enforces the invariant:
+            //   exactly one *current* row exists per business key.
+            //
+            // With SCD2 enabled, the history table intentionally does NOT apply
+            // this constraint, so multiple historical versions can coexist.
+            { "kind": "unique", "columns": ["vehicle_id", "country_id"] }
+          ],
+           "load": {
+             "kind": "fact",
+            "history": {
+              "enabled": true,
+              // The business key defines identity for "one current row".
+              // This MUST match the unique constraint above and the dedupe keys below.
+              "business_key": ["vehicle_id", "country_id"],
+              "valid_from_column": "valid_from",
+              "valid_to_column": "valid_to",
+              "changed_at_column": "changed_at"
+            },
+             "dedupe": {
+               "conflict_columns": ["vehicle_id", "country_id"],
+               "action": "do_nothing"
+             },
+             "from_rows": [
+               {
+                 "target_column": "vehicle_id",
+                 "lookup": {
+                   "table": "public.vehicles",
+                   "match": { "pcv": "pcv" },
+                   "return": "vehicle_id",
+                   "on_missing": "insert"
+                 }
+               },
+               {
+                 "target_column": "country_id",
+                 "lookup": {
+                   "table": "public.countries",
+                   "match": { "name": "stat" },
+                   "return": "country_id",
+                   "on_missing": "insert"
+                 }
+               },
+               { "target_column": "import_date", "source_field": "datum_dovozu" }
+             ]
+           }
+         }
+       ]
+     }
+   },
+   "runtime": {
+     "reader_workers": 1,
+     "transform_workers": 4,
+     "loader_workers": 4,
+     "batch_size": 8192,
+     "channel_buffer": 2048,
+     "dedupe_dimension_keys": false,
+     "dedupe_dimension_keys_within_batch": false
+   }
+ }
+

@@ -63,6 +63,7 @@ type selectCall struct {
 }
 
 type insertCall struct {
+	spec          storage.TableSpec
 	table         string
 	columns       []string
 	rows          [][]any
@@ -142,11 +143,19 @@ func (r *recordingMultiRepo) SelectAllKeyValue(ctx context.Context, table string
 	return cp, nil
 }
 
-func (r *recordingMultiRepo) InsertFactRows(ctx context.Context, table string, columns []string, rows [][]any, dedupeColumns []string) (int64, error) {
+func (r *recordingMultiRepo) InsertFactRows(
+	ctx context.Context,
+	spec storage.TableSpec,
+	table string,
+	columns []string,
+	rows [][]any,
+	dedupeColumns []string,
+) (int64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	r.insertCalls = append(r.insertCalls, insertCall{
+		spec:          spec,
 		table:         table,
 		columns:       append([]string(nil), columns...),
 		rows:          deepCopyRows(rows),

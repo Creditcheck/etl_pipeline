@@ -40,7 +40,15 @@ func (r *fakeMultiRepo) SelectKeyValueByKeys(ctx context.Context, table string, 
 func (r *fakeMultiRepo) SelectAllKeyValue(ctx context.Context, table string, keyColumn string, valueColumn string) (map[string]int64, error) {
 	return map[string]int64{}, nil
 }
-func (r *fakeMultiRepo) InsertFactRows(ctx context.Context, table string, columns []string, rows [][]any, dedupeColumns []string) (int64, error) {
+
+func (r *fakeMultiRepo) InsertFactRows(
+	ctx context.Context,
+	spec storage.TableSpec,
+	table string,
+	columns []string,
+	rows [][]any,
+	dedupeColumns []string,
+) (int64, error) {
 	return int64(len(rows)), nil
 }
 

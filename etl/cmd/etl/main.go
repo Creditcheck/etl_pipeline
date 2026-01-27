@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -15,78 +16,184 @@ import (
 	_ "etl/internal/storage/all"
 )
 
-func main() {
-	var cfgPath string
-	var pushgatewayURL string
-	var metricsBackend string
-	flag.StringVar(&cfgPath, "config", "", "path to multi-table pipeline config JSON")
-	flag.StringVar(&metricsBackend, "metrics-backend", "datadog", "metrics backend: none|datadog (or set METRICS_BACKEND)")
-	flag.Parse()
+// runner is the minimal contract the CLI needs from the pipeline runner.
+//
+// When to use:
+//   - This interface exists to allow unit tests to inject a fake runner.
+//   - Production uses multitable.NewDefaultRunner(), which satisfies this contract.
+//
+// Edge cases:
+//   - Implementations should respect ctx cancellation and return promptly when ctx is done.
+//
+// Errors:
+//   - Run returns an error on configuration validation failures, source/transform errors,
+//     and storage errors.
+type runner interface {
+	Run(ctx context.Context, cfg multitable.Pipeline) error
+}
 
-	if cfgPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: etl_multi -config path/to/pipeline.json")
-		os.Exit(2)
+// appDeps holds injected seams for the CLI.
+//
+// This struct exists to make the CLI unit-testable without real filesystem access,
+// real metrics backends, or real ETL execution.
+//
+// When to use:
+//   - Production uses defaultAppDeps().
+//   - Tests provide deterministic fakes.
+//
+// Ownership:
+//   - stdout and stderr writers are owned by the caller.
+//   - If initMetrics succeeds, the returned cleanup function must be called exactly once.
+type appDeps struct {
+	// readFile loads the pipeline configuration file content.
+	readFile func(path string) ([]byte, error)
+
+	// unmarshal decodes configuration bytes into the provided value.
+	unmarshal func(data []byte, v any) error
+
+	// newRunner constructs the ETL runner.
+	newRunner func() runner
+
+	// initMetrics wires the metrics backend for this process and returns a cleanup func.
+	//
+	// Errors:
+	//   - Returns an error if the backend cannot be initialized.
+	initMetrics func(ctx context.Context, jobName, backendName string) (func(), error)
+}
+
+// defaultAppDeps returns the production dependencies.
+func defaultAppDeps() appDeps {
+	return appDeps{
+		readFile:  os.ReadFile,
+		unmarshal: json.Unmarshal,
+		newRunner: func() runner { return multitable.NewDefaultRunner() },
+		initMetrics: func(ctx context.Context, jobName, backendName string) (func(), error) {
+			return initMetrics(ctx, jobName, backendName)
+		},
+	}
+}
+
+func main() {
+	// Keep main small and deterministic: delegate to runMain for testability.
+	code := runMain(context.Background(), os.Args[1:], os.Stdout, os.Stderr, defaultAppDeps())
+	os.Exit(code)
+}
+
+// runMain runs the CLI with injected dependencies and returns the process exit code.
+//
+// When to use:
+//   - Called by main().
+//   - Called by unit tests to validate behavior without os.Exit.
+//
+// Exit codes:
+//   - 0 on success.
+//   - 1 on runtime errors (I/O, parsing, metrics init, pipeline run).
+//   - 2 on usage errors (missing -config or invalid flags).
+//
+// Error precedence:
+//   - Usage errors are detected before any I/O or runner construction.
+//   - Metrics initialization happens after config parse but before running the pipeline.
+//
+// Output contract:
+//   - Errors are written to stderr.
+//   - On success, writes "ok\n" to stdout.
+func runMain(ctx context.Context, args []string, stdout, stderr io.Writer, deps appDeps) int {
+	var (
+		cfgPath        string
+		metricsBackend string
+	)
+
+	fs := flag.NewFlagSet("etl", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	fs.StringVar(&cfgPath, "config", "", "path to multi-table pipeline config JSON")
+	fs.StringVar(&metricsBackend, "metrics-backend", "none", "metrics backend: none|datadog (or set METRICS_BACKEND)")
+	if err := fs.Parse(args); err != nil {
+		// flag package prints a message to stderr for us; treat it as a usage error.
+		return 2
 	}
 
-	raw, err := os.ReadFile(cfgPath)
+	if strings.TrimSpace(cfgPath) == "" {
+		fmt.Fprintln(stderr, "usage: etl -config path/to/pipeline.json")
+		return 2
+	}
+
+	raw, err := deps.readFile(cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "read config: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "read config: %v\n", err)
+		return 1
 	}
 
 	var cfg multitable.Pipeline
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "parse config: %v\n", err)
-		os.Exit(1)
+	if err := deps.unmarshal(raw, &cfg); err != nil {
+		fmt.Fprintf(stderr, "parse config: %v\n", err)
+		return 1
 	}
 
-	// Metrics setup is intentionally done at the top-level CLI.
-	//
-	// Rationale:
-	//   - The multitable engine should remain storage-agnostic and orchestration-agnostic.
-	//   - The CLI is the correct place to choose the metrics backend (Prometheus Pushgateway,
-	//     Datadog, or none) because it is environment-specific.
-	//   - This mirrors the single-table cmd/etl runner: stage and record metrics are
-	//     emitted from within the pipeline, but backend selection happens here.
-	closeMetrics, err := initMetrics(context.Background(), cfg.Job, metricsBackend, pushgatewayURL)
+	closeMetrics, err := deps.initMetrics(ctx, cfg.Job, metricsBackend)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "init metrics: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "init metrics: %v\n", err)
+		return 1
 	}
 	defer closeMetrics()
 
-	r := multitable.NewDefaultRunner()
-	if err := r.Run(context.Background(), cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "run: %v\n", err)
-		os.Exit(1)
+	r := deps.newRunner()
+	if err := r.Run(ctx, cfg); err != nil {
+		fmt.Fprintf(stderr, "run: %v\n", err)
+		return 1
 	}
 
-	fmt.Println("ok")
+	fmt.Fprintln(stdout, "ok")
+	return 0
 }
+
+// ---- metrics wiring (package-private seams for unit tests) ----
+
+// metricsBackend is the minimal Close() contract for backends that flush on shutdown.
+type metricsBackend interface {
+	Close() error
+}
+
+var (
+	// newDatadogBackend is a seam for unit tests to avoid constructing real backends.
+	newDatadogBackend = func(ctx context.Context, opts datadog.Options) (metricsBackend, error) {
+		return datadog.NewBackend(ctx, opts)
+	}
+
+	// setMetricsBackend is a seam for unit tests to avoid mutating global metrics state.
+	//
+	// In production, metrics.SetBackend expects a value that implements metrics.Backend.
+	// The Datadog backend does so; tests can override this function to avoid type coupling.
+	setMetricsBackend = func(b any) {
+		metrics.SetBackend(b.(metrics.Backend))
+	}
+
+	// logPrintf is a seam for unit tests to capture log output without racing on global logger.
+	logPrintf = log.Printf
+)
 
 // initMetrics configures the global metrics backend used by the ETL.
 //
-// This function is intentionally verbose and heavily commented because the
-// metrics wiring is a critical operational contract.
+// This function is intentionally implemented in the CLI package because backend selection
+// is an environment-specific concern. Core pipeline packages should only record metrics,
+// not choose where they go.
 //
-// Backends:
-//   - none:       metrics calls become no-ops.
-//   - pushgateway: metrics are recorded in-process and pushed once at exit.
-//   - datadog:    metrics are buffered and periodically flushed while the job runs.
+// Supported backends:
+//   - none/noop: metrics calls become no-ops.
+//   - datadog/dd: metrics are buffered and periodically flushed while the job runs.
 //
-// The returned cleanup function MUST be deferred by the caller.
+// When to use:
+//   - Call once at process startup, before running a pipeline.
 //
-// Notes for maintainers (especially non-Go engineers):
-//   - The rest of the codebase calls into internal/metrics via global functions
-//     (metrics.RecordStep, metrics.RecordRow, metrics.RecordBatches).
-//   - Those functions are safe to call even if no backend is configured.
-//   - Selecting a backend here changes where those metrics go, without changing
-//     any core pipeline logic.
-func initMetrics(ctx context.Context, jobName, backendName, pushgatewayURL string) (func(), error) {
+// Edge cases:
+//   - Empty backendName defaults to "none".
+//   - Unknown backend names return an error.
+//
+// Errors:
+//   - Returns an error if the requested backend cannot be constructed.
+func initMetrics(ctx context.Context, jobName, backendName string) (func(), error) {
 	name := strings.ToLower(strings.TrimSpace(backendName))
 	if name == "" {
-		// Keep the default behavior explicit. In many environments the ETL is
-		// executed locally and metrics are not desired.
 		name = "none"
 	}
 
@@ -96,20 +203,31 @@ func initMetrics(ctx context.Context, jobName, backendName, pushgatewayURL strin
 		return func() {}, nil
 
 	case "datadog", "dd":
-		// Datadog backend flushes periodically while the process runs and then once
-		// more on shutdown.
-		b, err := datadog.NewBackend(ctx, datadog.Options{JobName: jobName})
+		b, err := newDatadogBackend(ctx, datadog.Options{JobName: jobName})
 		if err != nil {
 			return func() {}, err
 		}
-		metrics.SetBackend(b)
+
+		// Wire the backend into the global metrics package. This is intentionally
+		// centralized here so core pipeline logic stays backend-agnostic.
+		setMetricsBackend(b)
+
 		return func() {
+			// Close should flush; close errors are not fatal for the job result.
 			if err := b.Close(); err != nil {
-				log.Printf("metrics: datadog close error: %v", err)
+				logPrintf("metrics: datadog close error: %v", err)
 			}
 		}, nil
 
 	default:
-		return func() {}, fmt.Errorf("unknown metrics backend %q (want none|pushgateway|datadog)", backendName)
+		return func() {}, fmt.Errorf("unknown metrics backend %q (want none|datadog)", backendName)
 	}
 }
+
+/*
+Behavior changes
+
+- Removed Pushgateway plumbing from the CLI (flag, parameters, and error-message support list),
+  because Pushgateway no longer exists in the repository. This eliminates a misleading, dead path.
+- The usage line now matches the binary name in this package ("etl") consistently.
+*/

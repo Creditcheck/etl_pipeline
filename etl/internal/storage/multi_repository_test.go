@@ -33,7 +33,14 @@ func (stubMultiRepo) SelectKeyValueByKeys(ctx context.Context, table string, key
 func (stubMultiRepo) SelectAllKeyValue(ctx context.Context, table string, keyColumn string, valueColumn string) (map[string]int64, error) {
 	return nil, nil
 }
-func (stubMultiRepo) InsertFactRows(ctx context.Context, table string, columns []string, rows [][]any, dedupeColumns []string) (int64, error) {
+func (stubMultiRepo) InsertFactRows(
+	ctx context.Context,
+	spec TableSpec,
+	table string,
+	columns []string,
+	rows [][]any,
+	dedupeColumns []string,
+) (int64, error) {
 	return 0, nil
 }
 
