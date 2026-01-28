@@ -1,11 +1,5 @@
 {
   "job": "rsv_zpravy_vyrobce_zastupce_multi",
-  "source": {
-    "kind": "file",
-    "file": {
-      "path": "/home/zippy/projects/data/RSV_zpravy_vyrobce_zastupce_20251201.csv"
-    }
-  },
   "parser": {
     "kind": "csv",
     "options": {
@@ -19,14 +13,143 @@
       "trim_space": true
     }
   },
+  "runtime": {
+    "batch_size": 4096,
+    "channel_buffer": 1024,
+    "debug_timings": false,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": true,
+    "loader_workers": 4,
+    "reader_workers": 1,
+    "transform_workers": 3
+  },
+  "source": {
+    "file": {
+      "path": "/home/zippy/projects/data/RSV_zpravy_vyrobce_zastupce_20251201.csv"
+    },
+    "kind": "file"
+  },
+  "storage": {
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "mode": "multi_table",
+      "tables": [
+        {
+          "auto_create_table": true,
+          "columns": [
+            {
+              "name": "pcv",
+              "nullable": false,
+              "type": "bigint"
+            }
+          ],
+          "constraints": [
+            {
+              "columns": [
+                "pcv"
+              ],
+              "kind": "unique"
+            }
+          ],
+          "load": {
+            "cache": {
+              "key_column": "pcv",
+              "prewarm": false,
+              "value_column": "vehicle_id"
+            },
+            "conflict": {
+              "action": "do_nothing",
+              "target_columns": [
+                "pcv"
+              ]
+            },
+            "from_rows": [
+              {
+                "source_field": "pcv",
+                "target_column": "pcv"
+              }
+            ],
+            "kind": "dimension",
+            "returning": [
+              "vehicle_id",
+              "pcv"
+            ]
+          },
+          "name": "public.vehicles",
+          "primary_key": {
+            "name": "vehicle_id",
+            "type": "serial"
+          }
+        },
+        {
+          "auto_create_table": true,
+          "columns": [
+            {
+              "name": "vehicle_id",
+              "nullable": false,
+              "references": "public.vehicles(vehicle_id)",
+              "type": "int"
+            },
+            {
+              "name": "kratky_text",
+              "nullable": true,
+              "type": "text"
+            }
+          ],
+          "constraints": [
+            {
+              "columns": [
+                "vehicle_id",
+                "kratky_text"
+              ],
+              "kind": "unique"
+            }
+          ],
+          "load": {
+            "dedupe": {
+              "action": "do_nothing",
+              "conflict_columns": [
+                "vehicle_id",
+                "kratky_text"
+              ]
+            },
+            "from_rows": [
+              {
+                "lookup": {
+                  "match": {
+                    "pcv": "pcv"
+                  },
+                  "on_missing": "insert",
+                  "return": "vehicle_id",
+                  "table": "public.vehicles"
+                },
+                "target_column": "vehicle_id"
+              },
+              {
+                "source_field": "kratky_text",
+                "target_column": "kratky_text"
+              }
+            ],
+            "kind": "fact"
+          },
+          "name": "public.zpravy_vyrobce_zastupce",
+          "primary_key": {
+            "name": "zpravy_vyrobce_zastupce_id",
+            "type": "serial"
+          }
+        }
+      ]
+    },
+    "kind": "postgres"
+  },
   "transform": [
     {
       "kind": "coerce",
       "options": {
         "layout": "",
         "types": {
-          "pcv": "bigint",
-          "kratky_text": "text"
+          "kratky_text": "text",
+          "pcv": "bigint"
         }
       }
     },
@@ -34,123 +157,21 @@
       "kind": "validate",
       "options": {
         "contract": {
-          "name": "zpravy_vyrobce_zastupce",
           "fields": [
             {
               "name": "pcv",
-              "type": "bigint",
-              "required": true
+              "required": true,
+              "type": "bigint"
             },
             {
               "name": "kratky_text",
               "type": "text"
             }
-          ]
+          ],
+          "name": "zpravy_vyrobce_zastupce"
         },
         "policy": "lenient"
       }
     }
-  ],
-  "storage": {
-    "kind": "postgres",
-    "db": {
-      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
-      "mode": "multi_table",
-      "tables": [
-        {
-          "name": "public.vehicles",
-          "auto_create_table": true,
-          "primary_key": { "name": "vehicle_id", "type": "serial" },
-          "columns": [
-            { "name": "pcv", "type": "bigint", "nullable": false }
-          ],
-          "constraints": [
-            { "kind": "unique", "columns": ["pcv"] }
-          ],
-
-
-
-
-
-
-
-
-
-
-
-          "load": {
-            "kind": "dimension",
-            "from_rows": [
-              { "target_column": "pcv", "source_field": "pcv" }
-            ],
-            "conflict": {
-              "target_columns": ["pcv"],
-              "action": "do_nothing"
-            },
-            "returning": ["vehicle_id", "pcv"],
-            "cache": {
-              "key_column": "pcv",
-              "value_column": "vehicle_id",
-              "prewarm": false
-            }
-          }
-        },
-        {
-          "name": "public.zpravy_vyrobce_zastupce",
-          "auto_create_table": true,
-          "primary_key": { "name": "zpravy_vyrobce_zastupce_id", "type": "serial" },
-          "columns": [
-            {
-              "name": "vehicle_id",
-              "type": "int",
-              "nullable": false,
-              "references": "public.vehicles(vehicle_id)"
-            },
-            {
-              "name": "kratky_text",
-              "type": "text",
-              "nullable": true
-            }
-          ],
-          "constraints": [
-            { "kind": "unique", "columns": ["vehicle_id", "kratky_text"] }
-          ],
-          "load": {
-            "kind": "fact",
-            "dedupe": {
-              "conflict_columns": ["vehicle_id", "kratky_text"],
-              "action": "do_nothing"
-            },
-            "from_rows": [
-              {
-                "target_column": "vehicle_id",
-                "lookup": {
-                  "table": "public.vehicles",
-                  "match": { "pcv": "pcv" },
-                  "return": "vehicle_id",
-                  "on_missing": "insert"
-                }
-              },
-              {
-                "target_column": "kratky_text",
-                "source_field": "kratky_text"
-              }
-            ]
-          }
-        }
-      ]
-    }
-  },
-  "runtime": {
-    "reader_workers": 1,
-    "transform_workers": 3,
-    "loader_workers": 4,
-    "batch_size": 4096,
-    "channel_buffer": 1024,
-    "dedupe_dimension_keys": false,
-    "dedupe_dimension_keys_within_batch": true,
-    "debug_timings": false
-
-  }
+  ]
 }
-

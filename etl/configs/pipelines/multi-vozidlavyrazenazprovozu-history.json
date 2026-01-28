@@ -1,34 +1,36 @@
 {
-  "job": "rsv_vozidla_doplnkove_vybaveni_multi",
+  "job": "rsv_vozidla_vyrazena_z_provozu_multi",
   "parser": {
     "kind": "csv",
     "options": {
       "comma": ",",
-      "expected_fields": 4,
+      "expected_fields": 6,
       "has_header": true,
       "header_map": {
-        "Do": "do",
-        "Od": "od",
+        "Datum do": "datum_do",
+        "Datum od": "datum_od",
+        "Důvod": "duvod",
         "PČV": "pcv",
-        "Typ": "typ"
+        "RM Název": "rm_nazev",
+        "RM kód": "rm_kod"
       },
       "lazy_quotes": true,
       "stream_scrub_likvidaci": true,
-      "trim_space": false
+      "trim_space": true
     }
   },
   "runtime": {
-    "batch_size": 13000,
-    "channel_buffer": 32768,
+    "batch_size": 16384,
+    "channel_buffer": 8192,
     "dedupe_dimension_keys": false,
     "dedupe_dimension_keys_within_batch": false,
     "loader_workers": 1,
     "reader_workers": 1,
-    "transform_workers": 5
+    "transform_workers": 7
   },
   "source": {
     "file": {
-      "path": "/home/zippy/projects/data/RSV_vozidla_doplnkove_vybaveni_20251101.csv-1000000"
+      "path": "/home/zippy/projects/data/RSV_vozidla_vyrazena_z_provozu_20251201.csv"
     },
     "kind": "file"
   },
@@ -88,58 +90,6 @@
           "auto_create_table": true,
           "columns": [
             {
-              "name": "name",
-              "nullable": false,
-              "type": "text"
-            }
-          ],
-          "constraints": [
-            {
-              "columns": [
-                "name"
-              ],
-              "kind": "unique"
-            }
-          ],
-          "load": {
-            "cache": {
-              "key_column": "name",
-              "prewarm": true,
-              "value_column": "doplnkove_vybaveni_typ_id"
-            },
-            "conflict": {
-              "action": "do_nothing",
-              "target_columns": [
-                "name"
-              ]
-            },
-            "from_rows": [
-              {
-                "source_field": "typ",
-                "target_column": "name",
-                "transform": [
-                  {
-                    "kind": "trim"
-                  }
-                ]
-              }
-            ],
-            "kind": "dimension",
-            "returning": [
-              "doplnkove_vybaveni_typ_id",
-              "name"
-            ]
-          },
-          "name": "public.doplnkove_vybaveni_typ",
-          "primary_key": {
-            "name": "doplnkove_vybaveni_typ_id",
-            "type": "serial"
-          }
-        },
-        {
-          "auto_create_table": true,
-          "columns": [
-            {
               "name": "vehicle_id",
               "nullable": false,
               "references": "public.vehicles(vehicle_id)",
@@ -151,27 +101,50 @@
               "type": "text"
             },
             {
-              "name": "typ_id",
-              "nullable": true,
-              "references": "public.doplnkove_vybaveni_typ(doplnkove_vybaveni_typ_id)",
-              "type": "int"
+              "name": "valid_from",
+              "nullable": false,
+              "type": "timestamptz"
             },
             {
-              "name": "od",
+              "name": "valid_to",
+              "nullable": true,
+              "type": "timestamptz"
+            },
+            {
+              "name": "changed_at",
+              "nullable": false,
+              "type": "timestamptz"
+            },
+            {
+              "name": "datum_od",
               "nullable": true,
               "type": "date"
             },
             {
-              "name": "do",
+              "name": "datum_do",
               "nullable": true,
               "type": "date"
+            },
+            {
+              "name": "duvod",
+              "nullable": true,
+              "type": "text"
+            },
+            {
+              "name": "rm_kod",
+              "nullable": true,
+              "type": "bigint"
+            },
+            {
+              "name": "rm_nazev",
+              "nullable": true,
+              "type": "text"
             }
           ],
           "constraints": [
             {
               "columns": [
-                "vehicle_id",
-                "row_hash"
+                "vehicle_id"
               ],
               "kind": "unique"
             }
@@ -180,8 +153,7 @@
             "dedupe": {
               "action": "do_nothing",
               "conflict_columns": [
-                "vehicle_id",
-                "row_hash"
+                "vehicle_id"
               ]
             },
             "from_rows": [
@@ -201,30 +173,40 @@
                 "target_column": "row_hash"
               },
               {
-                "lookup": {
-                  "match": {
-                    "name": "typ"
-                  },
-                  "on_missing": "insert",
-                  "return": "doplnkove_vybaveni_typ_id",
-                  "table": "public.doplnkove_vybaveni_typ"
-                },
-                "target_column": "typ_id"
+                "source_field": "datum_od",
+                "target_column": "datum_od"
               },
               {
-                "source_field": "od",
-                "target_column": "od"
+                "source_field": "datum_do",
+                "target_column": "datum_do"
               },
               {
-                "source_field": "do",
-                "target_column": "do"
+                "source_field": "duvod",
+                "target_column": "duvod"
+              },
+              {
+                "source_field": "rm_kod",
+                "target_column": "rm_kod"
+              },
+              {
+                "source_field": "rm_nazev",
+                "target_column": "rm_nazev"
               }
             ],
+            "history": {
+              "business_key": [
+                "vehicle_id"
+              ],
+              "changed_at_column": "changed_at",
+              "enabled": true,
+              "valid_from_column": "valid_from",
+              "valid_to_column": "valid_to"
+            },
             "kind": "fact"
           },
-          "name": "public.vozidla_doplnkove_vybaveni",
+          "name": "public.vozidla_vyrazena_z_provozu",
           "primary_key": {
-            "name": "vozidla_doplnkove_vybaveni_id",
+            "name": "vozidla_vyrazena_z_provozu_id",
             "type": "serial"
           }
         }
@@ -238,10 +220,12 @@
       "options": {
         "layout": "02.01.2006",
         "types": {
-          "do": "date",
-          "od": "date",
+          "datum_do": "date",
+          "datum_od": "date",
+          "duvod": "text",
           "pcv": "bigint",
-          "typ": "text"
+          "rm_kod": "bigint",
+          "rm_nazev": "text"
         }
       }
     },
@@ -251,10 +235,11 @@
         "algorithm": "sha256",
         "encoding": "hex",
         "fields": [
-          "pcv",
-          "typ",
-          "od",
-          "do"
+          "datum_od",
+          "datum_do",
+          "duvod",
+          "rm_kod",
+          "rm_nazev"
         ],
         "include_field_names": true,
         "overwrite": true,
@@ -274,21 +259,34 @@
               "type": "bigint"
             },
             {
-              "name": "typ",
+              "layout": "02.01.2006",
+              "name": "datum_od",
+              "nullable": true,
+              "type": "date"
+            },
+            {
+              "layout": "02.01.2006",
+              "name": "datum_do",
+              "nullable": true,
+              "type": "date"
+            },
+            {
+              "name": "duvod",
+              "nullable": true,
               "type": "text"
             },
             {
-              "layout": "02.01.2006",
-              "name": "od",
-              "type": "date"
+              "name": "rm_kod",
+              "nullable": true,
+              "type": "bigint"
             },
             {
-              "layout": "02.01.2006",
-              "name": "do",
-              "type": "date"
+              "name": "rm_nazev",
+              "nullable": true,
+              "type": "text"
             }
           ],
-          "name": "vozidladoplnkovevybaveni"
+          "name": "vozidla_vyrazena_z_provozu"
         },
         "policy": "lenient"
       }

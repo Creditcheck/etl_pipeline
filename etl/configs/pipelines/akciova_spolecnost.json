@@ -1,0 +1,8 @@
+{
+  "fields": {
+    "ico": "ico",
+    "nazev": "nazev",
+    "zapisDatum": "zapisDatum"
+  },
+  "record_tag": "Subjekt"
+}

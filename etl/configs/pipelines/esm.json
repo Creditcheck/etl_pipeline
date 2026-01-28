@@ -1,0 +1,92 @@
+{
+  "job": "asdf",
+  "parser": {
+    "kind": "json",
+    "options": {
+      "allow_arrays": true,
+      "header_map": {
+        "Identifikační číslo": "identifikacni_cislo",
+        "Název": "nazev",
+        "Skuteční majitelé": "skutecni_majitele",
+        "Spisová značka": "spisova_znacka",
+        "Struktura_vztahů": "struktura_vztahu",
+        "_source_file": "source_file"
+      }
+    }
+  },
+  "runtime": {
+    "batch_size": 1000,
+    "channel_buffer": 1000,
+    "loader_workers": 1,
+    "reader_workers": 1,
+    "transform_workers": 1
+  },
+  "source": {
+    "file": {
+      "path": "testdata/esm.json"
+    },
+    "kind": "file"
+  },
+  "storage": {
+    "db": {
+      "auto_create_table": true,
+      "columns": [
+        "identifikacni_cislo",
+        "nazev",
+        "skutecni_majitele",
+        "spisova_znacka",
+        "struktura_vztahu",
+        "source_file"
+      ],
+      "date_column": "",
+      "dsn": "file:etl.db?cache=shared&_fk=1",
+      "key_columns": [],
+      "table": "asdf"
+    },
+    "kind": "sqlite"
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "",
+        "types": {}
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "contract": {
+          "fields": [
+            {
+              "name": "identifikacni_cislo",
+              "type": "text"
+            },
+            {
+              "name": "nazev",
+              "type": "text"
+            },
+            {
+              "name": "skutecni_majitele",
+              "type": "text"
+            },
+            {
+              "name": "spisova_znacka",
+              "type": "text"
+            },
+            {
+              "name": "struktura_vztahu",
+              "type": "text"
+            },
+            {
+              "name": "source_file",
+              "type": "text"
+            }
+          ],
+          "name": "asdf"
+        },
+        "policy": "lenient"
+      }
+    }
+  ]
+}

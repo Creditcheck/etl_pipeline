@@ -1,0 +1,146 @@
+{
+  "job": "firmycz",
+  "parser": {
+    "kind": "json",
+    "options": {
+      "allow_arrays": true,
+      "header_map": {
+        "adresa": "adresa",
+        "datova_schranka": "datova_schranka",
+        "email": "email",
+        "facebook_url": "facebook_url",
+        "ico": "ico",
+        "instagram_url": "instagram_url",
+        "linkedin_url": "linkedin_url",
+        "mobile": "mobile",
+        "nazev_firmy": "nazev_firmy",
+        "pinterest_url": "pinterest_url",
+        "popis_firmy": "popis_firmy",
+        "tiktok_url": "tiktok_url",
+        "twitter_url": "twitter_url",
+        "website": "website",
+        "youtube_url": "youtube_url"
+      }
+    }
+  },
+  "runtime": {
+    "batch_size": 1024,
+    "channel_buffer": 2048,
+    "loader_workers": 1,
+    "reader_workers": 1,
+    "transform_workers": 1
+  },
+  "source": {
+    "file": {
+      "path": "/home/zippy/projects/creditcheck/firmy.cz/tmp-detail-processed-2026-01-05.json"
+    },
+    "kind": "file"
+  },
+  "storage": {
+    "db": {
+      "auto_create_table": true,
+      "columns": [
+        "adresa",
+        "datova_schranka",
+        "email",
+        "facebook_url",
+        "ico",
+        "instagram_url",
+        "linkedin_url",
+        "mobile",
+        "nazev_firmy",
+        "pinterest_url",
+        "popis_firmy",
+        "tiktok_url",
+        "twitter_url",
+        "website",
+        "youtube_url"
+      ],
+      "date_column": "",
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "key_columns": [],
+      "table": "public.firmycz"
+    },
+    "kind": "postgres"
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "",
+        "types": {}
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "contract": {
+          "fields": [
+            {
+              "name": "adresa",
+              "type": "text"
+            },
+            {
+              "name": "datova_schranka",
+              "type": "text"
+            },
+            {
+              "name": "email",
+              "type": "text"
+            },
+            {
+              "name": "facebook_url",
+              "type": "text"
+            },
+            {
+              "name": "ico",
+              "type": "text"
+            },
+            {
+              "name": "instagram_url",
+              "type": "text"
+            },
+            {
+              "name": "linkedin_url",
+              "type": "text"
+            },
+            {
+              "name": "mobile",
+              "type": "text"
+            },
+            {
+              "name": "nazev_firmy",
+              "type": "text"
+            },
+            {
+              "name": "pinterest_url",
+              "type": "text"
+            },
+            {
+              "name": "popis_firmy",
+              "type": "text"
+            },
+            {
+              "name": "tiktok_url",
+              "type": "text"
+            },
+            {
+              "name": "twitter_url",
+              "type": "text"
+            },
+            {
+              "name": "website",
+              "type": "text"
+            },
+            {
+              "name": "youtube_url",
+              "type": "text"
+            }
+          ],
+          "name": "firmycz"
+        },
+        "policy": "lenient"
+      }
+    }
+  ]
+}

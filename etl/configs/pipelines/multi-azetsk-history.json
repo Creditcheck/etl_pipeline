@@ -114,6 +114,21 @@
               "type": "text"
             },
             {
+              "name": "valid_from",
+              "nullable": false,
+              "type": "timestamptz"
+            },
+            {
+              "name": "valid_to",
+              "nullable": true,
+              "type": "timestamptz"
+            },
+            {
+              "name": "changed_at",
+              "nullable": false,
+              "type": "timestamptz"
+            },
+            {
               "name": "addresslocality",
               "nullable": true,
               "type": "text"
@@ -227,8 +242,7 @@
           "constraints": [
             {
               "columns": [
-                "company_id",
-                "row_hash"
+                "company_id"
               ],
               "kind": "unique"
             }
@@ -237,8 +251,7 @@
             "dedupe": {
               "action": "do_nothing",
               "conflict_columns": [
-                "company_id",
-                "row_hash"
+                "company_id"
               ]
             },
             "from_rows": [
@@ -346,6 +359,15 @@
                 "target_column": "website"
               }
             ],
+            "history": {
+              "business_key": [
+                "company_id"
+              ],
+              "changed_at_column": "changed_at",
+              "enabled": true,
+              "valid_from_column": "valid_from",
+              "valid_to_column": "valid_to"
+            },
             "kind": "fact"
           },
           "name": "public.azet_sk",

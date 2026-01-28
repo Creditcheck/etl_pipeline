@@ -1,40 +1,36 @@
 {
-  "job": "rsv_vozidla_doplnkove_vybaveni_multi",
+  "job": "vozidla_dovoz_multi",
   "parser": {
     "kind": "csv",
     "options": {
       "comma": ",",
-      "expected_fields": 4,
+      "expected_fields": 3,
       "has_header": true,
       "header_map": {
-        "Do": "do",
-        "Od": "od",
+        "Datum dovozu": "datum_dovozu",
         "PČV": "pcv",
-        "Typ": "typ"
+        "Stát": "stat"
       },
-      "lazy_quotes": true,
-      "stream_scrub_likvidaci": true,
-      "trim_space": false
+      "trim_space": true
     }
   },
   "runtime": {
-    "batch_size": 13000,
-    "channel_buffer": 32768,
-    "dedupe_dimension_keys": false,
-    "dedupe_dimension_keys_within_batch": false,
-    "loader_workers": 1,
+    "batch_size": 2048,
+    "channel_buffer": 1024,
+    "debug_timings": false,
+    "loader_workers": 4,
     "reader_workers": 1,
-    "transform_workers": 5
+    "transform_workers": 2
   },
   "source": {
     "file": {
-      "path": "/home/zippy/projects/data/RSV_vozidla_doplnkove_vybaveni_20251101.csv-1000000"
+      "path": "/home/zippy/projects/data/file.csv"
     },
     "kind": "file"
   },
   "storage": {
     "db": {
-      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "dsn": "sqlserver://user:password@0.0.0.0:1433?database=testdb",
       "mode": "multi_table",
       "tables": [
         {
@@ -78,7 +74,7 @@
               "pcv"
             ]
           },
-          "name": "public.vehicles",
+          "name": "dbo.vehicles",
           "primary_key": {
             "name": "vehicle_id",
             "type": "serial"
@@ -90,7 +86,7 @@
             {
               "name": "name",
               "nullable": false,
-              "type": "text"
+              "type": "nvarchar(150)"
             }
           ],
           "constraints": [
@@ -105,7 +101,7 @@
             "cache": {
               "key_column": "name",
               "prewarm": true,
-              "value_column": "doplnkove_vybaveni_typ_id"
+              "value_column": "country_id"
             },
             "conflict": {
               "action": "do_nothing",
@@ -115,7 +111,7 @@
             },
             "from_rows": [
               {
-                "source_field": "typ",
+                "source_field": "stat",
                 "target_column": "name",
                 "transform": [
                   {
@@ -126,13 +122,13 @@
             ],
             "kind": "dimension",
             "returning": [
-              "doplnkove_vybaveni_typ_id",
+              "country_id",
               "name"
             ]
           },
-          "name": "public.doplnkove_vybaveni_typ",
+          "name": "dbo.countries",
           "primary_key": {
-            "name": "doplnkove_vybaveni_typ_id",
+            "name": "country_id",
             "type": "serial"
           }
         },
@@ -142,27 +138,17 @@
             {
               "name": "vehicle_id",
               "nullable": false,
-              "references": "public.vehicles(vehicle_id)",
+              "references": "dbo.vehicles(vehicle_id)",
               "type": "int"
             },
             {
-              "name": "row_hash",
+              "name": "country_id",
               "nullable": false,
-              "type": "text"
-            },
-            {
-              "name": "typ_id",
-              "nullable": true,
-              "references": "public.doplnkove_vybaveni_typ(doplnkove_vybaveni_typ_id)",
+              "references": "dbo.countries(country_id)",
               "type": "int"
             },
             {
-              "name": "od",
-              "nullable": true,
-              "type": "date"
-            },
-            {
-              "name": "do",
+              "name": "import_date",
               "nullable": true,
               "type": "date"
             }
@@ -171,7 +157,7 @@
             {
               "columns": [
                 "vehicle_id",
-                "row_hash"
+                "country_id"
               ],
               "kind": "unique"
             }
@@ -181,7 +167,7 @@
               "action": "do_nothing",
               "conflict_columns": [
                 "vehicle_id",
-                "row_hash"
+                "country_id"
               ]
             },
             "from_rows": [
@@ -192,45 +178,37 @@
                   },
                   "on_missing": "insert",
                   "return": "vehicle_id",
-                  "table": "public.vehicles"
+                  "table": "dbo.vehicles"
                 },
                 "target_column": "vehicle_id"
               },
               {
-                "source_field": "row_hash",
-                "target_column": "row_hash"
-              },
-              {
                 "lookup": {
                   "match": {
-                    "name": "typ"
+                    "name": "stat"
                   },
                   "on_missing": "insert",
-                  "return": "doplnkove_vybaveni_typ_id",
-                  "table": "public.doplnkove_vybaveni_typ"
+                  "return": "country_id",
+                  "table": "dbo.countries"
                 },
-                "target_column": "typ_id"
+                "target_column": "country_id"
               },
               {
-                "source_field": "od",
-                "target_column": "od"
-              },
-              {
-                "source_field": "do",
-                "target_column": "do"
+                "source_field": "datum_dovozu",
+                "target_column": "import_date"
               }
             ],
             "kind": "fact"
           },
-          "name": "public.vozidla_doplnkove_vybaveni",
+          "name": "dbo.imports",
           "primary_key": {
-            "name": "vozidla_doplnkove_vybaveni_id",
+            "name": "import_id",
             "type": "serial"
           }
         }
       ]
     },
-    "kind": "postgres"
+    "kind": "mssql"
   },
   "transform": [
     {
@@ -238,29 +216,10 @@
       "options": {
         "layout": "02.01.2006",
         "types": {
-          "do": "date",
-          "od": "date",
+          "datum_dovozu": "date",
           "pcv": "bigint",
-          "typ": "text"
+          "stat": "text"
         }
-      }
-    },
-    {
-      "kind": "hash",
-      "options": {
-        "algorithm": "sha256",
-        "encoding": "hex",
-        "fields": [
-          "pcv",
-          "typ",
-          "od",
-          "do"
-        ],
-        "include_field_names": true,
-        "overwrite": true,
-        "separator": "\u001f",
-        "target_field": "row_hash",
-        "trim_space": true
       }
     },
     {
@@ -274,21 +233,17 @@
               "type": "bigint"
             },
             {
-              "name": "typ",
+              "name": "stat",
+              "required": true,
               "type": "text"
             },
             {
               "layout": "02.01.2006",
-              "name": "od",
-              "type": "date"
-            },
-            {
-              "layout": "02.01.2006",
-              "name": "do",
+              "name": "datum_dovozu",
               "type": "date"
             }
           ],
-          "name": "vozidladoplnkovevybaveni"
+          "name": "vozidla_dovoz"
         },
         "policy": "lenient"
       }

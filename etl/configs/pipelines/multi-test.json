@@ -1,15 +1,12 @@
 {
-  "job": "firmycz_multi",
+  "job": "firmy_cz",
   "parser": {
     "kind": "json",
     "options": {
       "allow_arrays": true,
-      "array_join_separator": " ~ ",
       "header_map": {
         "adresa": "adresa",
-        "categories": "categories",
         "datova_schranka": "datova_schranka",
-        "description": "description",
         "email": "email",
         "facebook_url": "facebook_url",
         "ico": "ico",
@@ -18,6 +15,7 @@
         "mobile": "mobile",
         "nazev_firmy": "nazev_firmy",
         "pinterest_url": "pinterest_url",
+        "popis_firmy": "popis_firmy",
         "tiktok_url": "tiktok_url",
         "twitter_url": "twitter_url",
         "website": "website",
@@ -25,9 +23,18 @@
       }
     }
   },
+  "runtime": {
+    "batch_size": 2048,
+    "channel_buffer": 1024,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": false,
+    "loader_workers": 1,
+    "reader_workers": 1,
+    "transform_workers": 4
+  },
   "source": {
     "file": {
-      "path": "/home/zippy/projects/creditcheck/firmy.cz/detail-2026-01-16.json"
+      "path": "/home/zippy/projects/creditcheck/firmy.cz/tmp-detail-processed-2026-01-05.json"
     },
     "kind": "file"
   },
@@ -40,59 +47,6 @@
           "auto_create_table": true,
           "columns": [
             {
-              "name": "ico",
-              "nullable": false,
-              "type": "bigint"
-            }
-          ],
-          "constraints": [
-            {
-              "columns": [
-                "ico"
-              ],
-              "kind": "unique"
-            }
-          ],
-          "load": {
-            "cache": {
-              "key_column": "ico",
-              "prewarm": false,
-              "value_column": "company_id"
-            },
-            "conflict": {
-              "action": "do_nothing",
-              "target_columns": [
-                "ico"
-              ]
-            },
-            "from_rows": [
-              {
-                "source_field": "ico",
-                "target_column": "ico"
-              }
-            ],
-            "kind": "dimension",
-            "returning": [
-              "company_id",
-              "ico"
-            ]
-          },
-          "name": "public.companies",
-          "primary_key": {
-            "name": "company_id",
-            "type": "serial"
-          }
-        },
-        {
-          "auto_create_table": true,
-          "columns": [
-            {
-              "name": "company_id",
-              "nullable": false,
-              "references": "public.companies(company_id)",
-              "type": "int"
-            },
-            {
               "name": "row_hash",
               "nullable": false,
               "type": "text"
@@ -101,11 +55,6 @@
               "name": "adresa",
               "nullable": true,
               "type": "text"
-            },
-            {
-              "name": "categories",
-              "nullable": true,
-              "type": "varchar(512)"
             },
             {
               "name": "datova_schranka",
@@ -119,6 +68,11 @@
             },
             {
               "name": "facebook_url",
+              "nullable": true,
+              "type": "text"
+            },
+            {
+              "name": "ico",
               "nullable": true,
               "type": "text"
             },
@@ -148,7 +102,7 @@
               "type": "text"
             },
             {
-              "name": "description",
+              "name": "popis_firmy",
               "nullable": true,
               "type": "text"
             },
@@ -176,7 +130,6 @@
           "constraints": [
             {
               "columns": [
-                "company_id",
                 "row_hash"
               ],
               "kind": "unique"
@@ -186,22 +139,10 @@
             "dedupe": {
               "action": "do_nothing",
               "conflict_columns": [
-                "company_id",
                 "row_hash"
               ]
             },
             "from_rows": [
-              {
-                "lookup": {
-                  "match": {
-                    "ico": "ico"
-                  },
-                  "on_missing": "insert",
-                  "return": "company_id",
-                  "table": "public.companies"
-                },
-                "target_column": "company_id"
-              },
               {
                 "source_field": "row_hash",
                 "target_column": "row_hash"
@@ -209,10 +150,6 @@
               {
                 "source_field": "adresa",
                 "target_column": "adresa"
-              },
-              {
-                "source_field": "categories",
-                "target_column": "categories"
               },
               {
                 "source_field": "datova_schranka",
@@ -225,6 +162,10 @@
               {
                 "source_field": "facebook_url",
                 "target_column": "facebook_url"
+              },
+              {
+                "source_field": "ico",
+                "target_column": "ico"
               },
               {
                 "source_field": "instagram_url",
@@ -247,8 +188,8 @@
                 "target_column": "pinterest_url"
               },
               {
-                "source_field": "description",
-                "target_column": "description"
+                "source_field": "popis_firmy",
+                "target_column": "popis_firmy"
               },
               {
                 "source_field": "tiktok_url",
@@ -269,35 +210,17 @@
             ],
             "kind": "fact"
           },
-          "name": "public.firmycz",
+          "name": "public.firmy_cz",
           "primary_key": {
-            "name": "firmycz_id",
+            "name": "firmy_cz_id",
             "type": "serial"
           }
         }
       ]
     },
-    "kind": "postgres",
-    "runtime": {
-      "batch_size": 1024,
-      "channel_buffer": 2048,
-      "dedupe_dimension_keys": false,
-      "dedupe_dimension_keys_within_batch": false,
-      "loader_workers": 1,
-      "reader_workers": 1,
-      "transform_workers": 1
-    }
+    "kind": "postgres"
   },
   "transform": [
-    {
-      "kind": "coerce",
-      "options": {
-        "layout": "02.01.2006",
-        "types": {
-          "ico": "bigint"
-        }
-      }
-    },
     {
       "kind": "hash",
       "options": {
@@ -305,16 +228,17 @@
         "encoding": "hex",
         "fields": [
           "adresa",
-          "categories",
           "datova_schranka",
           "email",
           "facebook_url",
+          "ico",
           "instagram_url",
           "linkedin_url",
           "mobile",
           "nazev_firmy",
           "pinterest_url",
-          "description",
+          "popis_firmy",
+          "row_hash",
           "tiktok_url",
           "twitter_url",
           "website",
@@ -333,16 +257,7 @@
         "contract": {
           "fields": [
             {
-              "name": "ico",
-              "required": true,
-              "type": "bigint"
-            },
-            {
               "name": "adresa",
-              "type": "text"
-            },
-            {
-              "name": "categories",
               "type": "text"
             },
             {
@@ -355,6 +270,10 @@
             },
             {
               "name": "facebook_url",
+              "type": "text"
+            },
+            {
+              "name": "ico",
               "type": "text"
             },
             {
@@ -378,12 +297,7 @@
               "type": "text"
             },
             {
-              "name": "description",
-              "type": "text"
-            },
-            {
-              "name": "row_hash",
-              "required": true,
+              "name": "popis_firmy",
               "type": "text"
             },
             {
@@ -401,9 +315,14 @@
             {
               "name": "youtube_url",
               "type": "text"
+            },
+            {
+              "name": "row_hash",
+              "required": true,
+              "type": "text"
             }
           ],
-          "name": "firmycz"
+          "name": "firmy_cz"
         },
         "policy": "lenient"
       }

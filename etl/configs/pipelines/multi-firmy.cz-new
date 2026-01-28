@@ -1,51 +1,46 @@
 {
-  "job": "azet_sk_multi",
+  "job": "firmycz",
   "parser": {
     "kind": "json",
     "options": {
       "allow_arrays": true,
-      "array_join_separator": " ~ ",
       "header_map": {
-        "addressLocality": "addresslocality",
-        "breadcrumbs": "breadcrumbs",
-        "companyName": "companyname",
+        "adresa": "adresa",
+        "categories": "categories",
+        "datova_schranka": "datova_schranka",
         "description": "description",
-        "dic": "dic",
         "email": "email",
         "facebook_url": "facebook_url",
-        "ic_dph": "ic_dph",
         "ico": "ico",
         "instagram_url": "instagram_url",
         "linkedin_url": "linkedin_url",
-        "logo_src": "logo_src",
         "mobile": "mobile",
-        "name": "name",
-        "phone": "phone",
-        "postalCode": "postalcode",
-        "rating_class": "rating_class",
-        "rating_count": "rating_count",
-        "sidlo": "sidlo",
+        "nazev_firmy": "nazev_firmy",
+        "pinterest_url": "pinterest_url",
+        "rating": "rating",
+        "review_count": "review_count",
         "source_file": "source_file",
-        "streetAddress": "streetaddress",
+        "tiktok_url": "tiktok_url",
         "twitter_url": "twitter_url",
-        "website": "website"
+        "website": "website",
+        "youtube_url": "youtube_url"
       }
     }
   },
   "runtime": {
-    "batch_size": 1024,
-    "channel_buffer": 512,
+    "batch_size": 512,
+    "channel_buffer": 256,
     "dedupe_dimension_keys": false,
     "dedupe_dimension_keys_within_batch": false,
-    "loader_workers": 4,
+    "loader_workers": 1,
     "reader_workers": 1,
-    "transform_workers": 3
+    "transform_workers": 1
   },
   "source": {
+    "kind": "file",
     "file": {
-      "path": "/home/zippy/projects/data/azetsk-detail.json"
-    },
-    "kind": "file"
+      "path": "/home/zippy/projects/data/firmycz-detail-2026-01-18.json"
+    }
   },
   "storage": {
     "db": {
@@ -56,46 +51,46 @@
           "auto_create_table": true,
           "columns": [
             {
-              "name": "ico",
+              "name": "categories",
               "nullable": false,
-              "type": "varchar(64)"
+              "type": "varchar(1024)"
             }
           ],
           "constraints": [
             {
               "columns": [
-                "ico"
+                "categories"
               ],
               "kind": "unique"
             }
           ],
           "load": {
             "cache": {
-              "key_column": "ico",
+              "key_column": "categories",
               "prewarm": false,
-              "value_column": "company_id"
+              "value_column": "categories_id"
             },
             "conflict": {
               "action": "do_nothing",
               "target_columns": [
-                "ico"
+                "categories"
               ]
             },
             "from_rows": [
               {
-                "source_field": "ico",
-                "target_column": "ico"
+                "source_field": "categories",
+                "target_column": "categories"
               }
             ],
             "kind": "dimension",
             "returning": [
-              "company_id",
-              "ico"
+              "categories_id",
+              "categories"
             ]
           },
-          "name": "public.companies",
+          "name": "public.firmycz_categories",
           "primary_key": {
-            "name": "company_id",
+            "name": "categories_id",
             "type": "serial"
           }
         },
@@ -103,9 +98,115 @@
           "auto_create_table": true,
           "columns": [
             {
-              "name": "company_id",
+              "name": "rating",
               "nullable": false,
-              "references": "public.companies(company_id)",
+              "type": "varchar(1024)"
+            }
+          ],
+          "constraints": [
+            {
+              "columns": [
+                "rating"
+              ],
+              "kind": "unique"
+            }
+          ],
+          "load": {
+            "cache": {
+              "key_column": "rating",
+              "prewarm": false,
+              "value_column": "rating_id"
+            },
+            "conflict": {
+              "action": "do_nothing",
+              "target_columns": [
+                "rating"
+              ]
+            },
+            "from_rows": [
+              {
+                "source_field": "rating",
+                "target_column": "rating"
+              }
+            ],
+            "kind": "dimension",
+            "returning": [
+              "rating_id",
+              "rating"
+            ]
+          },
+          "name": "public.firmycz_rating",
+          "primary_key": {
+            "name": "rating_id",
+            "type": "serial"
+          }
+        },
+        {
+          "auto_create_table": true,
+          "columns": [
+            {
+              "name": "review_count",
+              "nullable": false,
+              "type": "int"
+            }
+          ],
+          "constraints": [
+            {
+              "columns": [
+                "review_count"
+              ],
+              "kind": "unique"
+            }
+          ],
+          "load": {
+            "cache": {
+              "key_column": "review_count",
+              "prewarm": false,
+              "value_column": "review_count_id"
+            },
+            "conflict": {
+              "action": "do_nothing",
+              "target_columns": [
+                "review_count"
+              ]
+            },
+            "from_rows": [
+              {
+                "source_field": "review_count",
+                "target_column": "review_count"
+              }
+            ],
+            "kind": "dimension",
+            "returning": [
+              "review_count_id",
+              "review_count"
+            ]
+          },
+          "name": "public.firmycz_review_count",
+          "primary_key": {
+            "name": "review_count_id",
+            "type": "serial"
+          }
+        },
+        {
+          "auto_create_table": true,
+          "columns": [
+            {
+              "name": "categories_id",
+              "nullable": true,
+              "references": "public.firmycz_categories(categories_id)",
+              "type": "int"
+            },
+            {
+              "name": "rating_id",
+              "nullable": true,
+              "references": "public.firmycz_rating(rating_id)",
+              "type": "int"
+            },
+            {
+              "name": "review_count_id",
+              "nullable": true,
+              "references": "public.firmycz_review_count(review_count_id)",
               "type": "int"
             },
             {
@@ -114,27 +215,17 @@
               "type": "text"
             },
             {
-              "name": "addresslocality",
+              "name": "adresa",
               "nullable": true,
               "type": "text"
             },
             {
-              "name": "breadcrumbs",
-              "nullable": true,
-              "type": "text"
-            },
-            {
-              "name": "companyname",
+              "name": "datova_schranka",
               "nullable": true,
               "type": "text"
             },
             {
               "name": "description",
-              "nullable": true,
-              "type": "text"
-            },
-            {
-              "name": "dic",
               "nullable": true,
               "type": "text"
             },
@@ -149,7 +240,7 @@
               "type": "text"
             },
             {
-              "name": "ic_dph",
+              "name": "ico",
               "nullable": true,
               "type": "text"
             },
@@ -164,42 +255,17 @@
               "type": "text"
             },
             {
-              "name": "logo_src",
-              "nullable": true,
-              "type": "text"
-            },
-            {
               "name": "mobile",
               "nullable": true,
               "type": "text"
             },
             {
-              "name": "name",
+              "name": "nazev_firmy",
               "nullable": true,
               "type": "text"
             },
             {
-              "name": "phone",
-              "nullable": true,
-              "type": "text"
-            },
-            {
-              "name": "postalcode",
-              "nullable": true,
-              "type": "text"
-            },
-            {
-              "name": "rating_class",
-              "nullable": true,
-              "type": "text"
-            },
-            {
-              "name": "rating_count",
-              "nullable": true,
-              "type": "text"
-            },
-            {
-              "name": "sidlo",
+              "name": "pinterest_url",
               "nullable": true,
               "type": "text"
             },
@@ -209,7 +275,7 @@
               "type": "text"
             },
             {
-              "name": "streetaddress",
+              "name": "tiktok_url",
               "nullable": true,
               "type": "text"
             },
@@ -222,12 +288,16 @@
               "name": "website",
               "nullable": true,
               "type": "text"
+            },
+            {
+              "name": "youtube_url",
+              "nullable": true,
+              "type": "text"
             }
           ],
           "constraints": [
             {
               "columns": [
-                "company_id",
                 "row_hash"
               ],
               "kind": "unique"
@@ -237,7 +307,6 @@
             "dedupe": {
               "action": "do_nothing",
               "conflict_columns": [
-                "company_id",
                 "row_hash"
               ]
             },
@@ -245,37 +314,51 @@
               {
                 "lookup": {
                   "match": {
-                    "ico": "ico"
+                    "categories": "categories"
                   },
                   "on_missing": "insert",
-                  "return": "company_id",
-                  "table": "public.companies"
+                  "return": "categories_id",
+                  "table": "public.firmycz_categories"
                 },
-                "target_column": "company_id"
+                "target_column": "categories_id"
+              },
+              {
+                "lookup": {
+                  "match": {
+                    "rating": "rating"
+                  },
+                  "on_missing": "insert",
+                  "return": "rating_id",
+                  "table": "public.firmycz_rating"
+                },
+                "target_column": "rating_id"
+              },
+              {
+                "lookup": {
+                  "match": {
+                    "review_count": "review_count"
+                  },
+                  "on_missing": "insert",
+                  "return": "review_count_id",
+                  "table": "public.firmycz_review_count"
+                },
+                "target_column": "review_count_id"
               },
               {
                 "source_field": "row_hash",
                 "target_column": "row_hash"
               },
               {
-                "source_field": "addresslocality",
-                "target_column": "addresslocality"
+                "source_field": "adresa",
+                "target_column": "adresa"
               },
               {
-                "source_field": "breadcrumbs",
-                "target_column": "breadcrumbs"
-              },
-              {
-                "source_field": "companyname",
-                "target_column": "companyname"
+                "source_field": "datova_schranka",
+                "target_column": "datova_schranka"
               },
               {
                 "source_field": "description",
                 "target_column": "description"
-              },
-              {
-                "source_field": "dic",
-                "target_column": "dic"
               },
               {
                 "source_field": "email",
@@ -286,8 +369,8 @@
                 "target_column": "facebook_url"
               },
               {
-                "source_field": "ic_dph",
-                "target_column": "ic_dph"
+                "source_field": "ico",
+                "target_column": "ico"
               },
               {
                 "source_field": "instagram_url",
@@ -298,44 +381,24 @@
                 "target_column": "linkedin_url"
               },
               {
-                "source_field": "logo_src",
-                "target_column": "logo_src"
-              },
-              {
                 "source_field": "mobile",
                 "target_column": "mobile"
               },
               {
-                "source_field": "name",
-                "target_column": "name"
+                "source_field": "nazev_firmy",
+                "target_column": "nazev_firmy"
               },
               {
-                "source_field": "phone",
-                "target_column": "phone"
-              },
-              {
-                "source_field": "postalcode",
-                "target_column": "postalcode"
-              },
-              {
-                "source_field": "rating_class",
-                "target_column": "rating_class"
-              },
-              {
-                "source_field": "rating_count",
-                "target_column": "rating_count"
-              },
-              {
-                "source_field": "sidlo",
-                "target_column": "sidlo"
+                "source_field": "pinterest_url",
+                "target_column": "pinterest_url"
               },
               {
                 "source_field": "source_file",
                 "target_column": "source_file"
               },
               {
-                "source_field": "streetaddress",
-                "target_column": "streetaddress"
+                "source_field": "tiktok_url",
+                "target_column": "tiktok_url"
               },
               {
                 "source_field": "twitter_url",
@@ -344,13 +407,17 @@
               {
                 "source_field": "website",
                 "target_column": "website"
+              },
+              {
+                "source_field": "youtube_url",
+                "target_column": "youtube_url"
               }
             ],
             "kind": "fact"
           },
-          "name": "public.azet_sk",
+          "name": "public.firmycz",
           "primary_key": {
-            "name": "azet_sk_id",
+            "name": "firmycz_id",
             "type": "serial"
           }
         }
@@ -360,41 +427,31 @@
   },
   "transform": [
     {
-      "kind": "coerce",
-      "options": {
-        "layout": "",
-        "types": {}
-      }
-    },
-    {
       "kind": "hash",
       "options": {
         "algorithm": "sha256",
         "encoding": "hex",
         "fields": [
-          "addresslocality",
-          "breadcrumbs",
-          "companyname",
+          "adresa",
+          "categories",
+          "datova_schranka",
           "description",
-          "dic",
           "email",
           "facebook_url",
-          "ic_dph",
           "ico",
           "instagram_url",
           "linkedin_url",
-          "logo_src",
           "mobile",
-          "name",
-          "phone",
-          "postalcode",
-          "rating_class",
-          "rating_count",
-          "sidlo",
+          "nazev_firmy",
+          "pinterest_url",
+          "rating",
+          "review_count",
+          "row_hash",
           "source_file",
-          "streetaddress",
+          "tiktok_url",
           "twitter_url",
-          "website"
+          "website",
+          "youtube_url"
         ],
         "include_field_names": true,
         "overwrite": true,
@@ -407,35 +464,22 @@
       "kind": "validate",
       "options": {
         "contract": {
+          "name": "firmycz",
           "fields": [
             {
-              "name": "ico",
-              "required": true,
+              "name": "adresa",
               "type": "text"
             },
             {
-              "name": "row_hash",
-              "required": true,
+              "name": "categories",
               "type": "text"
             },
             {
-              "name": "addresslocality",
-              "type": "text"
-            },
-            {
-              "name": "breadcrumbs",
-              "type": "text"
-            },
-            {
-              "name": "companyname",
+              "name": "datova_schranka",
               "type": "text"
             },
             {
               "name": "description",
-              "type": "text"
-            },
-            {
-              "name": "dic",
               "type": "text"
             },
             {
@@ -447,7 +491,7 @@
               "type": "text"
             },
             {
-              "name": "ic_dph",
+              "name": "ico",
               "type": "text"
             },
             {
@@ -459,35 +503,23 @@
               "type": "text"
             },
             {
-              "name": "logo_src",
-              "type": "text"
-            },
-            {
               "name": "mobile",
               "type": "text"
             },
             {
-              "name": "name",
+              "name": "nazev_firmy",
               "type": "text"
             },
             {
-              "name": "phone",
+              "name": "pinterest_url",
               "type": "text"
             },
             {
-              "name": "postalcode",
+              "name": "rating",
               "type": "text"
             },
             {
-              "name": "rating_class",
-              "type": "text"
-            },
-            {
-              "name": "rating_count",
-              "type": "text"
-            },
-            {
-              "name": "sidlo",
+              "name": "review_count",
               "type": "text"
             },
             {
@@ -495,7 +527,7 @@
               "type": "text"
             },
             {
-              "name": "streetaddress",
+              "name": "tiktok_url",
               "type": "text"
             },
             {
@@ -505,9 +537,17 @@
             {
               "name": "website",
               "type": "text"
+            },
+            {
+              "name": "youtube_url",
+              "type": "text"
+            },
+            {
+              "name": "row_hash",
+              "type": "text",
+              "required": true
             }
-          ],
-          "name": "azet_sk"
+          ]
         },
         "policy": "lenient"
       }

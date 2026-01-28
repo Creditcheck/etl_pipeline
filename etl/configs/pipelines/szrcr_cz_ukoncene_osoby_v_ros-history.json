@@ -28,7 +28,7 @@
   },
   "source": {
     "file": {
-      "path": "/data/szrcr.cz_ukoncene_osoby_v_ros.csv"
+      "path": "/home/zippy/projects/data/szrcr.cz_ukoncene_osoby_v_ros-little.csv"
     },
     "kind": "file"
   },
@@ -99,6 +99,21 @@
               "type": "text"
             },
             {
+              "name": "valid_from",
+              "nullable": false,
+              "type": "timestamptz"
+            },
+            {
+              "name": "valid_to",
+              "nullable": true,
+              "type": "timestamptz"
+            },
+            {
+              "name": "changed_at",
+              "nullable": false,
+              "type": "timestamptz"
+            },
+            {
               "name": "datzan",
               "nullable": true,
               "type": "date"
@@ -117,8 +132,7 @@
           "constraints": [
             {
               "columns": [
-                "company_id",
-                "row_hash"
+                "company_id"
               ],
               "kind": "unique"
             }
@@ -127,8 +141,7 @@
             "dedupe": {
               "action": "do_nothing",
               "conflict_columns": [
-                "company_id",
-                "row_hash"
+                "company_id"
               ]
             },
             "from_rows": [
@@ -160,6 +173,15 @@
                 "target_column": "datplat"
               }
             ],
+            "history": {
+              "business_key": [
+                "company_id"
+              ],
+              "changed_at_column": "changed_at",
+              "enabled": true,
+              "valid_from_column": "valid_from",
+              "valid_to_column": "valid_to"
+            },
             "kind": "fact"
           },
           "name": "public.ros04_osoby",

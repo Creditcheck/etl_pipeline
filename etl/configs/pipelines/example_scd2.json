@@ -1,0 +1,29 @@
+{
+  "multi_table": {
+    "tables": [
+      {
+        "columns": [
+          "customer_id",
+          "name"
+        ],
+        "load": {
+          "history": {
+            "business_key": [
+              "customer_id"
+            ],
+            "changed_at_column": "changed_at",
+            "enabled": true,
+            "valid_from_column": "valid_from",
+            "valid_to_column": "valid_to"
+          },
+          "kind": "fact"
+        },
+        "name": "customers"
+      }
+    ]
+  },
+  "storage": {
+    "dsn": "file:scd2.db?cache=shared&_fk=1",
+    "kind": "sqlite"
+  }
+}

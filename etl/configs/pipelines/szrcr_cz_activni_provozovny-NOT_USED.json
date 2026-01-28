@@ -1,34 +1,40 @@
 {
-  "job": "szrcr.cz_ukoncene_osoby",
+  "job": "ros02_provozovny",
   "parser": {
     "kind": "csv",
     "options": {
       "comma": ",",
-      "expected_fields": 4,
+      "expected_fields": 10,
       "has_header": true,
       "header_map": {
-        "AGENDA": "agenda",
+        "DAPPSČ": "dapps",
+        "DAPRUIAN": "dapruian",
+        "DAPTEXT": "daptext",
         "DATPLAT": "datplat",
-        "DATZAN": "datzan",
-        "ICO": "ico"
+        "DATUKON": "datukon",
+        "DATZAH": "datzah",
+        "ICO": "ico",
+        "ICP": "icp",
+        "PKODADM": "pkodadm",
+        "PTEXTADR": "ptextadr"
       },
       "trim_space": true
     }
   },
   "runtime": {
-    "batch_size": 4192,
+    "batch_size": 4096,
     "channel_buffer": 1024,
     "debug_timings": false,
     "dedupe_dimension_keys": false,
     "dedupe_dimension_keys_within_batch": true,
-    "loader_workers": 4,
+    "loader_workers": 3,
     "reader_workers": 1,
-    "transform_workers": 4,
+    "transform_workers": 3,
     "validate_log_first_n": 25
   },
   "source": {
     "file": {
-      "path": "/data/szrcr.cz_ukoncene_osoby_v_ros.csv"
+      "path": "/home/zippy/projects/data/szrcr.cz_aktivni_provozovny_ros.csv"
     },
     "kind": "file"
   },
@@ -89,7 +95,7 @@
           "columns": [
             {
               "name": "company_id",
-              "nullable": false,
+              "nullable": true,
               "references": "public.company(company_id)",
               "type": "int"
             },
@@ -99,12 +105,42 @@
               "type": "text"
             },
             {
-              "name": "datzan",
+              "name": "icp",
+              "nullable": false,
+              "type": "text"
+            },
+            {
+              "name": "datzah",
               "nullable": true,
               "type": "date"
             },
             {
-              "name": "agenda",
+              "name": "datukon",
+              "nullable": true,
+              "type": "date"
+            },
+            {
+              "name": "pkodadm",
+              "nullable": true,
+              "type": "text"
+            },
+            {
+              "name": "ptextadr",
+              "nullable": true,
+              "type": "text"
+            },
+            {
+              "name": "dapruian",
+              "nullable": true,
+              "type": "text"
+            },
+            {
+              "name": "daptext",
+              "nullable": true,
+              "type": "text"
+            },
+            {
+              "name": "dapps",
               "nullable": true,
               "type": "text"
             },
@@ -117,8 +153,13 @@
           "constraints": [
             {
               "columns": [
-                "company_id",
                 "row_hash"
+              ],
+              "kind": "unique"
+            },
+            {
+              "columns": [
+                "icp"
               ],
               "kind": "unique"
             }
@@ -127,7 +168,6 @@
             "dedupe": {
               "action": "do_nothing",
               "conflict_columns": [
-                "company_id",
                 "row_hash"
               ]
             },
@@ -148,12 +188,36 @@
                 "target_column": "row_hash"
               },
               {
-                "source_field": "datzan",
-                "target_column": "datzan"
+                "source_field": "icp",
+                "target_column": "icp"
               },
               {
-                "source_field": "agenda",
-                "target_column": "agenda"
+                "source_field": "datzah",
+                "target_column": "datzah"
+              },
+              {
+                "source_field": "datukon",
+                "target_column": "datukon"
+              },
+              {
+                "source_field": "pkodadm",
+                "target_column": "pkodadm"
+              },
+              {
+                "source_field": "ptextadr",
+                "target_column": "ptextadr"
+              },
+              {
+                "source_field": "dapruian",
+                "target_column": "dapruian"
+              },
+              {
+                "source_field": "daptext",
+                "target_column": "daptext"
+              },
+              {
+                "source_field": "dapps",
+                "target_column": "dapps"
               },
               {
                 "source_field": "datplat",
@@ -162,9 +226,9 @@
             ],
             "kind": "fact"
           },
-          "name": "public.ros04_osoby",
+          "name": "public.ros02_provozovny",
           "primary_key": {
-            "name": "ros04_osoby_id",
+            "name": "ros02_provozovny_id",
             "type": "serial"
           }
         }
@@ -179,7 +243,8 @@
         "layout": "2006-01-02",
         "types": {
           "datplat": "date",
-          "datzan": "date"
+          "datukon": "date",
+          "datzah": "date"
         }
       }
     },
@@ -189,9 +254,15 @@
         "algorithm": "sha256",
         "encoding": "hex",
         "fields": [
+          "icp",
           "ico",
-          "datzan",
-          "agenda",
+          "datzah",
+          "datukon",
+          "pkodadm",
+          "ptextadr",
+          "dapruian",
+          "daptext",
+          "dapps",
           "datplat"
         ],
         "include_field_names": true,
@@ -207,18 +278,23 @@
         "contract": {
           "fields": [
             {
-              "name": "ico",
+              "name": "icp",
               "required": true,
               "type": "text"
             },
             {
+              "name": "ico",
+              "type": "text"
+            },
+            {
               "layout": "2006-01-02",
-              "name": "datzan",
+              "name": "datzah",
               "type": "date"
             },
             {
-              "name": "agenda",
-              "type": "text"
+              "layout": "2006-01-02",
+              "name": "datukon",
+              "type": "date"
             },
             {
               "layout": "2006-01-02",
@@ -226,12 +302,32 @@
               "type": "date"
             },
             {
+              "name": "pkodadm",
+              "type": "text"
+            },
+            {
+              "name": "ptextadr",
+              "type": "text"
+            },
+            {
+              "name": "dapruian",
+              "type": "text"
+            },
+            {
+              "name": "daptext",
+              "type": "text"
+            },
+            {
+              "name": "dapps",
+              "type": "text"
+            },
+            {
               "name": "row_hash",
               "required": true,
               "type": "text"
             }
           ],
-          "name": "ros04_osoby"
+          "name": "ros02_provozovny"
         },
         "policy": "lenient"
       }

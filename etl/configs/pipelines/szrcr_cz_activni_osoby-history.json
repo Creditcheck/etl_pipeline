@@ -70,6 +70,21 @@
               "type": "text"
             },
             {
+              "name": "valid_from",
+              "nullable": false,
+              "type": "timestamptz"
+            },
+            {
+              "name": "valid_to",
+              "nullable": true,
+              "type": "timestamptz"
+            },
+            {
+              "name": "changed_at",
+              "nullable": false,
+              "type": "timestamptz"
+            },
+            {
               "name": "agenda",
               "nullable": true,
               "type": "text"
@@ -188,8 +203,7 @@
           "constraints": [
             {
               "columns": [
-                "ico",
-                "row_hash"
+                "ico"
               ],
               "kind": "unique"
             }
@@ -198,8 +212,7 @@
             "dedupe": {
               "action": "do_nothing",
               "conflict_columns": [
-                "ico",
-                "row_hash"
+                "ico"
               ]
             },
             "from_rows": [
@@ -304,6 +317,15 @@
                 "target_column": "datplat"
               }
             ],
+            "history": {
+              "business_key": [
+                "ico"
+              ],
+              "changed_at_column": "changed_at",
+              "enabled": true,
+              "valid_from_column": "valid_from",
+              "valid_to_column": "valid_to"
+            },
             "kind": "fact"
           },
           "name": "public.ros01_activni_osoby",

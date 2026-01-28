@@ -1,29 +1,11 @@
 {
   "job": "rsv_vozidla_vyrazena_z_provozu_multi",
-  "source": {
-    "kind": "file",
-    "file": {
-      "path": "/home/zippy/projects/data/RSV_vozidla_vyrazena_z_provozu_20251201.csv"
-    }
-  },
-  "runtime": {
-    "reader_workers": 1,
-    "transform_workers": 7,
-    "loader_workers": 1,
-    "batch_size": 16384,
-    "channel_buffer": 8192,
-    "dedupe_dimension_keys": false,
-    "dedupe_dimension_keys_within_batch": false
-  },
   "parser": {
     "kind": "csv",
     "options": {
       "comma": ",",
       "expected_fields": 6,
       "has_header": true,
-      "trim_space": true,
-      "lazy_quotes": true,
-      "stream_scrub_likvidaci": true,
       "header_map": {
         "Datum do": "datum_do",
         "Datum od": "datum_od",
@@ -31,8 +13,184 @@
         "PČV": "pcv",
         "RM Název": "rm_nazev",
         "RM kód": "rm_kod"
-      }
+      },
+      "lazy_quotes": true,
+      "stream_scrub_likvidaci": true,
+      "trim_space": true
     }
+  },
+  "runtime": {
+    "batch_size": 16384,
+    "channel_buffer": 8192,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": false,
+    "loader_workers": 1,
+    "reader_workers": 1,
+    "transform_workers": 7
+  },
+  "source": {
+    "file": {
+      "path": "/home/zippy/projects/data/RSV_vozidla_vyrazena_z_provozu_20251201.csv"
+    },
+    "kind": "file"
+  },
+  "storage": {
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "mode": "multi_table",
+      "tables": [
+        {
+          "auto_create_table": true,
+          "columns": [
+            {
+              "name": "pcv",
+              "nullable": false,
+              "type": "bigint"
+            }
+          ],
+          "constraints": [
+            {
+              "columns": [
+                "pcv"
+              ],
+              "kind": "unique"
+            }
+          ],
+          "load": {
+            "cache": {
+              "key_column": "pcv",
+              "prewarm": false,
+              "value_column": "vehicle_id"
+            },
+            "conflict": {
+              "action": "do_nothing",
+              "target_columns": [
+                "pcv"
+              ]
+            },
+            "from_rows": [
+              {
+                "source_field": "pcv",
+                "target_column": "pcv"
+              }
+            ],
+            "kind": "dimension",
+            "returning": [
+              "vehicle_id",
+              "pcv"
+            ]
+          },
+          "name": "public.vehicles",
+          "primary_key": {
+            "name": "vehicle_id",
+            "type": "serial"
+          }
+        },
+        {
+          "auto_create_table": true,
+          "columns": [
+            {
+              "name": "vehicle_id",
+              "nullable": false,
+              "references": "public.vehicles(vehicle_id)",
+              "type": "int"
+            },
+            {
+              "name": "row_hash",
+              "nullable": false,
+              "type": "text"
+            },
+            {
+              "name": "datum_od",
+              "nullable": true,
+              "type": "date"
+            },
+            {
+              "name": "datum_do",
+              "nullable": true,
+              "type": "date"
+            },
+            {
+              "name": "duvod",
+              "nullable": true,
+              "type": "text"
+            },
+            {
+              "name": "rm_kod",
+              "nullable": true,
+              "type": "bigint"
+            },
+            {
+              "name": "rm_nazev",
+              "nullable": true,
+              "type": "text"
+            }
+          ],
+          "constraints": [
+            {
+              "columns": [
+                "vehicle_id",
+                "row_hash"
+              ],
+              "kind": "unique"
+            }
+          ],
+          "load": {
+            "dedupe": {
+              "action": "do_nothing",
+              "conflict_columns": [
+                "vehicle_id",
+                "row_hash"
+              ]
+            },
+            "from_rows": [
+              {
+                "lookup": {
+                  "match": {
+                    "pcv": "pcv"
+                  },
+                  "on_missing": "insert",
+                  "return": "vehicle_id",
+                  "table": "public.vehicles"
+                },
+                "target_column": "vehicle_id"
+              },
+              {
+                "source_field": "row_hash",
+                "target_column": "row_hash"
+              },
+              {
+                "source_field": "datum_od",
+                "target_column": "datum_od"
+              },
+              {
+                "source_field": "datum_do",
+                "target_column": "datum_do"
+              },
+              {
+                "source_field": "duvod",
+                "target_column": "duvod"
+              },
+              {
+                "source_field": "rm_kod",
+                "target_column": "rm_kod"
+              },
+              {
+                "source_field": "rm_nazev",
+                "target_column": "rm_nazev"
+              }
+            ],
+            "kind": "fact"
+          },
+          "name": "public.vozidla_vyrazena_z_provozu",
+          "primary_key": {
+            "name": "vozidla_vyrazena_z_provozu_id",
+            "type": "serial"
+          }
+        }
+      ]
+    },
+    "kind": "postgres"
   },
   "transform": [
     {
@@ -42,9 +200,9 @@
         "types": {
           "datum_do": "date",
           "datum_od": "date",
+          "duvod": "text",
           "pcv": "bigint",
           "rm_kod": "bigint",
-          "duvod": "text",
           "rm_nazev": "text"
         }
       }
@@ -52,7 +210,8 @@
     {
       "kind": "hash",
       "options": {
-        "target_field": "row_hash",
+        "algorithm": "sha256",
+        "encoding": "hex",
         "fields": [
           "datum_od",
           "datum_do",
@@ -61,214 +220,54 @@
           "rm_nazev"
         ],
         "include_field_names": true,
-        "trim_space": true,
+        "overwrite": true,
         "separator": "\u001f",
-        "algorithm": "sha256",
-        "encoding": "hex",
-        "overwrite": true
+        "target_field": "row_hash",
+        "trim_space": true
       }
     },
     {
       "kind": "validate",
       "options": {
-        "policy": "lenient",
         "contract": {
-          "name": "vozidla_vyrazena_z_provozu",
           "fields": [
             {
               "name": "pcv",
-              "type": "bigint",
-              "required": true
+              "required": true,
+              "type": "bigint"
             },
             {
+              "layout": "02.01.2006",
               "name": "datum_od",
-              "type": "date",
-              "layout": "02.01.2006",
-              "nullable": true
+              "nullable": true,
+              "type": "date"
             },
             {
-              "name": "datum_do",
-              "type": "date",
               "layout": "02.01.2006",
-              "nullable": true
+              "name": "datum_do",
+              "nullable": true,
+              "type": "date"
             },
             {
               "name": "duvod",
-              "type": "text",
-              "nullable": true
+              "nullable": true,
+              "type": "text"
             },
             {
               "name": "rm_kod",
-              "type": "bigint",
-              "nullable": true
+              "nullable": true,
+              "type": "bigint"
             },
             {
               "name": "rm_nazev",
-              "type": "text",
-              "nullable": true
+              "nullable": true,
+              "type": "text"
             }
-          ]
-        }
+          ],
+          "name": "vozidla_vyrazena_z_provozu"
+        },
+        "policy": "lenient"
       }
     }
-  ],
-  "storage": {
-    "kind": "postgres",
-    "db": {
-      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
-      "mode": "multi_table",
-      "tables": [
-        {
-          "name": "public.vehicles",
-          "auto_create_table": true,
-          "primary_key": {
-            "name": "vehicle_id",
-            "type": "serial"
-          },
-          "columns": [
-            {
-              "name": "pcv",
-              "type": "bigint",
-              "nullable": false
-            }
-          ],
-          "constraints": [
-            {
-              "kind": "unique",
-              "columns": [
-                "pcv"
-              ]
-            }
-          ],
-          "load": {
-            "kind": "dimension",
-            "from_rows": [
-              {
-                "target_column": "pcv",
-                "source_field": "pcv"
-              }
-            ],
-            "conflict": {
-              "target_columns": [
-                "pcv"
-              ],
-              "action": "do_nothing"
-            },
-            "returning": [
-              "vehicle_id",
-              "pcv"
-            ],
-            "cache": {
-              "key_column": "pcv",
-              "value_column": "vehicle_id",
-              "prewarm": false
-            }
-          }
-        },
-        {
-          "name": "public.vozidla_vyrazena_z_provozu",
-          "auto_create_table": true,
-          "primary_key": {
-            "name": "vozidla_vyrazena_z_provozu_id",
-            "type": "serial"
-          },
-          "columns": [
-            {
-              "name": "vehicle_id",
-              "type": "int",
-              "nullable": false,
-              "references": "public.vehicles(vehicle_id)"
-            },
-            {
-              "name": "row_hash",
-              "type": "text",
-              "nullable": false
-            },
-            {
-              "name": "datum_od",
-              "type": "date",
-              "nullable": true
-            },
-            {
-              "name": "datum_do",
-              "type": "date",
-              "nullable": true
-            },
-            {
-              "name": "duvod",
-              "type": "text",
-              "nullable": true
-            },
-            {
-              "name": "rm_kod",
-              "type": "bigint",
-              "nullable": true
-            },
-            {
-              "name": "rm_nazev",
-              "type": "text",
-              "nullable": true
-            }
-          ],
-          "constraints": [
-            {
-              "kind": "unique",
-              "columns": [
-                "vehicle_id",
-                "row_hash"
-              ]
-            }
-          ],
-          "load": {
-            "kind": "fact",
-            "dedupe": {
-              "conflict_columns": [
-                "vehicle_id",
-                "row_hash"
-              ],
-              "action": "do_nothing"
-            },
-            "from_rows": [
-              {
-                "target_column": "vehicle_id",
-                "lookup": {
-                  "table": "public.vehicles",
-                  "match": {
-                    "pcv": "pcv"
-                  },
-                  "return": "vehicle_id",
-                  "on_missing": "insert"
-                }
-              },
-              {
-                "target_column": "row_hash",
-                "source_field": "row_hash"
-              },
-              {
-                "target_column": "datum_od",
-                "source_field": "datum_od"
-              },
-              {
-                "target_column": "datum_do",
-                "source_field": "datum_do"
-              },
-              {
-                "target_column": "duvod",
-                "source_field": "duvod"
-              },
-              {
-                "target_column": "rm_kod",
-                "source_field": "rm_kod"
-              },
-              {
-                "target_column": "rm_nazev",
-                "source_field": "rm_nazev"
-              }
-            ]
-          }
-        }
-      ]
-    }
-  }
+  ]
 }
-

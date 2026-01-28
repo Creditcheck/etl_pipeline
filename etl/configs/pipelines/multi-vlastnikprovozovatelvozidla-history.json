@@ -99,6 +99,26 @@
               "type": "int"
             },
             {
+              "name": "row_hash",
+              "nullable": false,
+              "type": "text"
+            },
+            {
+              "name": "valid_from",
+              "nullable": false,
+              "type": "timestamptz"
+            },
+            {
+              "name": "valid_to",
+              "nullable": true,
+              "type": "timestamptz"
+            },
+            {
+              "name": "changed_at",
+              "nullable": false,
+              "type": "timestamptz"
+            },
+            {
               "name": "typ_subjektu",
               "nullable": true,
               "type": "int"
@@ -144,9 +164,7 @@
               "columns": [
                 "vehicle_id",
                 "typ_subjektu",
-                "vztah_k_vozidlu",
-                "datum_od",
-                "datum_do"
+                "vztah_k_vozidlu"
               ],
               "kind": "unique"
             }
@@ -157,9 +175,7 @@
               "conflict_columns": [
                 "vehicle_id",
                 "typ_subjektu",
-                "vztah_k_vozidlu",
-                "datum_od",
-                "datum_do"
+                "vztah_k_vozidlu"
               ]
             },
             "from_rows": [
@@ -173,6 +189,10 @@
                   "table": "public.vehicles"
                 },
                 "target_column": "vehicle_id"
+              },
+              {
+                "source_field": "row_hash",
+                "target_column": "row_hash"
               },
               {
                 "source_field": "typ_subjektu",
@@ -207,6 +227,17 @@
                 "target_column": "datum_do"
               }
             ],
+            "history": {
+              "business_key": [
+                "vehicle_id",
+                "typ_subjektu",
+                "vztah_k_vozidlu"
+              ],
+              "changed_at_column": "changed_at",
+              "enabled": true,
+              "valid_from_column": "valid_from",
+              "valid_to_column": "valid_to"
+            },
             "kind": "fact"
           },
           "name": "public.vlastnikprovozovatelvozidla",
@@ -233,6 +264,29 @@
           "typ_subjektu": "int",
           "vztah_k_vozidlu": "int"
         }
+      }
+    },
+    {
+      "kind": "hash",
+      "options": {
+        "algorithm": "sha256",
+        "encoding": "hex",
+        "fields": [
+          "pcv",
+          "typ_subjektu",
+          "vztah_k_vozidlu",
+          "aktualni",
+          "ico",
+          "nazev",
+          "adresa",
+          "datum_od",
+          "datum_do"
+        ],
+        "include_field_names": true,
+        "overwrite": true,
+        "separator": "\u001f",
+        "target_field": "row_hash",
+        "trim_space": true
       }
     },
     {
@@ -292,6 +346,11 @@
               "layout": "02.01.2006",
               "name": "datum_do",
               "type": "date"
+            },
+            {
+              "name": "row_hash",
+              "required": true,
+              "type": "text"
             }
           ],
           "name": "vlastnikprovozovatelvozidla"

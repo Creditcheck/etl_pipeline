@@ -1,0 +1,220 @@
+{
+  "job": "firmycz_multi",
+  "source": {
+    "kind": "file",
+    "file": {
+      "path": "/home/zippy/projects/creditcheck/firmy.cz/detail-2026-01-16.json"
+
+    }
+  },
+  "runtime": {
+    "reader_workers": 1,
+    "transform_workers": 1,
+    "loader_workers": 1,
+    "batch_size": 1024,
+    "channel_buffer": 2048,
+    "dedupe_dimension_keys": false,
+    "dedupe_dimension_keys_within_batch": false
+  },
+  "parser": {
+    "kind": "json",
+    "options": {
+      "allow_arrays": true,
+      "header_map": {
+        "adresa": "adresa",
+        "category": "category",
+        "datova_schranka": "datova_schranka",
+        "email": "email",
+        "facebook_url": "facebook_url",
+        "ico": "ico",
+        "instagram_url": "instagram_url",
+        "linkedin_url": "linkedin_url",
+        "mobile": "mobile",
+        "nazev_firmy": "nazev_firmy",
+        "pinterest_url": "pinterest_url",
+        "popis_firmy": "popis_firmy",
+        "tiktok_url": "tiktok_url",
+        "twitter_url": "twitter_url",
+        "website": "website",
+        "youtube_url": "youtube_url"
+      }
+    }
+  },
+  "transform": [
+    {
+      "kind": "coerce",
+      "options": {
+        "layout": "",
+        "types": {
+          "ico": "text"
+        }
+      }
+    },
+    {
+      "kind": "hash",
+      "options": {
+        "target_field": "row_hash",
+        "fields": [
+          "adresa",
+		  "category",
+          "datova_schranka",
+          "email",
+          "facebook_url",
+          "instagram_url",
+          "linkedin_url",
+          "mobile",
+          "nazev_firmy",
+          "pinterest_url",
+          "popis_firmy",
+          "tiktok_url",
+          "twitter_url",
+          "website",
+          "youtube_url"
+        ],
+        "include_field_names": true,
+        "trim_space": true,
+        "separator": "\u001f",
+        "algorithm": "sha256",
+        "encoding": "hex",
+        "overwrite": true
+      }
+    },
+    {
+      "kind": "validate",
+      "options": {
+        "contract": {
+          "name": "firmycz",
+          "fields": [
+            { "name": "ico", "type": "text", "required": true },
+
+            { "name": "adresa", "type": "text" },
+            { "name": "category", "type": "text" },
+            { "name": "datova_schranka", "type": "text" },
+            { "name": "email", "type": "text" },
+            { "name": "facebook_url", "type": "text" },
+            { "name": "instagram_url", "type": "text" },
+            { "name": "linkedin_url", "type": "text" },
+            { "name": "mobile", "type": "text" },
+            { "name": "nazev_firmy", "type": "text" },
+            { "name": "pinterest_url", "type": "text" },
+            { "name": "popis_firmy", "type": "text" },
+			{ "name": "row_hash", "type": "text", "required": true },
+            { "name": "tiktok_url", "type": "text" },
+            { "name": "twitter_url", "type": "text" },
+            { "name": "website", "type": "text" },
+            { "name": "youtube_url", "type": "text" }
+          ]
+        },
+        "policy": "lenient"
+      }
+    }
+  ],
+  "storage": {
+    "kind": "postgres",
+    "db": {
+      "dsn": "postgresql://user:password@0.0.0.0:5432/testdb?sslmode=disable",
+      "mode": "multi_table",
+      "tables": [
+        {
+          "name": "public.companies",
+          "auto_create_table": true,
+          "primary_key": {
+            "name": "company_id",
+            "type": "serial"
+          },
+          "columns": [
+            { "name": "ico", "type": "text", "nullable": false }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["ico"] }
+          ],
+          "load": {
+            "kind": "dimension",
+            "from_rows": [
+              { "target_column": "ico", "source_field": "ico" }
+            ],
+            "conflict": {
+              "target_columns": ["ico"],
+              "action": "do_nothing"
+            },
+            "returning": ["company_id", "ico"],
+            "cache": {
+              "key_column": "ico",
+              "value_column": "company_id",
+              "prewarm": false
+            }
+          }
+        },
+        {
+          "name": "public.firmycz",
+          "auto_create_table": true,
+          "primary_key": {
+            "name": "firmycz_id",
+            "type": "serial"
+          },
+          "columns": [
+            { "name": "company_id", "type": "int", "nullable": false, "references": "public.companies(company_id)" },
+            { "name": "row_hash", "type": "text", "nullable": false },
+
+            { "name": "adresa", "type": "text", "nullable": true },
+            { "name": "datova_schranka", "type": "text", "nullable": true },
+            { "name": "email", "type": "text", "nullable": true },
+            { "name": "facebook_url", "type": "text", "nullable": true },
+            { "name": "instagram_url", "type": "text", "nullable": true },
+            { "name": "linkedin_url", "type": "text", "nullable": true },
+            { "name": "mobile", "type": "text", "nullable": true },
+            { "name": "nazev_firmy", "type": "text", "nullable": true },
+            { "name": "pinterest_url", "type": "text", "nullable": true },
+            { "name": "popis_firmy", "type": "text", "nullable": true },
+            { "name": "tiktok_url", "type": "text", "nullable": true },
+            { "name": "twitter_url", "type": "text", "nullable": true },
+            { "name": "website", "type": "text", "nullable": true },
+            { "name": "youtube_url", "type": "text", "nullable": true },
+
+            { "name": "category", "type": "jsonb", "nullable": true }
+          ],
+          "constraints": [
+            { "kind": "unique", "columns": ["company_id", "row_hash"] }
+          ],
+          "load": {
+            "kind": "fact",
+            "dedupe": {
+              "conflict_columns": ["company_id", "row_hash"],
+              "action": "do_nothing"
+            },
+            "from_rows": [
+              {
+                "target_column": "company_id",
+                "lookup": {
+                  "table": "public.companies",
+                  "match": { "ico": "ico" },
+                  "return": "company_id",
+                  "on_missing": "insert"
+                }
+              },
+              { "target_column": "row_hash", "source_field": "row_hash" },
+
+              { "target_column": "adresa", "source_field": "adresa" },
+              { "target_column": "datova_schranka", "source_field": "datova_schranka" },
+              { "target_column": "email", "source_field": "email" },
+              { "target_column": "facebook_url", "source_field": "facebook_url" },
+              { "target_column": "instagram_url", "source_field": "instagram_url" },
+              { "target_column": "linkedin_url", "source_field": "linkedin_url" },
+              { "target_column": "mobile", "source_field": "mobile" },
+              { "target_column": "nazev_firmy", "source_field": "nazev_firmy" },
+              { "target_column": "pinterest_url", "source_field": "pinterest_url" },
+              { "target_column": "popis_firmy", "source_field": "popis_firmy" },
+              { "target_column": "tiktok_url", "source_field": "tiktok_url" },
+              { "target_column": "twitter_url", "source_field": "twitter_url" },
+              { "target_column": "website", "source_field": "website" },
+              { "target_column": "youtube_url", "source_field": "youtube_url" },
+
+              { "target_column": "category", "source_field": "category" }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+
