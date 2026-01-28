@@ -122,13 +122,13 @@ validate_subcategory() {
   E2E_TARGET_URLS="$(paste -sd, "${tmpdir}/subcategory-urls")"
   export E2E_MAPPINGS_PATH="${mappings}/subcategory.json"
   cur=$(pwd)
-  cd /app
+  cd /app || err "failed to cd into /app"
   if ! go test -run '^TestE2E_Strict_MappingsPopulateAcrossMultiplePages$' -tags=e2e -count=1 ./...; then
     #err "validate_subcategory go tests failed"
     log "validate_subcategory go tests failed"
 	
   fi
-  cd "$cur"
+  cd "$cur" || err "failed to cd into ${cur}"
 
 }
 
@@ -143,12 +143,12 @@ validate_detail() {
   E2E_TARGET_URLS="${E2E_TARGET_URLS},https://www.azet.sk/firma/1193737/brands-alliance-service-s-r-o/,https://www.azet.sk/firma/1247928/ivmo-real-s-r-o/"
   export E2E_MAPPINGS_PATH="${mappings}/detail.json"
     cur=$(pwd)
-  cd /app
+  cd /app || err "failed to cd into /app"
   if ! go test -run '^TestE2E_Strict_MappingsPopulateAcrossMultiplePages$' -tags=e2e -count=1 ./...;then
     log "validate_detail go tests failed"
     #err "validate_detail go tests failed"
   fi
-  cd "$cur"
+  cd "$cur" || err "failed to cd into ${cur}"
 }
 
 validate() {
