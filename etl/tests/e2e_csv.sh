@@ -67,15 +67,12 @@ run_one() {
   url="${parsed%%|*}"
   desc="${parsed#*|}"
 
-  local workdir config name runid counter
-  runid="$$"
+  local workdir config name counter
   counter=0
 
   log() {
     counter=$((counter + 1))
-    local wd
-#    wd="$(basename "$workdir" 2>/dev/null || true)"
-    #echo "[$(ts)]: INFO: (pid=${runid} job=${job_id} wd=${wd} desc=${desc} step ${counter}) $*" >&2
+    #echo "[$(ts)]: INFO: (job=${job_id} desc=${desc} step ${counter}) $*" >&2
     echo "[$(ts)]: INFO: ${desc}, $*" >&2
   }
 
